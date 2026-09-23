@@ -176,11 +176,21 @@ class ProxyEntity(
         } ?: SOCKSBean().applyDefaultValues()
     }
 
-    /** Mirrors `ProxyEntity.needExternal` from the Android source. */
+    /**
+     * Mirrors `ProxyEntity.needExternal` from the Android source, with one
+     * desktop specific difference: ShadowQUIC is **not** external here.
+     *
+     * On Android ([V2RayInstance]) ShadowQUIC always runs as a separate Rust
+     * plugin process (`libshadowquic.so`) reached through a local SOCKS
+     * listener, so `needExternal()` has to report `true` for it. The desktop Go
+     * core links the ShadowQUIC engine in natively and understands the
+     * `shadowquic` outbound protocol (verified with `owenclave-core test`), so
+     * routing it through a plugin would needlessly require a binary the desktop
+     * build does not ship. Only NaiveProxy and olcrtc remain external.
+     */
     fun needExternal(): Boolean {
         return when (type) {
             TYPE_NAIVE -> true
-            TYPE_SHADOWQUIC -> true
             TYPE_OLCRTC -> true
             else -> false
         }

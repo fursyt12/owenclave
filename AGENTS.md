@@ -32,10 +32,20 @@ nix develop
 - Desktop smoke test: `./gradlew :desktop:app:run --args="--selftest"` (starts the core
   as a local Shadowsocks server and tunnels an HTTP request through it)
 - Desktop naive plugin test: `./gradlew :desktop:app:run --args="--selftest-naive"`
+- Desktop protocol tests (real core as local server, end to end):
+  `./gradlew :desktop:app:run --args="--selftest-protocols"` covers
+  vless, vmess, trojan, anytls, shadowsocks, socks and http;
+  `--selftest-vless` and `--selftest-protocol <name>` run a single one.
+- `:desktop:app:test` also feeds every generated protocol config (including the
+  client-only ones) to `owenclave-core test` when the host core binary is present.
 
 ### Desktop (macOS / Windows / Linux)
-- `./run desktop build` - core + naive + installer for the current OS
-- `./run desktop build all` - cross platform `desktop/core/dist` + `desktop/naive/dist`
+- `./run desktop build` - core + naive + olcrtc + installer for the current OS
+- `./run desktop build all` - cross platform binaries in `desktop/core/dist`,
+  `desktop/naive/dist`, `desktop/olcrtc/dist` and `desktop/tun2socks/dist`
+- olcrtc is built from a pinned upstream commit and is not published as a prebuilt
+  binary: `./run desktop olcrtc build` (pure Go, `CGO_ENABLED=0`); `all` builds
+  linux/amd64, darwin/amd64+arm64 and windows/amd64+arm64
 - `:desktop:shared` compiles the Android `fmt`/`group`/`ktx` sources read-only; the
   Android bound files are excluded and replaced by the Kotlin shims in
   `desktop/shared/src/main/kotlin/desktopshim` (same packages, so the Android app is
@@ -47,10 +57,12 @@ nix develop
 - `DataStore.kt` - settings defaults and storage
 - `global_preferences.xml` - settings UI layout
 - `ProxyEntity.kt` - protocol types and entity management
-- `ConfigBuilder.kt` - V2Ray config generation (Android)
+- `ConfigBuilder.kt` - V2Ray config generation (Android, shared with desktop)
 - `V2RayInstance.kt` - external plugin management (naive, shadowquic, olcrtc)
-- `desktop/app/.../DesktopConfigBuilder.kt` - V2Ray config generation (desktop)
+- `desktop/app/.../DesktopConfigBuilder.kt` - desktop adapter over `ConfigBuilder.kt`
+- `desktop/app/.../ExternalPlugins.kt` - external engine (naive, olcrtc) supervision
 - `desktop/app/.../CoreRunner.kt` - core + plugin process supervision (desktop)
+- `desktop/app/.../ProtocolSelfTest.kt` - end to end protocol self tests
 - `themes.xml` / `styles.xml` - UI theme and dialog styling
 - `Theme.kt` - theme application logic
 

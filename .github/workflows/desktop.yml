@@ -109,12 +109,27 @@ jobs:
       - name: Download tun2socks (transparent mode)
         shell: bash
         run: TARGETS="${{ matrix.target }}" bash bin/desktop/tun2socks/download.sh
+      - name: Build olcrtc plugin
+        shell: bash
+        env:
+          GOPROXY: "https://proxy.golang.org|https://goproxy.io|direct"
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if TARGETS="${{ matrix.target }}" bash bin/desktop/olcrtc/build.sh; then
+              exit 0
+            fi
+            echo "olcrtc build attempt $attempt failed, retrying in 20s"
+            sleep 20
+          done
+          echo "::error::olcrtc build failed after 3 attempts"
+          exit 1
       - name: Verify binaries
         shell: bash
         run: |
           tag="${{ matrix.target }}"
           tag="${tag//\//-}"
-          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag" "desktop/tun2socks/dist/$tag"
+          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag" "desktop/olcrtc/dist/$tag" "desktop/tun2socks/dist/$tag"
       - name: Gradle cache
         uses: actions/cache@v6
         with:
@@ -196,7 +211,7 @@ jobs:
           fi
           printf '%s\n' "$listing"
           missing=0
-          for name in owenclave-core naive tun2socks; do
+          for name in owenclave-core naive olcrtc tun2socks; do
             fileName="$name"
             if [ "$RUNNER_OS" = "Windows" ]; then fileName="$name.exe"; fi
             if ! printf '%s\n' "$listing" | grep -qx "bin/$fileName"; then
@@ -220,6 +235,15 @@ jobs:
           echo "launcher: $launcher"
           "$launcher" --version
           "$launcher" --selftest
+      - name: Protocol self tests (bundled core, every protocol family)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
+          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
+          # starts the shipped core as a local server per protocol and tunnels a
+          # request through the config the shared Android generator produced
+          "$launcher" --selftest-protocols
       - name: NaiveProxy plugin self test
         shell: bash
         continue-on-error: true
@@ -239,14 +263,18 @@ jobs:
           mkdir -p /tmp/owenclave-netns
           log=/tmp/tun-netns.log
           # a network namespace gives CAP_NET_ADMIN for the TUN device without
-          # touching the runner's own routes
-          sudo unshare -rn bash -c "
+          # touching the runner's own routes. GitHub runs this step as `bash -e`,
+          # so the status goes through an if: a bare `sudo ...` that fails aborted
+          # the step before any diagnostic below could run.
+          status=0
+          if ! sudo unshare -rn bash -c "
             ip link set lo up
             ip route add default dev lo || true
             export JAVA_TOOL_OPTIONS=-Dowenclave.dataDir=/tmp/owenclave-netns
             '$launcher' --selftest-tun-stub
-          " >"$log" 2>&1
-          status=$?
+          " >"$log" 2>&1; then
+            status=$?
+          fi
           echo "::notice::transparent mode, network namespace: launcher exit status $status"
           # the job logs need a token, annotations do not: publish the end of the
           # log either way so a failure here can be diagnosed from the API
@@ -297,6 +325,7 @@ jobs:
           path: |
             desktop/core/dist/${{ matrix.tag }}
             desktop/naive/dist/${{ matrix.tag }}
+            desktop/olcrtc/dist/${{ matrix.tag }}
           if-no-files-found: warn
       # Runs last: it takes over the default route, so it must not be able to
       # jeopardise the artifact uploads. Needs administrator rights, which the
@@ -417,14 +446,19 @@ jobs:
           | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `owenclave___DESKTOP_VERSION___amd64-linux-x64.deb`, `owenclave-__DESKTOP_VERSION__-1.x86_64-linux-x64.rpm` |
 
           The portable archive is self contained: unpack it, start the launcher, and
-          profiles, settings plus the extracted `owenclave-core` and `naive` binaries
-          stay inside the unpacked folder as long as a `data` directory sits next to
-          the launcher (remove it to fall back to the per user OS directory).
+          profiles, settings plus the extracted `owenclave-core`, `naive`, `olcrtc` and
+          `tun2socks` engines stay inside the unpacked folder as long as a `data`
+          directory sits next to the launcher (remove it to fall back to the per user OS
+          directory).
 
           ## Verified on every build
 
           * unit tests of the shared subscription importers and the desktop config builder
+          * every generated protocol config is fed to `owenclave-core test`, including the
+            client only protocols, so a protocol the engine cannot parse fails the build
           * tunnel smoke test through the core bundled into the application image
+          * protocol self tests that start the shipped core as a local server and tunnel a
+            request through VLESS, VMess, Trojan, AnyTLS, Shadowsocks, SOCKS and HTTP
           * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
           * transparent mode test: `tun2socks` creates a TUN device inside a network
             namespace, the client's traffic enters it and reaches a stub SOCKS server,
@@ -446,9 +480,13 @@ jobs:
             `wintun.dll` must sit next to the launcher. When the device cannot be
             created the connection log says which right or file is missing, and the
             application states the reason instead of failing silently.
-          * Protocol coverage on desktop is narrower than on Android (no OLCRTC, Mieru,
-            TUIC, Juicy, AnyTLS, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP3 or WireGuard
-            yet). See `desktop/README.md`.
+          * Protocol coverage matches the Android app: the desktop client generates its
+            configuration with the very same generator Android uses, so Shadowsocks
+            (incl. 2022 and SIP003 plugins), VMess, VLESS, Trojan, Hysteria2, TUIC,
+            Juicity, AnyTLS, Mieru, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP/3,
+            WireGuard and SOCKS/HTTP are all usable. NaiveProxy and OLCRTC run as
+            external engines, exactly like the plugins on Android. See
+            `desktop/README.md`.
           NOTES
           sed -i "s/__VERSION__/${version}/g; s/__DESKTOP_VERSION__/${desktop_version}/g" notes.md
           echo "--- release notes ---"

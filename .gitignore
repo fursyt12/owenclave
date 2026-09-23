@@ -27,6 +27,8 @@ release.keystore
 /desktop/core/dist/
 /desktop/naive/dist/
 /desktop/naive/cache/
+/desktop/olcrtc/dist/
+/desktop/olcrtc/cache/
 /desktop/tun2socks/dist/
 /desktop/tun2socks/cache/
 /desktop/arch/dist/

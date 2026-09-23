@@ -61,6 +61,7 @@ class AppState(private val scope: CoroutineScope) {
             append(DesktopRuntime.platformTag)
             if (DesktopRuntime.coreBinary() == null) append(" | core missing")
             if (DesktopRuntime.naiveBinary() == null) append(" | naive plugin missing")
+            if (DesktopRuntime.olcrtcBinary() == null) append(" | olcrtc plugin missing")
         }
 
     private val runner = CoreRunner { line -> appendLog(line) }

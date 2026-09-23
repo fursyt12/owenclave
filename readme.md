@@ -115,25 +115,29 @@ parser; a standard Mihomo installation handles them by its own rules.
 ## desktop
 
 The same protocol layer is available as a Compose Multiplatform desktop client for
-macOS, Windows and Linux. It reuses the Android model (`fmt`, `group`, `ktx`) and runs
-the same Go engine as a child process, so profiles, share links, Clash YAML and
+macOS, Windows and Linux. It reuses the Android model (`fmt`, `group`, `ktx`) and
+runs the same Go engine as a child process, and it builds its configs with the
+**shared Android generator** (`fmt/ConfigBuilder.kt`), so every protocol the
+Android app supports works on desktop too. Profiles, share links, Clash YAML and
 V2Ray/sing-box JSON are imported exactly like on Android.
 
 - `owenclave-core` is the `exclave-core` CLI, cross compiled for linux/macos/windows
-- NaiveProxy is shipped as an external `naive` process with a local SOCKS listener,
-  mirroring the Android plugin architecture
+- NaiveProxy (`naive`) and olcrtc are shipped as external processes with a local
+  SOCKS listener, mirroring the Android plugin architecture; ShadowQUIC runs
+  natively inside the desktop core
 - portable archive (unpack and run, self contained `data` directory) plus installers
 - transparent TUN mode (all system traffic) built on tun2socks, and a pacman
   repository for Arch Linux
 
 ```bash
-./run desktop build        # core + naive + portable zip + installer for this OS
+./run desktop build        # core + naive + olcrtc + portable zip + installer for this OS
 ./run desktop build all    # cross platform binaries only
 ```
 
 See [desktop/README.md](desktop/README.md) for the architecture, the verification
-commands (`--selftest`, `--selftest-naive`, `--selftest-tun`, `--print-config`) and the
-current protocol coverage. On Arch Linux the client installs from a pacman repository:
+commands (`--selftest`, `--selftest-naive`, `--selftest-protocols`,
+`--selftest-tun`, `--print-config`) and the protocol coverage. On Arch Linux the
+client installs from a pacman repository:
 
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/fursyt12/owenclave/dev/packaging/arch/setup-repo.sh)"

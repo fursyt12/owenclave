@@ -158,7 +158,10 @@ object SelfTest {
             runner.start(profile, settings)
             Thread.sleep(1500)
             println("[selftest-naive] generated plugin config:")
-            println(File(DesktopRuntime.dataDir, "naive.json").readText())
+            val pluginConfig = DesktopRuntime.dataDir
+                .listFiles { file -> file.name.startsWith("naive_") && file.name.endsWith(".json") }
+                ?.maxByOrNull { it.lastModified() }
+            println(pluginConfig?.readText() ?: "(no naive_*.json written)")
             val alive = runner.pluginAlive()
             println("[selftest-naive] plugin alive: $alive, core running: ${runner.running}")
             val attempt = runCatching { runner.fetch("http://example.com/", 8000) }
@@ -185,7 +188,7 @@ object SelfTest {
      * necessarily contain the `jdk.httpserver` module, and the self test has to
      * work inside the packaged application as well.
      */
-    private class LocalHttpServer(private val payload: String) {
+    internal class LocalHttpServer(private val payload: String) {
 
         private val socket = ServerSocket(0, 0, InetAddress.getLoopbackAddress())
 
@@ -225,7 +228,7 @@ object SelfTest {
 
     }
 
-    private fun awaitPort(port: Int) {
+    internal fun awaitPort(port: Int) {
         val deadline = System.currentTimeMillis() + 20_000
         while (System.currentTimeMillis() < deadline) {
             val connected = runCatching {

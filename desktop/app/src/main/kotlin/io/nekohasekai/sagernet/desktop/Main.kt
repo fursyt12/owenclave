@@ -83,6 +83,7 @@ private fun runCli(args: Array<String>): Int? {
         println("data: ${DesktopRuntime.dataDir}")
         println("core: ${DesktopRuntime.coreBinary()?.absolutePath ?: "not found"}")
         println("naive: ${DesktopRuntime.naiveBinary()?.absolutePath ?: "not found"}")
+        println("olcrtc: ${DesktopRuntime.olcrtcBinary()?.absolutePath ?: "not found"}")
         return 0
     }
     if (args.contains("--selftest")) {
@@ -90,6 +91,16 @@ private fun runCli(args: Array<String>): Int? {
     }
     if (args.contains("--selftest-naive")) {
         return SelfTest.runNaive()
+    }
+    if (args.contains("--selftest-protocols")) {
+        return ProtocolSelfTest.run()
+    }
+    if (args.contains("--selftest-vless")) {
+        return ProtocolSelfTest.run("vless")
+    }
+    val protocolIndex = args.indexOf("--selftest-protocol")
+    if (protocolIndex >= 0) {
+        return ProtocolSelfTest.run(args.getOrNull(protocolIndex + 1))
     }
     if (args.contains("--selftest-tun")) {
         return SelfTest.runTun(stub = false)
@@ -126,7 +137,7 @@ private fun runCli(args: Array<String>): Int? {
             routeMode = if (args.contains("--route-direct")) DesktopSettings.ROUTE_DIRECT else DesktopSettings.ROUTE_GLOBAL,
         )
         println("--- generated core config for ${supported.displayName()} ---")
-        println(DesktopConfigBuilder.build(supported, settings, null))
+        println(DesktopConfigBuilder.build(Profile(bean = supported), settings, emptyList(), null).json)
         return 0
     }
     return null
@@ -268,9 +279,11 @@ private fun ProfilesSection(state: AppState) {
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
-                                if (profile.bean != null && !DesktopConfigBuilder.supports(profile.bean)) {
+                                // Every parsed bean is supported; only a really
+                                // empty profile cannot be connected.
+                                if (profile.bean == null && profile.customConfig == null) {
                                     Text(
-                                        DesktopConfigBuilder.unsupportedReason(profile.bean),
+                                        DesktopConfigBuilder.unsupportedReason(null),
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.error,
                                     )
@@ -765,6 +778,7 @@ private fun SettingsSection(state: AppState) {
         InfoLine("Data directory", DesktopRuntime.dataDir.absolutePath)
         InfoLine("Core", DesktopRuntime.coreBinary()?.absolutePath ?: "not found")
         InfoLine("NaiveProxy", DesktopRuntime.naiveBinary()?.absolutePath ?: "not found")
+        InfoLine("olcrtc", DesktopRuntime.olcrtcBinary()?.absolutePath ?: "not found")
         Spacer(Modifier.height(16.dp))
     }
 }

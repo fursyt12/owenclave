@@ -3,6 +3,7 @@ package io.nekohasekai.sagernet.desktop
 import com.google.gson.JsonParser
 import io.nekohasekai.sagernet.LogLevel
 import io.nekohasekai.sagernet.fmt.naive.NaiveBean
+import io.nekohasekai.sagernet.fmt.naive.buildNaiveConfig
 import io.nekohasekai.sagernet.fmt.shadowsocks.ShadowsocksBean
 import io.nekohasekai.sagernet.fmt.v2ray.VMessBean
 import kotlin.test.Test
@@ -16,10 +17,23 @@ import kotlin.test.assertTrue
  */
 class DesktopConfigBuilderTest {
 
-    private fun outboundOf(config: String, tag: String) = JsonParser.parseString(config).asJsonObject
+    /** The outbound that carries the selected profile (the core names it `proxy-global-<id>`). */
+    private fun proxyOutboundOf(config: String) = JsonParser.parseString(config).asJsonObject
         .getAsJsonArray("outbounds")
         .map { it.asJsonObject }
-        .first { it.get("tag").asString == tag }
+        .first {
+            val tag = it.get("tag")?.asString ?: ""
+            tag == "proxy" || tag.startsWith("proxy-global-")
+        }
+
+    private fun build(
+        bean: io.nekohasekai.sagernet.fmt.AbstractBean,
+        settings: DesktopSettings = DesktopSettings(),
+        rules: List<RoutingRule> = emptyList(),
+    ): String {
+        bean.initializeDefaultValues()
+        return DesktopConfigBuilder.build(Profile(bean = bean), settings, rules, null).json
+    }
 
     @Test
     fun `parses a shadowsocks share link and proxies through it`() {
@@ -32,8 +46,8 @@ class DesktopConfigBuilderTest {
         assertEquals("aes-256-gcm", (bean as ShadowsocksBean).method)
         assertEquals("wintestpass", bean.password)
 
-        val config = DesktopConfigBuilder.build(bean, DesktopSettings(), null)
-        val proxy = outboundOf(config, "proxy")
+        val config = build(bean)
+        val proxy = proxyOutboundOf(config)
         assertEquals("shadowsocks", proxy.get("protocol").asString)
         val server = proxy.getAsJsonObject("settings").getAsJsonArray("servers")[0].asJsonObject
         assertEquals("127.0.0.1", server.get("address").asString)
@@ -105,17 +119,25 @@ class DesktopConfigBuilderTest {
         }
         bean.initializeDefaultValues()
 
-        val plugin = PluginBinding(port = 41234, username = "plugin-user", password = "plugin-pass")
-        val config = DesktopConfigBuilder.build(bean, DesktopSettings(), plugin)
+        val result = DesktopConfigBuilder.build(Profile(bean = bean), DesktopSettings(), emptyList(), null)
 
-        val proxy = outboundOf(config, "proxy")
+        // NaiveProxy is external: the core gets a socks outbound pointing at the
+        // plugin port, and the plugin binding is reported back to the runner.
+        assertEquals(1, result.plugins.size)
+        val plugin = result.plugins.single()
+        assertTrue(plugin.bean is NaiveBean)
+        assertTrue(plugin.port > 0)
+        assertTrue(plugin.username.isNotEmpty())
+        assertTrue(plugin.password.isNotEmpty())
+
+        val proxy = proxyOutboundOf(result.json)
         assertEquals("socks", proxy.get("protocol").asString)
         val server = proxy.getAsJsonObject("settings").getAsJsonArray("servers")[0].asJsonObject
         assertEquals("127.0.0.1", server.get("address").asString)
-        assertEquals(41234, server.get("port").asInt)
+        assertEquals(plugin.port, server.get("port").asInt)
         val user = server.getAsJsonArray("users")[0].asJsonObject
-        assertEquals("plugin-user", user.get("user").asString)
-        assertEquals("plugin-pass", user.get("pass").asString)
+        assertEquals(plugin.username, user.get("user").asString)
+        assertEquals(plugin.password, user.get("pass").asString)
     }
 
     @Test
@@ -132,7 +154,7 @@ class DesktopConfigBuilderTest {
         bean.initializeDefaultValues()
 
         val config = JsonParser.parseString(
-            DesktopConfigBuilder.naivePluginConfig(bean, 41234, "u", "p")
+            bean.buildNaiveConfig(41234, "u", "p")
         ).asJsonObject
 
         assertEquals("socks://u:p@127.0.0.1:41234", config.get("listen").asString)
@@ -147,6 +169,10 @@ class DesktopConfigBuilderTest {
         assertNotNull(profile.customConfig)
         assertEquals("Custom", profile.protocolName)
         assertEquals("raw config", profile.address)
+
+        val result = DesktopConfigBuilder.build(profile, DesktopSettings(), emptyList(), null)
+        assertEquals(profile.customConfig, result.json)
+        assertTrue(result.plugins.isEmpty())
     }
 
     @Test
@@ -157,15 +183,14 @@ class DesktopConfigBuilderTest {
             method = "aes-256-gcm"
             password = "secret"
         }
-        bean.initializeDefaultValues()
 
         val withBypass = JsonParser.parseString(
-            DesktopConfigBuilder.build(bean, DesktopSettings(bypassPrivateNetworks = true), null)
+            build(bean, DesktopSettings(bypassPrivateNetworks = true))
         ).asJsonObject
         assertTrue(withBypass.has("routing"))
 
         val withoutBypass = JsonParser.parseString(
-            DesktopConfigBuilder.build(bean, DesktopSettings(bypassPrivateNetworks = false), null)
+            build(bean, DesktopSettings(bypassPrivateNetworks = false))
         ).asJsonObject
         assertTrue(!withoutBypass.has("routing"))
     }
@@ -178,18 +203,15 @@ class DesktopConfigBuilderTest {
             method = "aes-256-gcm"
             password = "secret"
         }
-        bean.initializeDefaultValues()
 
-        val config = DesktopConfigBuilder.build(
+        val config = build(
             bean,
             DesktopSettings(routeMode = DesktopSettings.ROUTE_DIRECT, logLevel = LogLevel.DEBUG),
-            null,
         )
-        assertEquals("freedom", outboundOf(config, "proxy").get("protocol").asString)
+        assertEquals("freedom", proxyOutboundOf(config).get("protocol").asString)
         assertEquals("debug", JsonParser.parseString(config).asJsonObject
             .getAsJsonObject("log").get("loglevel").asString)
     }
-
 
     @Test
     fun `routing rules are emitted before the lan bypass`() {
@@ -199,12 +221,10 @@ class DesktopConfigBuilderTest {
             method = "aes-256-gcm"
             password = "secret"
         }
-        bean.initializeDefaultValues()
 
-        val config = DesktopConfigBuilder.build(
+        val config = build(
             bean,
             DesktopSettings(),
-            null,
             listOf(
                 RoutingRule(name = "ads", domains = "keyword:ads, full:api.example.com", target = RuleTarget.BLOCK.tag),
                 RoutingRule(enabled = false, domains = "disabled.example.com"),
@@ -223,9 +243,27 @@ class DesktopConfigBuilderTest {
             first.getAsJsonArray("domains").map { it.asString },
         )
         val second = rules[1].asJsonObject
-        assertEquals("direct", second.get("outboundTag").asString)
+        assertEquals("bypass", second.get("outboundTag").asString)
         assertEquals(listOf("10.0.0.0/8"), second.getAsJsonArray("ip").map { it.asString })
-        assertEquals("direct", rules[2].asJsonObject.get("outboundTag").asString)
+        assertEquals("bypass", rules[2].asJsonObject.get("outboundTag").asString)
+    }
+
+    @Test
+    fun `android only inbounds and their routing rules are dropped`() {
+        val bean = ShadowsocksBean().apply {
+            serverAddress = "1.2.3.4"
+            serverPort = 8388
+            method = "aes-256-gcm"
+            password = "secret"
+        }
+        val root = JsonParser.parseString(build(bean)).asJsonObject
+        val inboundTags = root.getAsJsonArray("inbounds").map {
+            it.asJsonObject.get("tag")?.asString
+        }
+        assertTrue("ipc-in" !in inboundTags, "the Android ipc UDS inbound must be dropped")
+        assertTrue("dns-in" !in inboundTags, "the Android DNS UDS inbound must be dropped")
+        assertTrue("socks" in inboundTags)
+        assertTrue("http" in inboundTags)
     }
 
     @Test

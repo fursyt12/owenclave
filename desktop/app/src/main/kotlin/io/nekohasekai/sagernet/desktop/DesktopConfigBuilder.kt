@@ -1,38 +1,50 @@
 package io.nekohasekai.sagernet.desktop
 
-import com.github.shadowsocks.plugin.PluginConfiguration
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
-import io.nekohasekai.sagernet.LogLevel
+import com.google.gson.JsonParser
+import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.RouteMode
+import io.nekohasekai.sagernet.TunImplementation
+import io.nekohasekai.sagernet.database.DataStore
+import io.nekohasekai.sagernet.database.ProxyEntity
+import io.nekohasekai.sagernet.database.RuleEntity
+import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.fmt.AbstractBean
-import io.nekohasekai.sagernet.fmt.hysteria2.Hysteria2Bean
-import io.nekohasekai.sagernet.fmt.http.HttpBean
-import io.nekohasekai.sagernet.fmt.naive.NaiveBean
-import io.nekohasekai.sagernet.fmt.naive.buildNaiveConfig
-import io.nekohasekai.sagernet.fmt.shadowsocks.ShadowsocksBean
-import io.nekohasekai.sagernet.fmt.socks.SOCKSBean
-import io.nekohasekai.sagernet.fmt.trojan.TrojanBean
-import io.nekohasekai.sagernet.fmt.v2ray.StandardV2RayBean
-import io.nekohasekai.sagernet.fmt.v2ray.VLESSBean
-import io.nekohasekai.sagernet.fmt.v2ray.VMessBean
-import io.nekohasekai.sagernet.ktx.listByLineOrComma
-import java.util.UUID
+import io.nekohasekai.sagernet.fmt.buildV2RayConfig
 
 /** Raised when a profile cannot be expressed as a V2Ray config for the core. */
 class UnsupportedProfileException(message: String) : Exception(message)
 
-/** Local SOCKS listener of an external plugin process plus its credentials. */
-data class PluginBinding(val port: Int, val username: String, val password: String)
+/**
+ * An external engine that has to be started next to the core because the core
+ * does not implement the protocol itself (NaiveProxy, olcrtc).
+ *
+ * [bean] is the very same object that `buildV2RayConfig` used, so the mapping
+ * fields it mutates (`finalAddress`/`finalPort`) are already applied when the
+ * plugin config is generated from it.
+ */
+data class ExternalPlugin(
+    val bean: AbstractBean,
+    val port: Int,
+    val username: String,
+    val password: String,
+)
+
+/** Result of [DesktopConfigBuilder.build]: the core JSON plus the plugins to run. */
+class CoreConfig(val json: String, val plugins: List<ExternalPlugin>)
 
 /**
- * Turns a shared [AbstractBean] into the V2Ray format JSON the core consumes.
+ * Turns a desktop [Profile] into the JSON the core consumes.
  *
- * The Android app does the same in `fmt/ConfigBuilder.kt`, but that file is bound
- * to the VPN service, Room and the Android preference store. This builder reuses
- * the identical bean model, so profiles imported on desktop (share links, Clash
- * YAML, V2Ray JSON) are interpreted exactly like on Android, and only the
- * platform specific inbounds (TUN, per app proxy) are dropped.
+ * Unlike the earlier desktop-only builder this is a thin adapter over the real
+ * Android generator (`fmt/ConfigBuilder.kt`, compiled into `:desktop:shared`),
+ * so the desktop client understands every protocol the Android app does. The
+ * shared generator is bound to the VPN service, Room and Android preferences, so
+ * this adapter pushes the desktop settings into the `DataStore` shim, installs
+ * the desktop routing rules on `SagerDatabase.rulesDao` and then strips the
+ * Android-only inbounds from the result.
  */
 object DesktopConfigBuilder {
 
@@ -41,6 +53,10 @@ object DesktopConfigBuilder {
         .disableHtmlEscaping()
         .create()
 
+    /**
+     * The same private-network list the pre-generator desktop builder emitted.
+     * Kept in one rule so DNS and local-network handling stay equivalent.
+     */
     private val PRIVATE_NETWORKS = listOf(
         "127.0.0.0/8",
         "10.0.0.0/8",
@@ -52,14 +68,13 @@ object DesktopConfigBuilder {
         "fe80::/10",
     )
 
-    /** Protocols the desktop client can build a config for. */
-    fun supports(bean: AbstractBean?): Boolean = when (bean) {
-        null -> false
-        is NaiveBean, is ShadowsocksBean, is VMessBean, is VLESSBean, is TrojanBean,
-        is SOCKSBean, is HttpBean, is Hysteria2Bean,
-        -> true
-        else -> false
-    }
+    /**
+     * Every non-null [AbstractBean] is buildable: the shared generator has an
+     * outbound branch for each protocol the Android app supports. NaiveProxy and
+     * olcrtc are still supported, they just need an external plugin process (see
+     * [CoreConfig.plugins]).
+     */
+    fun supports(bean: AbstractBean?): Boolean = bean != null
 
     fun unsupportedReason(bean: AbstractBean?): String = when (bean) {
         null -> "The profile is empty"
@@ -67,580 +82,236 @@ object DesktopConfigBuilder {
     }
 
     /**
-     * Builds the core configuration.
+     * Builds the core configuration for [profile].
      *
-     * @param plugin binding of the external plugin process, required for Naive
-     *   (and eventually OLCRTC) profiles, which are reached through a local SOCKS
-     *   listener exactly like on Android.
+     * @param bindInterface physical interface the outbounds have to be pinned to
+     *   in transparent (TUN) mode, or `null` when the system proxy is used.
      */
     fun build(
-        bean: AbstractBean,
+        profile: Profile,
         settings: DesktopSettings,
-        plugin: PluginBinding?,
         rules: List<RoutingRule> = emptyList(),
         bindInterface: String? = null,
-    ): String {
-        val root = JsonObject()
+    ): CoreConfig {
+        val bean = profile.bean
+        if (bean == null) {
+            val raw = profile.customConfig
+            if (raw.isNullOrBlank()) throw UnsupportedProfileException("The profile is empty")
+            // Custom configs are never routed through the generator: the user
+            // wrote them for the core already. Only the TUN interface binding is
+            // injected, and only when there is one.
+            return CoreConfig(postProcessCustom(raw, bindInterface), emptyList())
+        }
+        if (!supports(bean)) throw UnsupportedProfileException(unsupportedReason(bean))
 
-        root.add("log", JsonObject().apply {
-            addProperty("loglevel", logLevelName(settings.logLevel))
-        })
+        applySettings(settings)
+        installRules(rules, settings.bypassPrivateNetworks)
 
-        root.add("inbounds", JsonArray().apply {
-            add(socksInbound(settings.socksPort))
-            add(httpInbound(settings.httpPort))
-        })
+        val entity = ProxyEntity(id = profile.id.hashCode().toLong(), groupId = 0L).putBean(bean)
+        val result = buildV2RayConfig(entity)
 
-        val proxyOutbound = if (settings.routeMode == DesktopSettings.ROUTE_DIRECT) {
-            freedom("proxy")
+        val direct = settings.routeMode == DesktopSettings.ROUTE_DIRECT
+        val plugins = if (direct) {
+            // The proxy outbound is replaced by a freedom outbound below, so no
+            // external engine is needed at all.
+            emptyList()
         } else {
-            outboundFor(bean, plugin, settings)
+            result.index.flatMap { index ->
+                index.chain.map { (triple, proxy) ->
+                    ExternalPlugin(proxy.requireBean(), triple.first, triple.second, triple.third)
+                }
+            }
         }
 
-        // In transparent mode the default route points at the tunnel, so the
-        // outbound that reaches the upstream server must be pinned to the physical
-        // interface, otherwise it would loop straight back into the tunnel.
+        return CoreConfig(
+            postProcess(result.config, settings, bindInterface, result.outboundTagsCurrent.toSet()),
+            plugins,
+        )
+    }
+
+    // ------------------------------------------------------------------ settings
+
+    /**
+     * Pushes the desktop settings into the shared `DataStore` shim. Only the
+     * values `ConfigBuilder` actually reads are set; everything else keeps the
+     * desktop defaults documented in the shim.
+     */
+    private fun applySettings(settings: DesktopSettings) {
+        DataStore.socksPort = settings.socksPort
+        DataStore.socksUsername = ""
+        DataStore.socksPassword = ""
+        DataStore.requireSocks = true
+        DataStore.socksUDP = true
+
+        DataStore.httpPort = settings.httpPort
+        DataStore.httpUsername = ""
+        DataStore.httpPassword = ""
+        DataStore.requireHttp = true
+
+        // The desktop client has no transparent proxy inbound and no Android
+        // local-DNS socket; the TUN device is served by the SOCKS inbound.
+        DataStore.requireTransproxy = false
+        DataStore.requireDnsInbound = false
+
+        // Rules are always evaluated; ROUTE_DIRECT is expressed by turning the
+        // proxy outbound into a freedom outbound in postProcess().
+        DataStore.routeMode = RouteMode.RULE
+
+        DataStore.logLevel = settings.logLevel
+        DataStore.profileTrafficStatistics = false
+        DataStore.allowAccess = false
+
+        // MODE_PROXY (plus a non-SYSTEM TUN implementation) keeps ConfigBuilder
+        // from emitting the Android VpnService plugin-protect arguments
+        // (`--android_vpn` / `-V`) for SIP003 plugins.
+        DataStore.serviceMode = Key.MODE_PROXY
+        DataStore.tunImplementation = TunImplementation.GVISOR
+    }
+
+    // --------------------------------------------------------------------- rules
+
+    /**
+     * Installs the desktop routing rules on the shared `SagerDatabase` shim.
+     *
+     * The desktop model has no proxy ids, so the Android outbound encoding is
+     * used directly: `0` is the selected profile, `-1` is the bypass (direct)
+     * outbound and `-2` is the block outbound. `userOrder` keeps the list order,
+     * and the private-network bypass is appended last exactly like the old
+     * desktop builder did.
+     */
+    private fun installRules(rules: List<RoutingRule>, bypassPrivateNetworks: Boolean) {
+        val entities = ArrayList<RuleEntity>()
+        rules.forEachIndexed { index, rule ->
+            entities += RuleEntity(
+                id = index.toLong() + 1,
+                name = rule.name,
+                userOrder = index.toLong(),
+                enabled = rule.enabled,
+                domains = rule.domains,
+                ip = rule.ip,
+                port = rule.port,
+                network = rule.network,
+                protocol = rule.protocol,
+                outbound = when (rule.target) {
+                    RuleTarget.DIRECT.tag -> -1L
+                    RuleTarget.BLOCK.tag -> -2L
+                    else -> 0L
+                },
+            )
+        }
+        if (bypassPrivateNetworks) {
+            entities += RuleEntity(
+                id = entities.size.toLong() + 1,
+                name = "Bypass private networks",
+                userOrder = entities.size.toLong(),
+                enabled = true,
+                ip = PRIVATE_NETWORKS.joinToString("\n"),
+                outbound = -1L,
+            )
+        }
+        SagerDatabase.rulesDao = object : RuleEntity.Dao() {
+            override fun enabledRules(enabled: Boolean): List<RuleEntity> =
+                entities.filter { it.enabled == enabled }.sortedBy { it.userOrder }
+        }
+    }
+
+    // -------------------------------------------------------------- post process
+
+    /**
+     * Removes everything that only makes sense inside the Android VPN service
+     * and applies the desktop specific outbound tweaks.
+     *
+     * @param proxyTags tags of the outbounds that carry the selected profile;
+     *   they are replaced by a direct outbound in [DesktopSettings.ROUTE_DIRECT].
+     */
+    private fun postProcess(
+        config: String,
+        settings: DesktopSettings,
+        bindInterface: String?,
+        proxyTags: Set<String>,
+    ): String {
+        val root = runCatching { JsonParser.parseString(config).asJsonObject }.getOrElse { return config }
+
+        // 1. Drop the Android-only inbounds: the `ipc-in` UDS Android uses for
+        //    per-app traffic stats, and the `ipc_dns.sock` UDS of the local DNS.
+        val inbounds = root.getAsJsonArray("inbounds") ?: JsonArray()
+        val keptInbounds = JsonArray()
+        inbounds.forEach { element ->
+            val inbound = element.asJsonObject
+            val tag = inbound.get("tag")?.asString
+            if (tag == TAG_IPC_IN || tag == TAG_DNS_IN) return@forEach
+            keptInbounds.add(inbound)
+        }
+        root.add("inbounds", keptInbounds)
+        val inboundTags = keptInbounds.mapNotNull { it.asJsonObject.get("tag")?.asString }.toSet()
+
+        // 2. Routing rules that referenced a dropped inbound (`dns-in` fed the
+        //    `dns-out` outbound) would make the core reject the config.
+        root.getAsJsonObject("routing")?.let { routing ->
+            val rules = routing.getAsJsonArray("rules")
+            if (rules != null) {
+                val keptRules = JsonArray()
+                rules.forEach { element ->
+                    val rule = element.asJsonObject
+                    val inboundTag = rule.getAsJsonArray("inboundTag")
+                    if (inboundTag != null && inboundTag.any { it.asString !in inboundTags }) return@forEach
+                    keptRules.add(rule)
+                }
+                routing.add("rules", keptRules)
+                if (keptRules.size() == 0) root.remove("routing")
+            }
+        }
+
+        val outbounds = root.getAsJsonArray("outbounds") ?: JsonArray()
+
+        // 3. "Direct only" mode: the selected profile is not dialled, the core
+        //    sends everything out directly. The tag is kept so the routing rules
+        //    that point at it still resolve.
+        if (settings.routeMode == DesktopSettings.ROUTE_DIRECT) {
+            outbounds.forEach { element ->
+                val outbound = element.asJsonObject
+                if (outbound.get("tag")?.asString in proxyTags) {
+                    outbound.addProperty("protocol", "freedom")
+                    outbound.remove("settings")
+                    outbound.remove("mux")
+                    outbound.remove("smux")
+                    outbound.remove("streamSettings")
+                }
+            }
+        }
+
+        // 4. Transparent mode: every outbound that dials a real socket (so
+        //    everything except blackhole and the internal DNS) has to be pinned
+        //    to the physical interface, otherwise it would loop back into TUN.
         if (!bindInterface.isNullOrBlank()) {
-            proxyOutbound.bindToInterface(bindInterface)
-        }
-
-        root.add("outbounds", JsonArray().apply {
-            add(proxyOutbound)
-            add(freedom("direct"))
-            add(JsonObject().apply {
-                addProperty("tag", "block")
-                addProperty("protocol", "blackhole")
-                add("settings", JsonObject().apply {
-                    add("response", JsonObject().apply { addProperty("type", "http") })
-                })
-            })
-        })
-
-        // User rules come first because the core uses the first matching rule;
-        // `domains` accepts the usual domain:/full:/keyword:/regexp: prefixes,
-        // exactly like the Android rule editor.
-        val routingRules = JsonArray()
-        rules.filter { it.enabled && it.hasMatchers }.forEach { rule ->
-            routingRules.add(JsonObject().apply {
-                addProperty("type", "field")
-                if (rule.domains.isNotBlank()) {
-                    add("domains", JsonArray().apply { rule.domains.listByLineOrComma().forEach { add(it) } })
-                }
-                if (rule.ip.isNotBlank()) {
-                    add("ip", JsonArray().apply { rule.ip.listByLineOrComma().forEach { add(it) } })
-                }
-                if (rule.port.isNotBlank()) addProperty("port", rule.port.trim())
-                if (rule.network.isNotBlank()) addProperty("network", rule.network.trim())
-                if (rule.protocol.isNotBlank()) {
-                    add("protocol", JsonArray().apply { rule.protocol.listByLineOrComma().forEach { add(it) } })
-                }
-                addProperty(
-                    "outboundTag",
-                    RuleTarget.entries.firstOrNull { it.tag == rule.target }?.tag ?: RuleTarget.PROXY.tag,
-                )
-            })
-        }
-        if (settings.bypassPrivateNetworks) {
-            routingRules.add(JsonObject().apply {
-                addProperty("type", "field")
-                add("ip", JsonArray().apply { PRIVATE_NETWORKS.forEach { add(it) } })
-                addProperty("outboundTag", "direct")
-            })
-        }
-        if (routingRules.size() > 0) {
-            root.add("routing", JsonObject().apply {
-                addProperty("domainStrategy", "AsIs")
-                add("rules", routingRules)
-            })
+            outbounds.forEach { element ->
+                element.asJsonObject.bindToInterface(bindInterface)
+            }
         }
 
         return json.toJson(root)
     }
 
-    /** Configuration for the external NaiveProxy process. */
-    fun naivePluginConfig(bean: NaiveBean, port: Int, username: String, password: String): String =
-        bean.buildNaiveConfig(port, username, password)
-
-    private fun logLevelName(level: Int): String = when (level) {
-        LogLevel.NONE -> "none"
-        LogLevel.ERROR -> "error"
-        LogLevel.WARNING -> "warning"
-        LogLevel.INFO -> "info"
-        else -> "debug"
-    }
-
-    private fun socksInbound(port: Int): JsonObject = JsonObject().apply {
-        addProperty("tag", "socks-in")
-        addProperty("listen", "127.0.0.1")
-        addProperty("port", port)
-        addProperty("protocol", "socks")
-        add("settings", JsonObject().apply {
-            addProperty("auth", "noauth")
-            addProperty("udp", true)
-        })
-        add("sniffing", sniffing())
-    }
-
-    private fun httpInbound(port: Int): JsonObject = JsonObject().apply {
-        addProperty("tag", "http-in")
-        addProperty("listen", "127.0.0.1")
-        addProperty("port", port)
-        addProperty("protocol", "http")
-        add("settings", JsonObject())
-        add("sniffing", sniffing())
-    }
-
-    private fun sniffing(): JsonObject = JsonObject().apply {
-        addProperty("enabled", true)
-        add("destOverride", JsonArray().apply {
-            add("http")
-            add("tls")
-            add("quic")
-        })
-        addProperty("routeOnly", false)
+    /** Custom configs only get the TUN interface binding, nothing else. */
+    private fun postProcessCustom(config: String, bindInterface: String?): String {
+        if (bindInterface.isNullOrBlank()) return config
+        val root = runCatching { JsonParser.parseString(config).asJsonObject }.getOrElse { return config }
+        root.getAsJsonArray("outbounds")?.forEach { element ->
+            element.asJsonObject.bindToInterface(bindInterface)
+        }
+        return json.toJson(root)
     }
 
     /** Pins every socket of this outbound to a network interface. */
     private fun JsonObject.bindToInterface(interfaceName: String) {
+        val protocol = get("protocol")?.asString
+        if (protocol == "blackhole" || protocol == "dns") return
         val streamSettings = getAsJsonObject("streamSettings") ?: JsonObject().also { add("streamSettings", it) }
         val sockopt = streamSettings.getAsJsonObject("sockopt") ?: JsonObject().also { streamSettings.add("sockopt", it) }
         sockopt.addProperty("bindToDevice", interfaceName)
     }
 
-    private fun freedom(tag: String): JsonObject = JsonObject().apply {
-        addProperty("tag", tag)
-        addProperty("protocol", "freedom")
-        add("settings", JsonObject().apply {
-            addProperty("domainStrategy", "AsIs")
-        })
-    }
-
-    private fun outboundFor(bean: AbstractBean, plugin: PluginBinding?, settings: DesktopSettings): JsonObject =
-        when (bean) {
-            is NaiveBean -> naive(bean, plugin)
-            is ShadowsocksBean -> shadowsocks(bean)
-            is VMessBean -> vmess(bean)
-            is VLESSBean -> vless(bean)
-            is TrojanBean -> trojan(bean)
-            is SOCKSBean -> socks(bean)
-            is HttpBean -> http(bean)
-            is Hysteria2Bean -> hysteria2(bean)
-            else -> throw UnsupportedProfileException(unsupportedReason(bean))
-        }
-
-    /**
-     * NaiveProxy runs as an external process: the core dials into its local SOCKS
-     * listener, which is what the Android build does as well.
-     */
-    private fun naive(bean: NaiveBean, plugin: PluginBinding?): JsonObject {
-        val binding = plugin
-            ?: throw UnsupportedProfileException("NaiveProxy plugin is not running")
-        return JsonObject().apply {
-            addProperty("tag", "proxy")
-            addProperty("protocol", "socks")
-            add("settings", JsonObject().apply {
-                add("servers", JsonArray().apply {
-                    add(JsonObject().apply {
-                        addProperty("address", "127.0.0.1")
-                        addProperty("port", binding.port)
-                        add("users", JsonArray().apply {
-                            add(JsonObject().apply {
-                                addProperty("user", binding.username)
-                                addProperty("pass", binding.password)
-                            })
-                        })
-                    })
-                })
-                addProperty("version", "5")
-                if (bean.singUoT == true) addProperty("uot", true)
-            })
-        }
-    }
-
-    private fun shadowsocks(bean: ShadowsocksBean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "shadowsocks")
-        add("settings", JsonObject().apply {
-            add("servers", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPort)
-                    addProperty("method", bean.method)
-                    addProperty("password", bean.password)
-                    if (!bean.method.startsWith("2022-blake3-") && bean.experimentReducedIvHeadEntropy == true) {
-                        addProperty("experimentReducedIvHeadEntropy", true)
-                    }
-                })
-            })
-            if (bean.plugin.isNotEmpty()) {
-                val configuration = PluginConfiguration(bean.plugin)
-                if (configuration.selected.isNotEmpty()) {
-                    addProperty("plugin", configuration.selected)
-                    addProperty("pluginOpts", configuration.getOptions().toString())
-                }
-            }
-            if (bean.singUoT == true) addProperty("uot", true)
-        })
-        applyStream(this, bean)
-    }
-
-    private fun vmess(bean: VMessBean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "vmess")
-        add("settings", JsonObject().apply {
-            add("vnext", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPort)
-                    add("users", JsonArray().apply {
-                        add(JsonObject().apply {
-                            addProperty("id", bean.uuid.orRandomUuid())
-                            addProperty("security", bean.encryption.ifEmpty { "auto" })
-                            (bean.alterId ?: 0).takeIf { it > 0 }?.let { addProperty("alterId", it) }
-                            val experiments = ArrayList<String>()
-                            if (bean.experimentalAuthenticatedLength == true) experiments.add("AuthenticatedLength")
-                            if (bean.experimentalNoTerminationSignal == true) experiments.add("NoTerminationSignal")
-                            if (experiments.isNotEmpty()) addProperty("experiments", experiments.joinToString("|"))
-                        })
-                    })
-                })
-            })
-            bean.packetEncoding?.takeIf { it.isNotEmpty() }?.let { addProperty("packetEncoding", it) }
-        })
-        applyStream(this, bean)
-        applyMux(this, bean)
-    }
-
-    private fun vless(bean: VLESSBean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "vless")
-        add("settings", JsonObject().apply {
-            add("vnext", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPort)
-                    add("users", JsonArray().apply {
-                        add(JsonObject().apply {
-                            addProperty("id", bean.uuid.orRandomUuid())
-                            addProperty("encryption", bean.encryption.ifEmpty { "none" })
-                            if (bean.flow.isNotEmpty()) addProperty("flow", bean.flow)
-                        })
-                    })
-                })
-            })
-            bean.packetEncoding?.takeIf { it.isNotEmpty() }?.let { addProperty("packetEncoding", it) }
-        })
-        applyStream(this, bean)
-        applyMux(this, bean)
-    }
-
-    private fun trojan(bean: TrojanBean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "trojan")
-        add("settings", JsonObject().apply {
-            add("servers", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPort)
-                    addProperty("password", bean.password)
-                })
-            })
-        })
-        applyStream(this, bean)
-        applyMux(this, bean)
-    }
-
-    private fun socks(bean: SOCKSBean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "socks")
-        add("settings", JsonObject().apply {
-            add("servers", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPort)
-                    val user = bean.username
-                    val pass = bean.password
-                    if (!user.isNullOrEmpty() || !pass.isNullOrEmpty()) {
-                        add("users", JsonArray().apply {
-                            add(JsonObject().apply {
-                                addProperty("user", user ?: "")
-                                addProperty("pass", pass ?: "")
-                            })
-                        })
-                    }
-                })
-            })
-            addProperty("version", bean.protocolVersion().toString())
-        })
-        applyStream(this, bean)
-    }
-
-    private fun http(bean: HttpBean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "http")
-        add("settings", JsonObject().apply {
-            add("servers", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPort)
-                    if (bean.username.isNotEmpty() || bean.password.isNotEmpty()) {
-                        add("users", JsonArray().apply {
-                            add(JsonObject().apply {
-                                addProperty("user", bean.username)
-                                addProperty("pass", bean.password)
-                            })
-                        })
-                    }
-                })
-            })
-        })
-        applyStream(this, bean)
-    }
-
-    private fun hysteria2(bean: Hysteria2Bean): JsonObject = JsonObject().apply {
-        addProperty("tag", "proxy")
-        addProperty("protocol", "hysteria2")
-        add("settings", JsonObject().apply {
-            add("servers", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("address", bean.serverAddress)
-                    addProperty("port", bean.serverPorts.firstPort() ?: bean.serverPort)
-                })
-            })
-        })
-        add("streamSettings", JsonObject().apply {
-            addProperty("network", "hysteria2")
-            addProperty("security", "tls")
-            add("tlsSettings", hysteria2TlsSettings(bean))
-            add("hy2Settings", JsonObject().apply {
-                if (bean.auth.isNotEmpty()) addProperty("password", bean.auth)
-                addProperty("use_udp_extension", true)
-                if (bean.serverPorts.contains("-") || bean.serverPorts.contains(",")) {
-                    addProperty("hopPorts", bean.serverPorts)
-                    (bean.hopInterval ?: 0L).takeIf { it > 0 }?.let { addProperty("hopInterval", it) }
-                }
-                if (bean.obfsType.isNotEmpty() && bean.obfsPassword.isNotEmpty()) {
-                    add("obfs", JsonObject().apply {
-                        addProperty("type", bean.obfsType)
-                        addProperty("password", bean.obfsPassword)
-                        (bean.geckoMinPacketSize ?: 0).takeIf { it > 0 }?.let { addProperty("minPacketSize", it) }
-                        (bean.geckoMaxPacketSize ?: 0).takeIf { it > 0 }?.let { addProperty("maxPacketSize", it) }
-                    })
-                }
-                if ((bean.uploadMbps ?: 0L) > 0 || (bean.downloadMbps ?: 0L) > 0 || bean.congestionControl.isNotEmpty()) {
-                    add("congestion", JsonObject().apply {
-                        if (bean.congestionControl.isNotEmpty()) addProperty("type", bean.congestionControl)
-                        (bean.uploadMbps ?: 0L).takeIf { it > 0 }?.let { addProperty("up_mbps", it) }
-                        (bean.downloadMbps ?: 0L).takeIf { it > 0 }?.let { addProperty("down_mbps", it) }
-                        if (bean.bbrProfile.isNotEmpty()) addProperty("bbrProfile", bean.bbrProfile)
-                    })
-                }
-                if (bean.chromeParrot == true) addProperty("chromeParrot", true)
-                if (bean.omitMaxDatagramFrameSize == true) addProperty("omitMaxDatagramFrameSize", true)
-            })
-        })
-    }
-
-    private fun applyStream(outbound: JsonObject, bean: StandardV2RayBean) {
-        outbound.add("streamSettings", JsonObject().apply {
-            val network = bean.type.ifEmpty { "tcp" }
-            addProperty("network", network)
-            val security = bean.security.ifEmpty { "none" }
-            addProperty("security", security)
-
-            when (security) {
-                "tls", "xtls" -> add("tlsSettings", tlsSettings(bean))
-                "reality" -> {
-                    add("realitySettings", JsonObject().apply {
-                        if (bean.sni.isNotEmpty()) addProperty("serverName", bean.sni)
-                        addProperty("publicKey", bean.realityPublicKey)
-                        if (bean.realityShortId.isNotEmpty()) addProperty("shortId", bean.realityShortId)
-                        addProperty("fingerprint", bean.realityFingerprint.ifEmpty { bean.utlsFingerprint }.ifEmpty { "chrome" })
-                        if (bean.realityMldsa65Verify.isNotEmpty()) addProperty("mldsa65Verify", bean.realityMldsa65Verify)
-                        if (bean.realityDisableX25519Mlkem768 == true) addProperty("disableX25519MLKEM768", true)
-                    })
-                }
-            }
-
-            when (network) {
-                "ws" -> add("wsSettings", JsonObject().apply {
-                    addProperty("path", bean.path)
-                    if (bean.host.isNotEmpty()) {
-                        add("headers", JsonObject().apply { addProperty("Host", bean.host) })
-                    }
-                    (bean.maxEarlyData ?: 0).takeIf { it > 0 }?.let { earlyData ->
-                        addProperty("maxEarlyData", earlyData)
-                        if (bean.earlyDataHeaderName.isNotEmpty()) {
-                            addProperty("earlyDataHeaderName", bean.earlyDataHeaderName)
-                        }
-                    }
-                })
-                "grpc" -> add("grpcSettings", JsonObject().apply {
-                    if (bean.grpcServiceName.isNotEmpty()) addProperty("serviceName", bean.grpcServiceName)
-                    if (bean.grpcMultiMode == true) addProperty("multiMode", true)
-                    if (bean.grpcServiceNameCompat == true) addProperty("serviceNameCompat", true)
-                })
-                "h2", "http" -> add("httpSettings", JsonObject().apply {
-                    if (bean.host.isNotEmpty()) {
-                        add("host", JsonArray().apply { bean.host.listByLineOrComma().forEach { add(it) } })
-                    }
-                    if (bean.path.isNotEmpty()) addProperty("path", bean.path)
-                })
-                "httpupgrade" -> add("httpupgradeSettings", JsonObject().apply {
-                    if (bean.host.isNotEmpty()) addProperty("host", bean.host)
-                    addProperty("path", bean.path)
-                    (bean.maxEarlyData ?: 0).takeIf { it > 0 }?.let { earlyData ->
-                        addProperty("maxEarlyData", earlyData)
-                        if (bean.earlyDataHeaderName.isNotEmpty()) {
-                            addProperty("earlyDataHeaderName", bean.earlyDataHeaderName)
-                        }
-                    }
-                })
-                "quic" -> add("quicSettings", JsonObject().apply {
-                    addProperty("security", bean.quicSecurity.ifEmpty { "none" })
-                    addProperty("key", bean.quicKey)
-                    add("header", JsonObject().apply { addProperty("type", bean.headerType.ifEmpty { "none" }) })
-                })
-                "kcp" -> add("kcpSettings", JsonObject().apply {
-                    if (bean.mKcpSeed.isNotEmpty()) addProperty("seed", bean.mKcpSeed)
-                    add("header", JsonObject().apply { addProperty("type", bean.headerType.ifEmpty { "none" }) })
-                })
-                "splithttp", "xhttp" -> add(if (network == "xhttp") "xhttpSettings" else "splithttpSettings", JsonObject().apply {
-                    if (bean.host.isNotEmpty()) addProperty("host", bean.host)
-                    addProperty("path", bean.path)
-                    if (bean.splithttpMode.isNotEmpty()) addProperty("mode", bean.splithttpMode)
-                })
-                "tcp" -> if (bean.headerType == "http") {
-                    add("tcpSettings", JsonObject().apply {
-                        add("header", JsonObject().apply { addProperty("type", "http") })
-                    })
-                }
-            }
-        })
-    }
-
-    private fun tlsSettings(bean: StandardV2RayBean): JsonObject = JsonObject().apply {
-        if (bean.sni.isNotEmpty()) addProperty("serverName", sniOf(bean))
-        if (bean.allowInsecure == true) addProperty("allowInsecure", true)
-        if (bean.alpn.isNotEmpty()) {
-            add("alpn", JsonArray().apply { bean.alpn.listByLineOrComma().forEach { add(it) } })
-        }
-        if (bean.utlsFingerprint.isNotEmpty()) addProperty("fingerprint", bean.utlsFingerprint)
-        if (bean.certificates.isNotEmpty()) {
-            addProperty("disableSystemRoot", true)
-            add("certificates", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("usage", "verify")
-                    add("certificate", JsonArray().apply { bean.certificates.lines().forEach { add(it) } })
-                })
-            })
-        }
-        if (bean.mtlsCertificate.isNotEmpty() || bean.mtlsCertificatePrivateKey.isNotEmpty()) {
-            add("certificates", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("usage", "encipherment")
-                    add("certificate", JsonArray().apply { bean.mtlsCertificate.lines().forEach { add(it) } })
-                    add("key", JsonArray().apply { bean.mtlsCertificatePrivateKey.lines().forEach { add(it) } })
-                })
-            })
-        }
-        addPinnedCertificates(bean.pinnedPeerCertificateSha256, bean.pinnedPeerCertificatePublicKeySha256, bean.pinnedPeerCertificateChainSha256)
-        if (bean.serverNameToVerify.isNotEmpty()) {
-            add("serverNameToVerify", JsonArray().apply {
-                bean.serverNameToVerify.listByLineOrComma().forEach { add(it) }
-            })
-        }
-        if (bean.echEnabled == true) {
-            add("ech", JsonObject().apply {
-                addProperty("enabled", true)
-                when {
-                    bean.echConfigList.isNotEmpty() -> addProperty("config", bean.echConfigList)
-                    bean.echQueryName.isNotEmpty() -> addProperty("queryDomain", bean.echQueryName)
-                }
-            })
-        }
-    }
-
-    /** Hysteria2 has its own bean type but shares the TLS option names. */
-    private fun hysteria2TlsSettings(bean: Hysteria2Bean): JsonObject = JsonObject().apply {
-        if (bean.sni.isNotEmpty()) addProperty("serverName", bean.sni)
-        if (bean.allowInsecure == true) addProperty("allowInsecure", true)
-        if (bean.certificates.isNotEmpty()) {
-            addProperty("disableSystemRoot", true)
-            add("certificates", JsonArray().apply {
-                add(JsonObject().apply {
-                    addProperty("usage", "verify")
-                    add("certificate", JsonArray().apply { bean.certificates.lines().forEach { add(it) } })
-                })
-            })
-        }
-        addPinnedCertificates(bean.pinnedPeerCertificateSha256, bean.pinnedPeerCertificatePublicKeySha256, bean.pinnedPeerCertificateChainSha256)
-        if (bean.serverNameToVerify.isNotEmpty()) {
-            add("serverNameToVerify", JsonArray().apply {
-                bean.serverNameToVerify.listByLineOrComma().forEach { add(it) }
-            })
-        }
-        if (bean.echEnabled == true) {
-            add("ech", JsonObject().apply {
-                addProperty("enabled", true)
-                when {
-                    bean.echConfigList.isNotEmpty() -> addProperty("config", bean.echConfigList)
-                    bean.echQueryName.isNotEmpty() -> addProperty("queryDomain", bean.echQueryName)
-                }
-            })
-        }
-    }
-
-    private fun JsonObject.addPinnedCertificates(
-        sha256: String,
-        publicKeySha256: String,
-        chainSha256: String,
-    ) {
-        if (sha256.isNotEmpty()) {
-            add("pinnedPeerCertificateSha256", JsonArray().apply {
-                sha256.listByLineOrComma().forEach { add(it.replace(":", "")) }
-            })
-        }
-        if (publicKeySha256.isNotEmpty()) {
-            add("pinnedPeerCertificatePublicKeySha256", JsonArray().apply {
-                publicKeySha256.listByLineOrComma().forEach { add(it) }
-            })
-        }
-        if (chainSha256.isNotEmpty()) {
-            add("pinnedPeerCertificateChainSha256", JsonArray().apply {
-                chainSha256.listByLineOrComma().forEach { add(it) }
-            })
-        }
-    }
-
-    private fun sniOf(bean: StandardV2RayBean): String = bean.sni
-
-    private fun applyMux(outbound: JsonObject, bean: StandardV2RayBean) {
-        if (bean.mux == true) {
-            outbound.add("mux", JsonObject().apply {
-                addProperty("enabled", true)
-                (bean.muxConcurrency ?: 0).takeIf { it > 0 }?.let { addProperty("concurrency", it) }
-                bean.muxPacketEncoding?.takeIf { it.isNotEmpty() }?.let { addProperty("packetEncoding", it) }
-            })
-        }
-        if (bean.singMux == true) {
-            outbound.add("smux", JsonObject().apply {
-                addProperty("enabled", true)
-                if (bean.singMuxProtocol.isNotEmpty()) addProperty("protocol", bean.singMuxProtocol)
-                (bean.singMuxMaxConnections ?: 0).takeIf { it > 0 }?.let { addProperty("maxConnections", it) }
-                (bean.singMuxMinStreams ?: 0).takeIf { it > 0 }?.let { addProperty("minStreams", it) }
-                (bean.singMuxMaxStreams ?: 0).takeIf { it > 0 }?.let { addProperty("maxStreams", it) }
-                if (bean.singMuxPadding == true) addProperty("padding", true)
-            })
-        }
-    }
-
-    private fun String?.orRandomUuid(): String {
-        if (this.isNullOrBlank()) return UUID.randomUUID().toString()
-        return runCatching { UUID.fromString(this.trim()) }.getOrNull()?.toString() ?: UUID.randomUUID().toString()
-    }
-
-    private fun String.firstPort(): Int? =
-        split(',', '-').firstNotNullOfOrNull { it.trim().toIntOrNull() }
+    private const val TAG_IPC_IN = "ipc-in"
+    private const val TAG_DNS_IN = "dns-in"
 
 }

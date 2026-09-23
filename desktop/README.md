@@ -9,15 +9,22 @@ the same Go proxy engine as a child process.
 │  ProfileStore  ──  shared beans / parsers  (app/src/main/java/.../fmt, .../group)            │
 │  DesktopConfigBuilder ──► V2Ray-format JSON ──► CoreRunner ──► owenclave-core (child proc)   │
 │                                                     │                                        │
-│                                                     └──► naive (child proc, local SOCKS)     │
+│                                                     ├──► naive (child proc, local SOCKS)     │
+│                                                     └──► olcrtc (child proc, local SOCKS)   │
 └─────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 * `owenclave-core` is the `exclave-core` CLI, i.e. exactly the engine the Android
   app links through gomobile (`libowenclavecore.aar`). It consumes the same
-  V2Ray-format JSON that `fmt/ConfigBuilder.kt` produces for Android.
+  V2Ray-format JSON that `fmt/ConfigBuilder.kt` produces for Android; the desktop
+  builder is now a thin adapter over that very generator, so every protocol the
+  Android app supports is buildable on desktop.
 * `naive` is the upstream NaiveProxy binary. Like on Android it is an external
   plugin: it listens on a local SOCKS port and the core dials into it.
+* `olcrtc` is the WebRTC transport plugin. It is built from a pinned upstream
+  commit and, like NaiveProxy, runs as an external engine behind a local SOCKS
+  listener. ShadowQUIC is the one exception to the Android layout: the desktop
+  core implements it natively, so no plugin process is started for it.
 * Profiles, share links, Clash YAML, V2Ray JSON and sing-box JSON are parsed by
   the **shared Android code** (`:desktop:shared` compiles
   `app/src/main/java/io/nekohasekai/sagernet/{fmt,group,ktx}` directly), so
@@ -31,6 +38,7 @@ the same Go proxy engine as a child process.
 | `:desktop:app` | Compose Multiplatform application, core/plugin supervision, packaging |
 | `desktop/core/dist/<os>-<arch>` | cross compiled `owenclave-core` binaries |
 | `desktop/naive/dist/<os>-<arch>` | downloaded NaiveProxy binaries |
+| `desktop/olcrtc/dist/<os>-<arch>` | locally built olcrtc plugin binaries |
 
 The Android build is untouched: the shims only exist inside the desktop modules,
 and the shared sources are consumed read-only through Gradle `srcDirs`.
@@ -38,13 +46,14 @@ and the shared sources are consumed read-only through Gradle `srcDirs`.
 ## Prerequisites
 
 * JDK 21
-* Go 1.26+ (only to build the core)
+* Go 1.26+ (to build the core and the olcrtc plugin)
+* `git` (olcrtc is built from a pinned upstream commit)
 * `python3` and `curl` (only to download the NaiveProxy binaries)
 
 ## Build
 
 ```sh
-# whole client for the current platform (core + plugin + installer)
+# whole client for the current platform (core + plugins + installer)
 ./run desktop build
 
 # just the cross platform binaries for every target
@@ -54,8 +63,9 @@ and the shared sources are consumed read-only through Gradle `srcDirs`.
 Individual steps:
 
 ```sh
-TARGETS="linux/amd64"   ./run desktop core build     # or: all
-TARGETS="darwin/arm64"  ./run desktop naive download # or: all
+TARGETS="linux/amd64"   ./run desktop core build      # or: all
+TARGETS="darwin/arm64"  ./run desktop naive download  # or: all
+TARGETS="linux/amd64"   ./run desktop olcrtc build    # or: all
 ./gradlew :desktop:app:packageDistributionForCurrentOS
 ```
 
@@ -93,7 +103,7 @@ macOS     Owenclave.app/Contents/MacOS/Owenclave     (unzip keeps the bundle)
 
 The archive contains a `data` directory next to the launcher. As soon as it
 exists, the client keeps profiles, settings, the generated core config and the
-extracted core/NaiveProxy binaries inside the unpacked folder instead of
+extracted core/plugin binaries inside the unpacked folder instead of
 `%APPDATA%` / `~/Library/Application Support` / `~/.config`, so the whole thing is
 self contained and can live on a USB stick. Remove `data/` to fall back to the
 per user location.
@@ -109,8 +119,8 @@ archives and the installers.
 ./gradlew :desktop:app:run
 ```
 
-`run` resolves the binaries straight from `desktop/core/dist` and
-`desktop/naive/dist` for the current host.
+`run` resolves the binaries straight from `desktop/core/dist`,
+`desktop/naive/dist` and `desktop/olcrtc/dist` for the current host.
 
 ## Verification
 
@@ -132,7 +142,14 @@ desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest
 # NaiveProxy plugin integration (config accepted by the real naive binary)
 ./gradlew :desktop:app:run --args="--selftest-naive"
 
-# unit tests of the importers, the rule builder and the config builder
+# every core-native protocol the core can also serve, end to end:
+# vless, vmess, trojan, anytls, shadowsocks, socks, http.
+# `--selftest-vless` is a shortcut for one of them, `--selftest-protocol <name>`
+# for any single protocol.
+./gradlew :desktop:app:run --args="--selftest-protocols"
+
+# unit tests of the importers, the rule builder and the config builder; the
+# config test also feeds every generated protocol config to `owenclave-core test`
 ./gradlew :desktop:app:test
 
 # open a specific tab right away, handy when checking that every screen renders
@@ -249,17 +266,24 @@ Building the package locally (needs `base-devel`):
 
 ## Supported protocols
 
-naive (external plugin), Shadowsocks (incl. 2022 methods and SIP003 plugins),
-VMess, VLESS, Trojan, SOCKS, HTTP, Hysteria2, plus direct/block outbounds.
+Desktop builds configs with the **shared Android generator**
+(`app/src/main/java/io/nekohasekai/sagernet/fmt/ConfigBuilder.kt`, compiled
+read-only into `:desktop:shared`), so the protocol coverage matches the Android
+app: Shadowsocks (incl. 2022 methods and SIP003 plugins), ShadowsocksR, VMess,
+VLESS, Trojan, Hysteria2, TUIC, AnyTLS, SSH, Snell, ShadowQUIC, Mieru, Juicity,
+TrustTunnel, HTTP/3, WireGuard, SOCKS and HTTP.
+
+NaiveProxy and olcrtc are the two protocols the core does not implement: they run
+as external plugin processes behind a local SOCKS listener, exactly like on
+Android. ShadowQUIC is the opposite case and is handled natively by the desktop
+core, so unlike Android it needs no plugin binary.
 
 Transports: tcp, ws, grpc, h2/http, httpupgrade, quic, kcp, splithttp/xhttp with
 TLS, uTLS, REALITY, ALPN, certificate pinning, ECH and mux/smux.
 
-Profiles using protocols that are not wired up yet (Mieru, TUIC, Juicy,
-AnyTLS, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP3, WireGuard, OLCRTC) are
-imported and shown, but marked as unsupported and cannot be connected. A raw
-V2Ray JSON config can always be added as a custom profile and is passed to the
-core unchanged.
+A raw V2Ray JSON config can always be added as a custom profile and is passed to
+the core unchanged (only the TUN interface binding is injected in transparent
+mode).
 
 Android-only concepts have no desktop equivalent and are intentionally absent:
 `VpnService` (desktop builds the same idea from `tun2socks` plus the core's SOCKS
@@ -273,5 +297,6 @@ desktop/
 ├── app/          Compose application, packaging, self test
 ├── shared/       JVM module: shared Android sources + desktop shims
 ├── core/dist/    cross compiled owenclave-core
-└── naive/dist/   downloaded NaiveProxy binaries
+├── naive/dist/   downloaded NaiveProxy binaries
+└── olcrtc/dist/  locally built olcrtc plugin binaries
 ```

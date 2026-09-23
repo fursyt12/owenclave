@@ -2,7 +2,6 @@ package io.nekohasekai.sagernet.desktop
 
 import io.nekohasekai.sagernet.SagerNet
 import io.nekohasekai.sagernet.database.DataStore
-import io.nekohasekai.sagernet.fmt.naive.NaiveBean
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
@@ -10,24 +9,22 @@ import java.net.Proxy
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
-import java.util.UUID
 
 /**
- * Supervises the desktop proxy runtime: the Go core process and, for protocols
- * that live outside of the core (NaiveProxy), the external plugin process.
+ * Supervises the desktop proxy runtime: the Go core process and the external
+ * engines (NaiveProxy, olcrtc) the core dials into through a local SOCKS
+ * listener.
  *
- * This mirrors the Android architecture, where `bg/proto/V2RayInstance.kt` starts
- * the in-process core plus the plugin binaries and wires them together through a
- * local SOCKS listener.
+ * This mirrors the Android architecture, where `bg/proto/V2RayInstance.kt`
+ * starts the in-process core plus the plugin binaries and wires them together
+ * through a local SOCKS listener.
  */
 class CoreRunner(private val log: (String) -> Unit) {
 
     private var tunSession: TunSession? = null
     private var coreProcess: Process? = null
-    private var pluginProcess: Process? = null
-    private var pluginTag: String? = null
     private var coreConfigFile: File = File(DesktopRuntime.dataDir, "core.json")
-    private var pluginConfigFile: File = File(DesktopRuntime.dataDir, "plugin.json")
+    private val plugins = ExternalPlugins { line -> log(line) }
 
     @Volatile
     var running: Boolean = false
@@ -39,8 +36,8 @@ class CoreRunner(private val log: (String) -> Unit) {
 
     val socksPort: Int get() = settings?.socksPort ?: 0
 
-    /** Whether the external plugin process is still running. */
-    fun pluginAlive(): Boolean = pluginProcess?.isAlive == true
+    /** Whether any external plugin process is still running. */
+    fun pluginAlive(): Boolean = plugins.alive
 
     private var settings: DesktopSettings? = null
 
@@ -50,29 +47,21 @@ class CoreRunner(private val log: (String) -> Unit) {
         this.settings = settings
         lastError = null
 
-        val bean = profile.bean
-        if (bean == null) {
-            val config = profile.customConfig
-            if (config.isNullOrBlank()) {
-                throw UnsupportedProfileException("The profile is empty")
-            }
-            startCore(profile, config, settings)
-            startTunIfEnabled(settings)
-            return
-        }
-
-        if (!DesktopConfigBuilder.supports(bean)) {
-            throw UnsupportedProfileException(DesktopConfigBuilder.unsupportedReason(bean))
-        }
-
-        val pluginBinding = when (bean) {
-            is NaiveBean -> startNaivePlugin(bean, settings)
-            else -> null
-        }
-
         val tunInterface = if (settings.tunEnabled) TunSession.primaryInterface() else null
-        val config = DesktopConfigBuilder.build(bean, settings, pluginBinding, rules, tunInterface)
-        startCore(profile, config, settings)
+        val config = DesktopConfigBuilder.build(profile, settings, rules, tunInterface)
+
+        // External engines have to be listening before the core tries to dial
+        // into their local SOCKS inbound.
+        try {
+            plugins.start(config.plugins) { port, process, what ->
+                awaitPort(port, process, timeoutMillis = 20_000, what = what)
+            }
+        } catch (e: Exception) {
+            stop()
+            throw e
+        }
+
+        startCore(profile, config.json, settings)
 
         if (tunInterface != null) {
             val session = TunSession { line -> log(line) }
@@ -85,43 +74,6 @@ class CoreRunner(private val log: (String) -> Unit) {
             tunSession = session
             log("transparent mode ready on ${session.device}")
         }
-    }
-
-    private fun startNaivePlugin(bean: NaiveBean, settings: DesktopSettings): PluginBinding {
-        val binary = DesktopRuntime.naiveBinary()
-            ?: throw UnsupportedProfileException("NaiveProxy binary is not available for ${DesktopRuntime.platformTag}")
-
-        val port = freePort()
-        val username = UUID.randomUUID().toString().replace("-", "")
-        val password = UUID.randomUUID().toString().replace("-", "")
-
-        pluginConfigFile = File(DesktopRuntime.dataDir, "naive.json")
-        pluginConfigFile.writeText(DesktopConfigBuilder.naivePluginConfig(bean, port, username, password))
-
-        log("starting NaiveProxy plugin on 127.0.0.1:$port")
-        val process = ProcessBuilder(binary.absolutePath, pluginConfigFile.absolutePath)
-            .directory(DesktopRuntime.dataDir)
-            .redirectErrorStream(true)
-            .start()
-        pluginProcess = process
-        pluginTag = "naive"
-        pumpOutput("naive", process)
-
-        awaitPort(port, process, timeoutMillis = 20_000, what = "NaiveProxy plugin")
-        return PluginBinding(port, username, password)
-    }
-
-    private fun startTunIfEnabled(settings: DesktopSettings) {
-        if (!settings.tunEnabled) return
-        val session = TunSession { line -> log(line) }
-        try {
-            session.start(TunSession.primaryInterface(), settings.tunMtu, settings.socksPort, settings.tunInterface)
-        } catch (e: Exception) {
-            stop()
-            throw e
-        }
-        tunSession = session
-        log("transparent mode ready on ${session.device}")
     }
 
     private fun startCore(profile: Profile, config: String, settings: DesktopSettings) {
@@ -179,13 +131,7 @@ class CoreRunner(private val log: (String) -> Unit) {
         }
         tunSession = null
 
-        pluginProcess?.let { process ->
-            log("stopping $pluginTag plugin")
-            process.destroy()
-            if (!process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()
-        }
-        pluginProcess = null
-        pluginTag = null
+        plugins.stop()
 
         coreProcess?.let { process ->
             log("stopping core")
