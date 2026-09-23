@@ -135,45 +135,22 @@ jobs:
           set -uo pipefail
           # CI logs need a token, annotations do not: surface Gradle failures as
           # annotations so a broken packaging step can be diagnosed from the API.
-          report() {
-            local label="$1" log="$2"
-            echo "::error::$label failed"
-            grep -aE "What went wrong|Execution failed|Caused by|^> |FAILURE|error:|Error:|Exception" "$log" \
-              | head -12 | while IFS= read -r line; do
-                echo "::error::${line//$'\r'/}"
-              done
-          }
+          source bin/desktop/ci-report.sh
           df -h | head -5 | while IFS= read -r line; do echo "::notice::disk $line"; done
-          dump_jpackage() {
-            local dir="$1" tag="$2"
-            local f
-            for f in "$dir"/*-err.txt "$dir"/*-out.txt; do
-              [ -f "$f" ] || continue
-              echo "::error::[$tag] $(basename "$f")"
-              head -25 "$f" | while IFS= read -r line; do echo "::error::[$tag] $line"; done
-            done
-          }
-          dump_args() {
-            local f="$1"
-            [ -f "$f" ] || return 0
-            tr -s ' ' '\n' < "$f" | grep -v '^$' | head -60 | while IFS= read -r line; do
-              echo "::error::jpackage-arg $line"
-            done
-          }
           echo "--- createDistributable ---"
           if ! ./gradlew :desktop:app:createDistributable --console=plain > /tmp/create.log 2>&1; then
             tail -30 /tmp/create.log
-            dump_jpackage desktop/app/build/compose/logs/createDistributable create
-            dump_args desktop/app/build/compose/tmp/createDistributable.args.txt
-            report "createDistributable" /tmp/create.log
+            dump_jpackage_logs desktop/app/build/compose/logs
+            dump_jpackage_args desktop/app/build/compose/tmp/createDistributable.args.txt
+            report_gradle_failure "createDistributable" /tmp/create.log
             exit 1
           fi
           tail -3 /tmp/create.log
           echo "--- packagePortable ---"
           if ! ./gradlew :desktop:app:packagePortable --console=plain > /tmp/portable.log 2>&1; then
             tail -30 /tmp/portable.log
-            dump_jpackage desktop/app/build/compose/logs/createDistributable create
-            report "packagePortable" /tmp/portable.log
+            dump_jpackage_logs desktop/app/build/compose/logs
+            report_gradle_failure "packagePortable" /tmp/portable.log
             exit 1
           fi
           tail -3 /tmp/portable.log
@@ -200,7 +177,20 @@ jobs:
       - name: Package installer (best effort)
         shell: bash
         continue-on-error: true
-        run: ./gradlew :desktop:app:packageDistributionForCurrentOS --console=plain
+        run: |
+          set -uo pipefail
+          source bin/desktop/ci-report.sh
+          if ./gradlew :desktop:app:packageDistributionForCurrentOS --console=plain > /tmp/installer.log 2>&1; then
+            tail -5 /tmp/installer.log
+            find desktop/app/build/compose/binaries/main -maxdepth 2 -type f \
+              \( -name '*.deb' -o -name '*.rpm' -o -name '*.dmg' -o -name '*.msi' -o -name '*.pkg' \) \
+              | while IFS= read -r file; do echo "::notice::installer $file"; done
+          else
+            tail -25 /tmp/installer.log
+            dump_jpackage_logs desktop/app/build/compose/logs
+            report_gradle_failure "packageDistributionForCurrentOS" /tmp/installer.log
+          fi
+          exit 0
       - name: Upload desktop artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -236,5 +226,8 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+          count=$(find release -type f | wc -l)
+          echo "collected $count artifact(s)"
           ls -la release
+          test "$count" -gt 0
           gh release create --latest=false "${{ github.event.inputs.tag }}" --notes="" --title="${{ github.event.inputs.tag }}" ./release/*
