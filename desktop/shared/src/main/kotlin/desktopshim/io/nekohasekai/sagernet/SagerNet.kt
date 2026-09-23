@@ -41,10 +41,22 @@ object SagerNet {
     @Volatile
     var started: Boolean = false
 
-    /** Location of the last known network location, an Android only feature. */
+    /**
+     * Mimics the subset of `android.location.LocationManager` used by shared
+     * code. Desktop has no network location provider, so the service always
+     * reports itself as disabled; a routing rule that matches on SSID therefore
+     * fails with `ROUTE_ALERT_LOCATION_DISABLED` instead of silently emitting a
+     * rule the core cannot evaluate.
+     */
+    class LocationService {
+
+        val isLocationEnabled: Boolean = false
+
+    }
+
+    /** Android only feature; see [LocationService]. */
     @JvmField
-    @Volatile
-    var location: String? = null
+    val location = LocationService()
 
     fun reloadService() {
         // no Android service to reload on desktop

@@ -33,14 +33,11 @@ val sharedIncludes = listOf(
 )
 
 val sharedExcludes = listOf(
-    // needs DataStore/VpnService/Room and produces the Android service config
-    "io/nekohasekai/sagernet/fmt/ConfigBuilder.kt",
     "io/nekohasekai/sagernet/fmt/PluginEntry.kt",
     "io/nekohasekai/sagernet/fmt/Serializable.kt",
     "io/nekohasekai/sagernet/fmt/KryoConverters.java",
     "io/nekohasekai/sagernet/fmt/TypeMap.kt",
     "io/nekohasekai/sagernet/fmt/UniversalFmt.kt",
-    "io/nekohasekai/sagernet/fmt/internal/**",
     // subscription updaters: Android HTTP stack, WorkManager, notifications
     "io/nekohasekai/sagernet/group/AppUpdater.kt",
     "io/nekohasekai/sagernet/group/AgeUpdater.kt",
