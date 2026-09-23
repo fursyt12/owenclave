@@ -386,6 +386,11 @@ jobs:
           * unit tests of the shared subscription importers and the desktop config builder
           * tunnel smoke test through the core bundled into the application image
           * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
+          * transparent mode test: `tun2socks` creates a TUN device inside a network
+            namespace, the client's traffic enters it and reaches a stub SOCKS server,
+            followed by a real run that takes over the default route on each system
+            (informational: the second one is skipped when the runner refuses
+            administrator rights, and it never blocks the build)
 
           Every push builds and tests all four targets: Linux x64, Windows x64,
           macOS arm64 and macOS x64.
@@ -397,9 +402,13 @@ jobs:
           * Desktop package versions use the scheme `1.a.b` for the Android app version
             `0.a.b`, because jpackage refuses an app version whose first component is zero
             on macOS.
+          * Transparent mode (TUN) needs root, or administrator on Windows, where
+            `wintun.dll` must sit next to the launcher. When the device cannot be
+            created the connection log says which right or file is missing, and the
+            application states the reason instead of failing silently.
           * Protocol coverage on desktop is narrower than on Android (no OLCRTC, Mieru,
             TUIC, Juicy, AnyTLS, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP3 or WireGuard
-            yet, and no TUN based transparent proxying). See `desktop/README.md`.
+            yet). See `desktop/README.md`.
           NOTES
           sed -i "s/__VERSION__/${version}/g; s/__DESKTOP_VERSION__/${desktop_version}/g" notes.md
           echo "--- release notes ---"

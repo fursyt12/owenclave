@@ -132,5 +132,9 @@ V2Ray/sing-box JSON are imported exactly like on Android.
 ```
 
 See [desktop/README.md](desktop/README.md) for the architecture, the verification
-commands (`--selftest`, `--selftest-naive`, `--print-config`) and the current protocol
-coverage.
+commands (`--selftest`, `--selftest-naive`, `--selftest-tun`, `--print-config`) and the
+current protocol coverage. On Arch Linux the client installs from a pacman repository:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/fursyt12/owenclave/dev/packaging/arch/setup-repo.sh)"
+```

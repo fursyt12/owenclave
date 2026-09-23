@@ -170,8 +170,7 @@ switch or the per-subscription switch is on.
   rebuilt on desktop;
 * rules have no per-app / package matching (SSID and package rules are Android
   concepts) and there is no rule reordering UI yet;
-* no subscription auto-update scheduling, no QR scanning and no TUN / system wide
-  transparent proxying (the SOCKS and HTTP inbounds are the integration point).
+* no subscription auto-update scheduling and no QR scanning.
 
 ## Transparent mode (TUN)
 
@@ -263,8 +262,9 @@ V2Ray JSON config can always be added as a custom profile and is passed to the
 core unchanged.
 
 Android-only concepts have no desktop equivalent and are intentionally absent:
-TUN/VpnService (the core uses the SOCKS/HTTP inbounds instead), per-app proxy,
-WorkManager based subscription refresh and the AIDL plugin discovery.
+`VpnService` (desktop builds the same idea from `tun2socks` plus the core's SOCKS
+inbound, see [Transparent mode](#transparent-mode-tun)), per-app proxy, WorkManager
+based subscription refresh and the AIDL plugin discovery.
 
 ## Layout
 
