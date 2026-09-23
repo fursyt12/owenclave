@@ -33,18 +33,22 @@ jobs:
             os: ubuntu-latest
             target: linux/amd64
             artifact: linux-x64
+            tag: linux-amd64
           - name: macOS x64
             os: macos-15-intel
             target: darwin/amd64
             artifact: macos-x64
+            tag: darwin-amd64
           - name: macOS arm64
             os: macos-14
             target: darwin/arm64
             artifact: macos-arm64
+            tag: darwin-arm64
           - name: Windows x64
             os: windows-latest
             target: windows/amd64
             artifact: windows-x64
+            tag: windows-amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -202,8 +206,8 @@ jobs:
         with:
           name: owenclave-binaries-${{ matrix.artifact }}
           path: |
-            desktop/core/dist/${{ matrix.target }}
-            desktop/naive/dist/${{ matrix.target }}
+            desktop/core/dist/${{ matrix.tag }}
+            desktop/naive/dist/${{ matrix.tag }}
           if-no-files-found: warn
 
   publish:
