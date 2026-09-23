@@ -123,6 +123,8 @@ V2Ray/sing-box JSON are imported exactly like on Android.
 - NaiveProxy is shipped as an external `naive` process with a local SOCKS listener,
   mirroring the Android plugin architecture
 - portable archive (unpack and run, self contained `data` directory) plus installers
+- transparent TUN mode (all system traffic) built on tun2socks, and a pacman
+  repository for Arch Linux
 
 ```bash
 ./run desktop build        # core + naive + portable zip + installer for this OS

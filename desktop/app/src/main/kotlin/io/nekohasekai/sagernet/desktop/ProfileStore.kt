@@ -22,6 +22,11 @@ class DesktopSettings(
     var hwidValue: String = "",
     /** Fetch subscriptions through the running core, which also bypasses local filtering. */
     var fetchSubscriptionsThroughProxy: Boolean = true,
+    /** Transparent mode: capture all system traffic through a TUN device. */
+    var tunEnabled: Boolean = false,
+    /** TUN interface name on Linux, empty for the default. */
+    var tunInterface: String = "",
+    var tunMtu: Int = 1500,
 ) {
 
     companion object {
@@ -40,9 +45,12 @@ class DesktopSettings(
         sendHwid: Boolean = this.sendHwid,
         hwidValue: String = this.hwidValue,
         fetchSubscriptionsThroughProxy: Boolean = this.fetchSubscriptionsThroughProxy,
+        tunEnabled: Boolean = this.tunEnabled,
+        tunInterface: String = this.tunInterface,
+        tunMtu: Int = this.tunMtu,
     ) = DesktopSettings(
         socksPort, httpPort, routeMode, logLevel, selectedProfileId, bypassPrivateNetworks,
-        sendHwid, hwidValue, fetchSubscriptionsThroughProxy,
+        sendHwid, hwidValue, fetchSubscriptionsThroughProxy, tunEnabled, tunInterface, tunMtu,
     )
 
 }
@@ -95,6 +103,9 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                     sendHwid = json.get("sendHwid")?.asBoolean ?: false,
                     hwidValue = json.get("hwidValue")?.asString.orEmpty(),
                     fetchSubscriptionsThroughProxy = json.get("fetchSubscriptionsThroughProxy")?.asBoolean ?: true,
+                    tunEnabled = json.get("tunEnabled")?.asBoolean ?: false,
+                    tunInterface = json.get("tunInterface")?.asString.orEmpty(),
+                    tunMtu = json.get("tunMtu")?.asInt ?: 1500,
                 )
             }
         }.onFailure {
@@ -115,6 +126,9 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                 addProperty("sendHwid", settings.sendHwid)
                 addProperty("hwidValue", settings.hwidValue)
                 addProperty("fetchSubscriptionsThroughProxy", settings.fetchSubscriptionsThroughProxy)
+                addProperty("tunEnabled", settings.tunEnabled)
+                addProperty("tunInterface", settings.tunInterface)
+                addProperty("tunMtu", settings.tunMtu)
                 settings.selectedProfileId?.let { addProperty("selectedProfileId", it) }
             })
             root.add("subscriptions", JsonArray().apply {

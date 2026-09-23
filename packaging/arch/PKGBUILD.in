@@ -1,0 +1,30 @@
+# Maintainer: fursyt12 <yt.wilde.simon@gmail.com>
+# Template used by bin/desktop/arch/package.sh: @PKGVER@ and @PKGDESC@ are filled
+# in from version.properties before makepkg runs.
+pkgname=owenclave-desktop
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="@PKGDESC@"
+arch=('x86_64' 'aarch64')
+url="https://github.com/fursyt12/owenclave"
+license=('GPL-3.0-only')
+depends=()
+provides=('owenclave')
+conflicts=('owenclave')
+options=('!strip' '!debug' '!emptydirs')
+
+# The application image built by jpackage, already containing its own runtime, the
+# proxy core, NaiveProxy and tun2socks, so no system JRE is required.
+source=("owenclave-desktop-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -dm755 "$pkgdir/opt/owenclave"
+  cp -a "$srcdir/opt/owenclave/." "$pkgdir/opt/owenclave/"
+
+  install -dm755 "$pkgdir/usr/bin"
+  ln -sf /opt/owenclave/bin/Owenclave "$pkgdir/usr/bin/owenclave"
+
+  install -Dm644 "$srcdir/owenclave.desktop" "$pkgdir/usr/share/applications/owenclave.desktop"
+  install -Dm644 "$srcdir/owenclave.png" "$pkgdir/usr/share/pixmaps/owenclave.png"
+}

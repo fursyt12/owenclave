@@ -173,6 +173,81 @@ switch or the per-subscription switch is on.
 * no subscription auto-update scheduling, no QR scanning and no TUN / system wide
   transparent proxying (the SOCKS and HTTP inbounds are the integration point).
 
+## Transparent mode (TUN)
+
+The core CLI cannot create a TUN device in this fork: on Android the app creates one
+through `VpnService` and hands the fd to the gomobile library. Desktop transparent
+mode is therefore assembled from two pieces:
+
+```
+system traffic -> TUN device -> tun2socks -> SOCKS 127.0.0.1:<port> -> core -> upstream
+```
+
+* `tun2socks` (v2.7.0, downloaded by `./run desktop tun2socks download`) owns the
+  device and pumps it into the core's local SOCKS inbound;
+* the core's outbound is pinned to the physical interface with
+  `streamSettings.sockopt.bindToDevice`, which the core implements on Linux
+  (`SO_BINDTODEVICE`), macOS (`IP_BOUND_IF`) and Windows (`IP_UNICAST_IF`). Without
+  that pin the upstream connection would follow the tunnel's default route and loop;
+* addresses and routes follow the upstream tun2socks recipes: split defaults
+  (`0.0.0.0/1` + `128.0.0.0/1`) on Linux, the documented route list on macOS,
+  `netsh` address/DNS/route on Windows. Everything is removed again on disconnect.
+
+Enable it in **Settings → Transparent mode (TUN)**; it applies on the next connect.
+
+### Privileges
+
+TUN mode needs administrator rights:
+
+| OS | How |
+| --- | --- |
+| Linux | run the client as root, or grant `CAP_NET_ADMIN` |
+| macOS | start it with `sudo` |
+| Windows | start it as Administrator (plus `wintun.dll`, see below) |
+
+Windows additionally needs `wintun.dll` next to `tun2socks.exe`; the download script
+fetches it from wintun.net when that host is reachable, otherwise put the DLL into
+the runtime directory by hand (the app says so explicitly).
+
+### Verification
+
+```sh
+# no privileges needed if user namespaces are available: a namespace gives the TUN
+# device without touching the host routes, and a stub SOCKS server answers
+sudo unshare -rn bash -c "ip link set lo up; ip route add default dev lo || true; \
+  ./desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest-tun-stub"
+
+# the real thing: takes over the default route and fetches a public URL through it
+sudo ./desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest-tun
+```
+
+CI runs both: the namespace variant on Linux, the real one (last step, non blocking)
+on Linux, macOS and Windows.
+
+## Arch Linux
+
+The client is packaged as `owenclave-desktop` for `/opt/owenclave` (the jpackage
+application image, so no system JRE is needed) with a launcher in `/usr/bin`, a
+desktop entry and an icon.
+
+One command adds the pacman repository and installs the client:
+
+```sh
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/fursyt12/owenclave/dev/packaging/arch/setup-repo.sh)"
+```
+
+The repository lives in the moving `desktop-repo` GitHub release, so the same URL
+keeps working and `pacman -Syu` picks up new builds. The packages are not GPG
+signed, which the installer reflects with `SigLevel = Optional TrustAll` (the files
+come over HTTPS from that single release URL). Remove the repository entry again
+with `... setup-repo.sh --uninstall`.
+
+Building the package locally (needs `base-devel`):
+
+```sh
+./run desktop arch package    # writes desktop/arch/dist/*.pkg.tar.zst and owenclave.db
+```
+
 ## Supported protocols
 
 naive (external plugin), Shadowsocks (incl. 2022 methods and SIP003 plugins),

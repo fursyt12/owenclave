@@ -50,21 +50,28 @@ val hostArch = System.getProperty("os.arch").lowercase().let {
 val platformTag = "$hostOs-$hostArch"
 val coreBinaryName = if (hostOs == "windows") "owenclave-core.exe" else "owenclave-core"
 val naiveBinaryName = if (hostOs == "windows") "naive.exe" else "naive"
+val tun2socksBinaryName = if (hostOs == "windows") "tun2socks.exe" else "tun2socks"
 
 val coreDistDir = rootProject.layout.projectDirectory.dir("desktop/core/dist/$platformTag")
 val naiveDistDir = rootProject.layout.projectDirectory.dir("desktop/naive/dist/$platformTag")
+val tun2socksDistDir = rootProject.layout.projectDirectory.dir("desktop/tun2socks/dist/$platformTag")
 
 /** Directory that gets bundled into the application jar as `/bin/<binary>`. */
 val runtimeResourcesDir = layout.buildDirectory.dir("desktop-resources")
 
 val prepareDesktopRuntime = tasks.register<Sync>("prepareDesktopRuntime") {
-    description = "Stages the core and NaiveProxy binaries for the current platform"
+    description = "Stages the core, NaiveProxy and tun2socks binaries for the current platform"
     into(runtimeResourcesDir.map { it.dir("bin") })
     from(coreDistDir) {
         include(coreBinaryName)
     }
     from(naiveDistDir) {
         include(naiveBinaryName)
+    }
+    from(tun2socksDistDir) {
+        include(tun2socksBinaryName)
+        // only present on Windows, and only when wintun.net was reachable
+        include("wintun.dll")
     }
     doLast {
         logger.lifecycle("Staged desktop runtime for $platformTag in ${runtimeResourcesDir.get().asFile}")

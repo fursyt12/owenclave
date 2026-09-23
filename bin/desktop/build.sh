@@ -30,6 +30,8 @@ if [ "${1:-}" = "all" ]; then
     "$PROJECT/bin/desktop/core/build.sh" all
   TARGETS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 windows/386" \
     "$PROJECT/bin/desktop/naive/download.sh" all
+  TARGETS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64" \
+    "$PROJECT/bin/desktop/tun2socks/download.sh" all
   echo "=== cross platform binaries are in desktop/core/dist and desktop/naive/dist ==="
   echo "=== packaging only works for the host OS: ./gradlew :desktop:app:packagePortable ==="
   exit 0
@@ -40,8 +42,14 @@ echo ">>> desktop target: $TARGET"
 
 TARGETS="$TARGET" "$PROJECT/bin/desktop/core/build.sh"
 TARGETS="$TARGET" "$PROJECT/bin/desktop/naive/download.sh"
+TARGETS="$TARGET" "$PROJECT/bin/desktop/tun2socks/download.sh"
 
 ./gradlew :desktop:app:packagePortable --console=plain
+
+if [ "$TARGET" = "linux/amd64" ] && command -v makepkg >/dev/null 2>&1; then
+  echo ">>> building the Arch package and repository"
+  bash "$PROJECT/bin/desktop/arch/package.sh"
+fi
 
 echo "=== desktop artifacts ==="
 ls -la "$PROJECT/desktop/app/build/compose/binaries/main/portable/" 2>/dev/null || true

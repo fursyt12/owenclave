@@ -91,6 +91,12 @@ private fun runCli(args: Array<String>): Int? {
     if (args.contains("--selftest-naive")) {
         return SelfTest.runNaive()
     }
+    if (args.contains("--selftest-tun")) {
+        return SelfTest.runTun(stub = false)
+    }
+    if (args.contains("--selftest-tun-stub")) {
+        return SelfTest.runTun(stub = true)
+    }
     val printIndex = args.indexOf("--print-config")
     if (printIndex >= 0) {
         val input = args.getOrNull(printIndex + 1)
@@ -670,6 +676,52 @@ private fun SettingsSection(state: AppState) {
                 ) { Text(label, fontSize = 12.sp) }
             }
         }
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Text("Transparent mode (TUN)", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.tunEnabled,
+                onCheckedChange = { value -> state.updateSettings { it.copy(tunEnabled = value) } },
+            )
+            Text("Route all system traffic through the selected profile", fontSize = 13.sp)
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = settings.tunInterface,
+                onValueChange = { value -> state.updateSettings { it.copy(tunInterface = value.trim()) } },
+                label = { Text("Interface name (Linux, optional)") },
+                singleLine = true,
+                modifier = Modifier.width(280.dp),
+            )
+            Spacer(Modifier.width(12.dp))
+            OutlinedTextField(
+                value = settings.tunMtu.toString(),
+                onValueChange = { value ->
+                    value.filter { it.isDigit() }.take(5).toIntOrNull()
+                        ?.takeIf { it in 576..9000 }
+                        ?.let { mtu -> state.updateSettings { it.copy(tunMtu = mtu) } }
+                },
+                label = { Text("MTU") },
+                singleLine = true,
+                modifier = Modifier.width(120.dp),
+            )
+        }
+        Text(
+            "TUN mode needs administrator rights: on Linux start the client as root (or grant " +
+                "CAP_NET_ADMIN), on macOS with sudo, on Windows as Administrator. It applies when " +
+                "you connect, and the routes are restored when you disconnect.",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            "tun2socks: " + (DesktopRuntime.tun2socksBinary()?.absolutePath ?: "not found (run ./run desktop tun2socks download)"),
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Spacer(Modifier.height(16.dp))
         HorizontalDivider()
         Spacer(Modifier.height(16.dp))

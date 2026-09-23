@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Owenclave
+GenericName=Proxy client
+Comment=Proxy client for NaiveProxy, Shadowsocks, VLESS, VMess and more
+Exec=owenclave
+Icon=owenclave
+Terminal=false
+Categories=Network;Security;
+Keywords=proxy;vpn;shadowsocks;naiveproxy;vless;vmess;hysteria;
+StartupWMClass=Owenclave

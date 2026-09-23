@@ -49,6 +49,10 @@ object DesktopRuntime {
     @Synchronized
     fun olcrtcBinary(): File? = cache.getOrPut("olcrtc") { locate("olcrtc") }
 
+    /** Userspace TUN pump used by the transparent mode. */
+    @Synchronized
+    fun tun2socksBinary(): File? = cache.getOrPut("tun2socks") { locate("tun2socks") }
+
     fun executableName(baseName: String): String = if (isWindows) "$baseName.exe" else baseName
 
     private fun locate(baseName: String): File? {
@@ -65,6 +69,7 @@ object DesktopRuntime {
             candidates.add(File(devRoot, "desktop/core/dist/$platformTag/$fileName"))
             candidates.add(File(devRoot, "desktop/naive/dist/$platformTag/$fileName"))
             candidates.add(File(devRoot, "desktop/olcrtc/dist/$platformTag/$fileName"))
+            candidates.add(File(devRoot, "desktop/tun2socks/dist/$platformTag/$fileName"))
         }
         val workingDir = File(System.getProperty("user.dir", "."))
         candidates.add(File(workingDir, "bin/$fileName"))

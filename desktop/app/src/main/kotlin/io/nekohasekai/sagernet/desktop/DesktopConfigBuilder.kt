@@ -78,6 +78,7 @@ object DesktopConfigBuilder {
         settings: DesktopSettings,
         plugin: PluginBinding?,
         rules: List<RoutingRule> = emptyList(),
+        bindInterface: String? = null,
     ): String {
         val root = JsonObject()
 
@@ -94,6 +95,13 @@ object DesktopConfigBuilder {
             freedom("proxy")
         } else {
             outboundFor(bean, plugin, settings)
+        }
+
+        // In transparent mode the default route points at the tunnel, so the
+        // outbound that reaches the upstream server must be pinned to the physical
+        // interface, otherwise it would loop straight back into the tunnel.
+        if (!bindInterface.isNullOrBlank()) {
+            proxyOutbound.bindToInterface(bindInterface)
         }
 
         root.add("outbounds", JsonArray().apply {
@@ -190,6 +198,13 @@ object DesktopConfigBuilder {
             add("quic")
         })
         addProperty("routeOnly", false)
+    }
+
+    /** Pins every socket of this outbound to a network interface. */
+    private fun JsonObject.bindToInterface(interfaceName: String) {
+        val streamSettings = getAsJsonObject("streamSettings") ?: JsonObject().also { add("streamSettings", it) }
+        val sockopt = streamSettings.getAsJsonObject("sockopt") ?: JsonObject().also { streamSettings.add("sockopt", it) }
+        sockopt.addProperty("bindToDevice", interfaceName)
     }
 
     private fun freedom(tag: String): JsonObject = JsonObject().apply {

@@ -22,6 +22,7 @@ import java.util.UUID
  */
 class CoreRunner(private val log: (String) -> Unit) {
 
+    private var tunSession: TunSession? = null
     private var coreProcess: Process? = null
     private var pluginProcess: Process? = null
     private var pluginTag: String? = null
@@ -55,7 +56,9 @@ class CoreRunner(private val log: (String) -> Unit) {
             if (config.isNullOrBlank()) {
                 throw UnsupportedProfileException("The profile is empty")
             }
-            return startCore(profile, config, settings)
+            startCore(profile, config, settings)
+            startTunIfEnabled(settings)
+            return
         }
 
         if (!DesktopConfigBuilder.supports(bean)) {
@@ -67,8 +70,21 @@ class CoreRunner(private val log: (String) -> Unit) {
             else -> null
         }
 
-        val config = DesktopConfigBuilder.build(bean, settings, pluginBinding, rules)
+        val tunInterface = if (settings.tunEnabled) TunSession.primaryInterface() else null
+        val config = DesktopConfigBuilder.build(bean, settings, pluginBinding, rules, tunInterface)
         startCore(profile, config, settings)
+
+        if (tunInterface != null) {
+            val session = TunSession { line -> log(line) }
+            try {
+                session.start(tunInterface, settings.tunMtu, settings.socksPort, settings.tunInterface)
+            } catch (e: Exception) {
+                stop()
+                throw e
+            }
+            tunSession = session
+            log("transparent mode ready on ${session.device}")
+        }
     }
 
     private fun startNaivePlugin(bean: NaiveBean, settings: DesktopSettings): PluginBinding {
@@ -93,6 +109,19 @@ class CoreRunner(private val log: (String) -> Unit) {
 
         awaitPort(port, process, timeoutMillis = 20_000, what = "NaiveProxy plugin")
         return PluginBinding(port, username, password)
+    }
+
+    private fun startTunIfEnabled(settings: DesktopSettings) {
+        if (!settings.tunEnabled) return
+        val session = TunSession { line -> log(line) }
+        try {
+            session.start(TunSession.primaryInterface(), settings.tunMtu, settings.socksPort, settings.tunInterface)
+        } catch (e: Exception) {
+            stop()
+            throw e
+        }
+        tunSession = session
+        log("transparent mode ready on ${session.device}")
     }
 
     private fun startCore(profile: Profile, config: String, settings: DesktopSettings) {
@@ -142,6 +171,13 @@ class CoreRunner(private val log: (String) -> Unit) {
         running = false
         SagerNet.started = false
         DataStore.startedProfile = 0L
+
+        // The routes and the device have to go before the core disappears.
+        tunSession?.let { session ->
+            log("stopping transparent mode")
+            session.stop()
+        }
+        tunSession = null
 
         pluginProcess?.let { process ->
             log("stopping $pluginTag plugin")
