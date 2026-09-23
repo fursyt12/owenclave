@@ -301,3 +301,135 @@ jobs:
             done
           fi
           exit 0
+
+  publish:
+    name: Publish Release
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/desktop-v')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'y' && github.event.inputs.tag != '')
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Collect assets and write release notes
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            echo "TAG=${GITHUB_REF_NAME}" >>"$GITHUB_ENV"
+          else
+            echo "TAG=${{ github.event.inputs.tag }}" >>"$GITHUB_ENV"
+          fi
+          version="$(grep -E '^VERSION_NAME=' version.properties | cut -d= -f2 | tr -d '[:space:]')"
+          desktop_version="$(printf '%s' "$version" | sed -E 's/^0+(\.)/1\1/')"
+          echo "VERSION=${version}" >>"$GITHUB_ENV"
+          echo "DESKTOP_VERSION=${desktop_version}" >>"$GITHUB_ENV"
+          rm -rf release notes.md
+          mkdir -p release
+          # Installer names do not contain the platform, so the macOS dmg of both
+          # architectures would overwrite each other: suffix them with the matrix tag
+          # taken from the artifact directory name. Portable archives already carry
+          # the os and the architecture.
+          while IFS= read -r file; do
+            rel="${file#artifacts/}"
+            leg="${rel%%/*}"
+            short="${leg#owenclave-desktop-}"
+            base="$(basename "$file")"
+            case "$base" in
+              *-portable.zip) target="$base" ;;
+              *) target="${base%.*}-${short}.${base##*.}" ;;
+            esac
+            cp "$file" "release/$target"
+          done < <(find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.rpm" \) | sort)
+          # the Arch repository files must keep their exact names: pacman asks for
+          # <repo>.db and for the package file inside the repository
+          mkdir -p arch
+          find artifacts/owenclave-arch-repo -type f -name '*.pkg.tar.zst' -exec cp {} release/ \; 2>/dev/null || true
+          find artifacts/owenclave-arch-repo -type f \( -name '*.pkg.tar.zst' -o -name 'owenclave.db*' -o -name 'owenclave.files*' \) -exec cp {} arch/ \; 2>/dev/null || true
+          count=$(find release -type f | wc -l)
+          echo "collected $count asset(s) for ${TAG:-manual}"
+          ls -la arch 2>/dev/null || true
+          ls -la release
+          test "$count" -gt 0
+          cat > notes.md <<'NOTES'
+          Desktop client for macOS, Windows and Linux. It reuses the Android protocol
+          layer and runs the same Go engine as a child process, so profiles, share
+          links, Clash YAML and V2Ray/sing-box JSON behave exactly like on Android.
+
+          Built from the Android app version `__VERSION__`; desktop packages use the
+          version `__DESKTOP_VERSION__`.
+
+          ## Downloads
+
+          | Platform | Portable (unpack and run) | Installer |
+          | --- | --- | --- |
+          | Windows x64 | `owenclave-desktop-__DESKTOP_VERSION__-windows-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-windows-x64.msi` |
+          | macOS arm64 | `owenclave-desktop-__DESKTOP_VERSION__-darwin-arm64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-macos-arm64.dmg` |
+          | macOS x64 | `owenclave-desktop-__DESKTOP_VERSION__-darwin-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-macos-x64.dmg` |
+          | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `owenclave___DESKTOP_VERSION___amd64-linux-x64.deb`, `owenclave-__DESKTOP_VERSION__-1.x86_64-linux-x64.rpm` |
+
+          The portable archive is self contained: unpack it, start the launcher, and
+          profiles, settings plus the extracted `owenclave-core` and `naive` binaries
+          stay inside the unpacked folder as long as a `data` directory sits next to
+          the launcher (remove it to fall back to the per user OS directory).
+
+          ## Verified on every build
+
+          * unit tests of the shared subscription importers and the desktop config builder
+          * tunnel smoke test through the core bundled into the application image
+          * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
+
+          Every push builds and tests all four targets: Linux x64, Windows x64,
+          macOS arm64 and macOS x64.
+
+          ## Notes
+
+          * The macOS bundles are not signed with an Apple certificate, so Gatekeeper
+            asks once: right click then Open, or `xattr -dr com.apple.quarantine <app>`.
+          * Desktop package versions use the scheme `1.a.b` for the Android app version
+            `0.a.b`, because jpackage refuses an app version whose first component is zero
+            on macOS.
+          * Protocol coverage on desktop is narrower than on Android (no OLCRTC, Mieru,
+            TUIC, Juicy, AnyTLS, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP3 or WireGuard
+            yet, and no TUN based transparent proxying). See `desktop/README.md`.
+          NOTES
+          sed -i "s/__VERSION__/${version}/g; s/__DESKTOP_VERSION__/${desktop_version}/g" notes.md
+          echo "--- release notes ---"
+          cat notes.md
+      - name: Publish or update the release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "updating the existing release $TAG"
+            gh release upload "$TAG" ./release/* --clobber
+            gh release edit "$TAG" --title "Owenclave desktop ${DESKTOP_VERSION}" --notes-file notes.md --latest=false
+            # drop assets that belonged to an earlier layout of this release
+            while IFS= read -r asset; do
+              [ -f "release/$asset" ] || gh release delete-asset "$TAG" "$asset" --yes
+            done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          else
+            gh release create --latest=false "$TAG" \
+              --title "Owenclave desktop ${DESKTOP_VERSION}" \
+              --notes-file notes.md \
+              ./release/*
+          fi
+          gh release view "$TAG"
+
+          # Stable repository release: the URL used by the one command installer and
+          # by the Server line in /etc/pacman.conf never changes.
+          if [ -n "$(ls -A arch 2>/dev/null)" ]; then
+            if ! gh release view desktop-repo >/dev/null 2>&1; then
+              gh release create desktop-repo --latest=false --title "Arch repository" \
+                --notes "pacman repository for owenclave-desktop.\n\nInstall with:\n\n    sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/fursyt12/owenclave/dev/packaging/arch/setup-repo.sh)\""
+            fi
+            gh release upload desktop-repo ./arch/* --clobber
+            echo "uploaded the Arch repository assets"
+          fi
