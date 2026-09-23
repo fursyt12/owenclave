@@ -230,7 +230,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts
-      - name: Collect installers and write release notes
+      - name: Collect assets and write release notes
         run: |
           set -euo pipefail
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
@@ -242,8 +242,23 @@ jobs:
           desktop_version="$(printf '%s' "$version" | sed -E 's/^0+(\.)/1\1/')"
           echo "VERSION=${version}" >>"$GITHUB_ENV"
           echo "DESKTOP_VERSION=${desktop_version}" >>"$GITHUB_ENV"
+          rm -rf release notes.md
           mkdir -p release
-          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+          # Installer names do not contain the platform, so the macOS dmg of both
+          # architectures would overwrite each other: suffix them with the matrix tag
+          # taken from the artifact directory name. Portable archives already carry
+          # the os and the architecture.
+          while IFS= read -r file; do
+            rel="${file#artifacts/}"
+            leg="${rel%%/*}"
+            short="${leg#owenclave-desktop-}"
+            base="$(basename "$file")"
+            case "$base" in
+              *-portable.zip) target="$base" ;;
+              *) target="${base%.*}-${short}.${base##*.}" ;;
+            esac
+            cp "$file" "release/$target"
+          done < <(find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.rpm" \) | sort)
           count=$(find release -type f | wc -l)
           echo "collected $count asset(s) for ${TAG:-manual}"
           ls -la release
@@ -260,9 +275,10 @@ jobs:
 
           | Platform | Portable (unpack and run) | Installer |
           | --- | --- | --- |
-          | Windows x64 | `owenclave-desktop-__DESKTOP_VERSION__-windows-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__.msi` |
-          | macOS arm64 / x64 | `owenclave-desktop-__DESKTOP_VERSION__-macos-*-portable.zip` | `Owenclave-__DESKTOP_VERSION__.dmg` |
-          | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `.deb` and `.rpm` |
+          | Windows x64 | `owenclave-desktop-__DESKTOP_VERSION__-windows-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-windows-x64.msi` |
+          | macOS arm64 | `owenclave-desktop-__DESKTOP_VERSION__-darwin-arm64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-macos-arm64.dmg` |
+          | macOS x64 | `owenclave-desktop-__DESKTOP_VERSION__-darwin-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-macos-x64.dmg` |
+          | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `owenclave___DESKTOP_VERSION___amd64-linux-x64.deb`, `owenclave-__DESKTOP_VERSION__-1.x86_64-linux-x64.rpm` |
 
           The portable archive is self contained: unpack it, start the launcher, and
           profiles, settings plus the extracted `owenclave-core` and `naive` binaries
@@ -290,10 +306,23 @@ jobs:
             yet, and no TUN based transparent proxying). See `desktop/README.md`.
           NOTES
           sed -i "s/__VERSION__/${version}/g; s/__DESKTOP_VERSION__/${desktop_version}/g" notes.md
-      - name: Publish Release
+          echo "--- release notes ---"
+          cat notes.md
+      - name: Publish or update the release
         run: |
           set -euo pipefail
-          gh release create --latest=false "$TAG" \
-            --title "Owenclave desktop ${DESKTOP_VERSION}" \
-            --notes-file notes.md \
-            ./release/*
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "updating the existing release $TAG"
+            gh release upload "$TAG" ./release/* --clobber
+            gh release edit "$TAG" --title "Owenclave desktop ${DESKTOP_VERSION}" --notes-file notes.md --latest=false
+            # drop assets that belonged to an earlier layout of this release
+            while IFS= read -r asset; do
+              [ -f "release/$asset" ] || gh release delete-asset "$TAG" "$asset" --yes
+            done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          else
+            gh release create --latest=false "$TAG" \
+              --title "Owenclave desktop ${DESKTOP_VERSION}" \
+              --notes-file notes.md \
+              ./release/*
+          fi
+          gh release view "$TAG"
