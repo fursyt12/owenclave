@@ -59,6 +59,12 @@ TARGETS="darwin/arm64"  ./run desktop naive download # or: all
 ./gradlew :desktop:app:packageDistributionForCurrentOS
 ```
 
+Desktop artifacts are versioned `1.a.b` for an Android app version `0.a.b`:
+`jpackage` refuses an app-version whose first component is zero on macOS
+("The first number in an app-version cannot be zero or negative"), and all three
+desktop platforms should carry the same version. `--version` and the UI still show
+the application version from `version.properties`.
+
 Artifacts land in `desktop/app/build/compose/binaries/main/`:
 
 | Artifact | Path | Notes |

@@ -24,6 +24,14 @@ val versionProperties = Properties().apply {
 }
 val appVersion = versionProperties.getProperty("VERSION_NAME").trim()
 
+/*
+ * jpackage refuses an app-version whose first component is zero on macOS
+ * ("The first number in an app-version cannot be zero or negative"), while the
+ * Android app versions are 0.x. Desktop artifacts therefore map 0.a.b to 1.a.b so
+ * that all three desktop platforms carry the same, valid version.
+ */
+val desktopVersion = appVersion.replaceFirst(Regex("^0+(?=\\.)"), "1")
+
 /** Build host == packaging target for jpackage, so the host tuple selects the binaries. */
 val hostOs = System.getProperty("os.name").lowercase().let {
     when {
@@ -97,7 +105,7 @@ val packagePortable = tasks.register<Zip>("packagePortable") {
     description = "Builds the portable (unpack and run) archive for the current platform"
     dependsOn(preparePortable)
     from(portableStaging)
-    archiveFileName.set("owenclave-desktop-$appVersion-$platformTag-portable.zip")
+    archiveFileName.set("owenclave-desktop-$desktopVersion-$platformTag-portable.zip")
     destinationDirectory.set(layout.buildDirectory.dir("compose/binaries/main/portable"))
     // Gradle does not keep unix permissions in archives, but a portable build has
     // to keep the launcher and the bundled JRE binaries executable.
@@ -139,7 +147,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm)
             packageName = "Owenclave"
-            packageVersion = appVersion
+            packageVersion = desktopVersion
             description = "Owenclave desktop proxy client"
             vendor = "owenewans"
             copyright = "GPL-3.0"
