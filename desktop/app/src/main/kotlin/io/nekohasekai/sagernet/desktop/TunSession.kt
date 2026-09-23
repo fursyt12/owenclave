@@ -316,15 +316,30 @@ class TunSession(private val log: (String) -> Unit) {
         }
 
         private fun windowsPrimary(): Pair<String, String> {
-            // the $ signs belong to PowerShell, so they are escaped for Kotlin
-            val script = "(Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | " +
-                "Select-Object -First 1) | ForEach-Object { \"\$(\$_.InterfaceAlias)|\$(\$_.NextHop)\" }"
-            val text = output(listOf("powershell", "-NoProfile", "-NonInteractive", "-Command", script))
-            val parts = text.trim().lineSequence().lastOrNull { it.contains("|") }?.split("|")
-            if (parts.isNullOrEmpty() || parts[0].isBlank()) {
-                throw TunException("cannot detect the default network interface: ${text.trim()}")
+            // Two single property reads. The previous version asked PowerShell for a
+            // formatted string built inside ForEach-Object with $_, and on the CI runner
+            // PowerShell answered with a parse error whose text contains a "|"; the
+            // parser below then took that error as the interface name. Asking for one
+            // property at a time keeps the output to a single line, and the effective
+            // route metric includes the interface metric.
+            val route = "(Get-NetRoute -DestinationPrefix 0.0.0.0/0 | " +
+                "Sort-Object -Property RouteMetric, InterfaceMetric | Select-Object -First 1)"
+            val interfaceName = powershellValue("$route.InterfaceAlias")
+            val gateway = powershellValue("$route.NextHop")
+            if (interfaceName.isBlank() || interfaceName.contains('+')) {
+                throw TunException(
+                    "cannot detect the default network interface" +
+                        if (interfaceName.isBlank()) "" else ": $interfaceName"
+                )
             }
-            return parts[0].trim() to parts.getOrElse(1) { "" }.trim()
+            return interfaceName to gateway
+        }
+
+        /** Runs a PowerShell expression and returns its first line of real output. */
+        private fun powershellValue(script: String): String {
+            val text = output(listOf("powershell", "-NoProfile", "-NonInteractive", "-Command", script))
+            if (text.contains("At line:") || text.contains("CategoryInfo")) return ""
+            return text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
         }
 
     }
