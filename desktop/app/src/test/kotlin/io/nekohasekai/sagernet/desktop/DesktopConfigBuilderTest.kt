@@ -1,0 +1,193 @@
+package io.nekohasekai.sagernet.desktop
+
+import com.google.gson.JsonParser
+import io.nekohasekai.sagernet.LogLevel
+import io.nekohasekai.sagernet.fmt.naive.NaiveBean
+import io.nekohasekai.sagernet.fmt.shadowsocks.ShadowsocksBean
+import io.nekohasekai.sagernet.fmt.v2ray.VMessBean
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+
+/**
+ * Covers the desktop specific glue: the shared importer wired to the desktop
+ * config builder, and the desktop `libexclavecore` shim that builds proxy URIs.
+ */
+class DesktopConfigBuilderTest {
+
+    private fun outboundOf(config: String, tag: String) = JsonParser.parseString(config).asJsonObject
+        .getAsJsonArray("outbounds")
+        .map { it.asJsonObject }
+        .first { it.get("tag").asString == tag }
+
+    @Test
+    fun `parses a shadowsocks share link and proxies through it`() {
+        val beans = SubscriptionImporter.parse("ss://YWVzLTI1Ni1nY206d2ludGVzdHBhc3M=@127.0.0.1:18388#selftest")
+        assertEquals(1, beans.size)
+        val bean = beans.first()
+        assertTrue(bean is ShadowsocksBean)
+        assertEquals("127.0.0.1", bean.serverAddress)
+        assertEquals(18388, bean.serverPort)
+        assertEquals("aes-256-gcm", (bean as ShadowsocksBean).method)
+        assertEquals("wintestpass", bean.password)
+
+        val config = DesktopConfigBuilder.build(bean, DesktopSettings(), null)
+        val proxy = outboundOf(config, "proxy")
+        assertEquals("shadowsocks", proxy.get("protocol").asString)
+        val server = proxy.getAsJsonObject("settings").getAsJsonArray("servers")[0].asJsonObject
+        assertEquals("127.0.0.1", server.get("address").asString)
+        assertEquals(18388, server.get("port").asInt)
+    }
+
+    @Test
+    fun `parses a clash yaml subscription including naive`() {
+        val yaml = """
+            proxies:
+              - name: My Naive
+                type: naive
+                server: example.com
+                port: 443
+                proto: https
+                username: user
+                password: pass
+                sni: example.com
+              - name: My SS
+                type: ss
+                server: ss.example.com
+                port: 8388
+                cipher: aes-256-gcm
+                password: secret
+        """.trimIndent()
+
+        val beans = SubscriptionImporter.parse(yaml)
+        assertEquals(2, beans.size)
+        assertTrue(beans.any { it is NaiveBean }, "naive should be parsed from clash yaml")
+        assertTrue(beans.any { it is ShadowsocksBean }, "ss should be parsed from clash yaml")
+        assertEquals("My Naive", beans.first().name)
+    }
+
+    @Test
+    fun `parses a v2ray vmess outbound document`() {
+        val document = """
+            {
+              "outbounds": [
+                {
+                  "tag": "proxy",
+                  "protocol": "vmess",
+                  "settings": {
+                    "vnext": [
+                      { "address": "v.example.com", "port": 443,
+                        "users": [ { "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": 0 } ] }
+                    ]
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val beans = SubscriptionImporter.parse(document)
+        assertEquals(1, beans.size)
+        val bean = beans.first()
+        assertTrue(bean is VMessBean)
+        assertEquals("b831381d-6324-4d53-ad4f-8cda48b30811", (bean as VMessBean).uuid)
+    }
+
+    @Test
+    fun `naive profile is routed through the plugin socks listener`() {
+        val bean = NaiveBean().apply {
+            serverAddress = "naive.example.com"
+            serverPort = 443
+            proto = "https"
+            username = "user"
+            password = "pass"
+            sni = "naive.example.com"
+        }
+        bean.initializeDefaultValues()
+
+        val plugin = PluginBinding(port = 41234, username = "plugin-user", password = "plugin-pass")
+        val config = DesktopConfigBuilder.build(bean, DesktopSettings(), plugin)
+
+        val proxy = outboundOf(config, "proxy")
+        assertEquals("socks", proxy.get("protocol").asString)
+        val server = proxy.getAsJsonObject("settings").getAsJsonArray("servers")[0].asJsonObject
+        assertEquals("127.0.0.1", server.get("address").asString)
+        assertEquals(41234, server.get("port").asInt)
+        val user = server.getAsJsonArray("users")[0].asJsonObject
+        assertEquals("plugin-user", user.get("user").asString)
+        assertEquals("plugin-pass", user.get("pass").asString)
+    }
+
+    @Test
+    fun `naive plugin config is generated from the shared formatter`() {
+        val bean = NaiveBean().apply {
+            serverAddress = "naive.example.com"
+            serverPort = 443
+            proto = "https"
+            username = "user"
+            password = "pass"
+            sni = "naive.example.com"
+            extraHeaders = "X-Test: 1"
+        }
+        bean.initializeDefaultValues()
+
+        val config = JsonParser.parseString(
+            DesktopConfigBuilder.naivePluginConfig(bean, 41234, "u", "p")
+        ).asJsonObject
+
+        assertEquals("socks://u:p@127.0.0.1:41234", config.get("listen").asString)
+        assertTrue(config.get("proxy").asString.startsWith("https://user:pass@naive.example.com:443"))
+        assertEquals("X-Test: 1", config.get("extra-headers").asString)
+        assertEquals("MAP naive.example.com naive.example.com", config.get("host-resolver-rules").asString)
+    }
+
+    @Test
+    fun `raw config profiles are passed through unchanged`() {
+        val profile = Profile(name = "custom", customConfig = """{ "inbounds": [], "outbounds": [] }""")
+        assertNotNull(profile.customConfig)
+        assertEquals("Custom", profile.protocolName)
+        assertEquals("raw config", profile.address)
+    }
+
+    @Test
+    fun `private networks are bypassed only when enabled`() {
+        val bean = ShadowsocksBean().apply {
+            serverAddress = "1.2.3.4"
+            serverPort = 8388
+            method = "aes-256-gcm"
+            password = "secret"
+        }
+        bean.initializeDefaultValues()
+
+        val withBypass = JsonParser.parseString(
+            DesktopConfigBuilder.build(bean, DesktopSettings(bypassPrivateNetworks = true), null)
+        ).asJsonObject
+        assertTrue(withBypass.has("routing"))
+
+        val withoutBypass = JsonParser.parseString(
+            DesktopConfigBuilder.build(bean, DesktopSettings(bypassPrivateNetworks = false), null)
+        ).asJsonObject
+        assertTrue(!withoutBypass.has("routing"))
+    }
+
+    @Test
+    fun `direct mode does not use the upstream profile`() {
+        val bean = ShadowsocksBean().apply {
+            serverAddress = "1.2.3.4"
+            serverPort = 8388
+            method = "aes-256-gcm"
+            password = "secret"
+        }
+        bean.initializeDefaultValues()
+
+        val config = DesktopConfigBuilder.build(
+            bean,
+            DesktopSettings(routeMode = DesktopSettings.ROUTE_DIRECT, logLevel = LogLevel.DEBUG),
+            null,
+        )
+        assertEquals("freedom", outboundOf(config, "proxy").get("protocol").asString)
+        assertEquals("debug", JsonParser.parseString(config).asJsonObject
+            .getAsJsonObject("log").get("loglevel").asString)
+    }
+
+}

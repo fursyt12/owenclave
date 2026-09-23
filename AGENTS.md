@@ -29,14 +29,28 @@ nix develop
 
 ### Testing
 - `./gradlew test`
+- Desktop smoke test: `./gradlew :desktop:app:run --args="--selftest"` (starts the core
+  as a local Shadowsocks server and tunnels an HTTP request through it)
+- Desktop naive plugin test: `./gradlew :desktop:app:run --args="--selftest-naive"`
+
+### Desktop (macOS / Windows / Linux)
+- `./run desktop build` - core + naive + installer for the current OS
+- `./run desktop build all` - cross platform `desktop/core/dist` + `desktop/naive/dist`
+- `:desktop:shared` compiles the Android `fmt`/`group`/`ktx` sources read-only; the
+  Android bound files are excluded and replaced by the Kotlin shims in
+  `desktop/shared/src/main/kotlin/desktopshim` (same packages, so the Android app is
+  unaffected). Keep both sides compiling when touching shared model code.
+- Docs: `desktop/README.md`
 
 ### Key files
 - `Constants.kt` - connection test URL, key constants
 - `DataStore.kt` - settings defaults and storage
 - `global_preferences.xml` - settings UI layout
 - `ProxyEntity.kt` - protocol types and entity management
-- `ConfigBuilder.kt` - V2Ray config generation
+- `ConfigBuilder.kt` - V2Ray config generation (Android)
 - `V2RayInstance.kt` - external plugin management (naive, shadowquic, olcrtc)
+- `desktop/app/.../DesktopConfigBuilder.kt` - V2Ray config generation (desktop)
+- `desktop/app/.../CoreRunner.kt` - core + plugin process supervision (desktop)
 - `themes.xml` / `styles.xml` - UI theme and dialog styling
 - `Theme.kt` - theme application logic
 

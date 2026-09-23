@@ -111,3 +111,24 @@ proxies:
 
 `proto` selects `https` or `quic`. These two types are read by owenclave's
 parser; a standard Mihomo installation handles them by its own rules.
+
+## desktop
+
+The same protocol layer is available as a Compose Multiplatform desktop client for
+macOS, Windows and Linux. It reuses the Android model (`fmt`, `group`, `ktx`) and runs
+the same Go engine as a child process, so profiles, share links, Clash YAML and
+V2Ray/sing-box JSON are imported exactly like on Android.
+
+- `owenclave-core` is the `exclave-core` CLI, cross compiled for linux/macos/windows
+- NaiveProxy is shipped as an external `naive` process with a local SOCKS listener,
+  mirroring the Android plugin architecture
+- portable archive (unpack and run, self contained `data` directory) plus installers
+
+```bash
+./run desktop build        # core + naive + portable zip + installer for this OS
+./run desktop build all    # cross platform binaries only
+```
+
+See [desktop/README.md](desktop/README.md) for the architecture, the verification
+commands (`--selftest`, `--selftest-naive`, `--print-config`) and the current protocol
+coverage.

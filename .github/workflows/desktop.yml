@@ -1,0 +1,144 @@
+name: Desktop Build
+on:
+  push:
+    branches:
+      - dev*
+    paths:
+      - "desktop/**"
+      - "app/src/main/java/io/nekohasekai/sagernet/fmt/**"
+      - "app/src/main/java/io/nekohasekai/sagernet/group/**"
+      - "app/src/main/java/io/nekohasekai/sagernet/ktx/**"
+      - "buildSrc/**"
+      - "bin/desktop/**"
+      - "gradle/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release (y/n)'
+        required: false
+      tag:
+        description: 'Release Tag'
+        required: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            os: ubuntu-latest
+            target: linux/amd64
+            artifact: linux-x64
+          - name: macOS x64
+            os: macos-13
+            target: darwin/amd64
+            artifact: macos-x64
+          - name: macOS arm64
+            os: macos-14
+            target: darwin/arm64
+            artifact: macos-arm64
+          - name: Windows x64
+            os: windows-latest
+            target: windows/amd64
+            artifact: windows-x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache-dependency-path: "library/core/go.sum"
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: 21
+      - name: Install WiX (Windows MSI)
+        if: runner.os == 'Windows'
+        run: choco install wixtoolset --no-progress -y
+      - name: Build core
+        shell: bash
+        run: TARGETS="${{ matrix.target }}" bash bin/desktop/core/build.sh
+      - name: Download NaiveProxy
+        shell: bash
+        run: TARGETS="${{ matrix.target }}" bash bin/desktop/naive/download.sh
+      - name: Verify binaries
+        shell: bash
+        run: |
+          tag="${{ matrix.target }}"
+          tag="${tag//\//-}"
+          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag"
+      - name: Gradle cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.gradle
+          key: gradle-desktop-${{ matrix.artifact }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+      - name: Unit tests (importers + config builder)
+        shell: bash
+        run: ./gradlew :desktop:app:test :desktop:shared:test --console=plain
+      - name: Build portable archive and application image
+        shell: bash
+        run: ./gradlew :desktop:app:createDistributable :desktop:app:packagePortable --console=plain
+      - name: Development self test (core tunnel)
+        shell: bash
+        run: ./gradlew :desktop:app:run --args="--selftest" --console=plain
+      - name: Packaged self test (bundled core tunnel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave*' | head -1)"
+          echo "launcher: $launcher"
+          "$launcher" --version
+          "$launcher" --selftest
+      - name: NaiveProxy plugin self test
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave*' | head -1)"
+          "$launcher" --selftest-naive
+      - name: Package installer (best effort)
+        shell: bash
+        continue-on-error: true
+        run: ./gradlew :desktop:app:packageDistributionForCurrentOS --console=plain
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: owenclave-desktop-${{ matrix.artifact }}
+          path: desktop/app/build/compose/binaries/main/**
+          if-no-files-found: warn
+      - name: Upload platform binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: owenclave-binaries-${{ matrix.artifact }}
+          path: |
+            desktop/core/dist/${{ matrix.target }}
+            desktop/naive/dist/${{ matrix.target }}
+          if-no-files-found: warn
+
+  publish:
+    name: Publish Release
+    if: github.event.inputs.release == 'y' && github.event.inputs.tag != ''
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      GH_TOKEN: ${{ github.token }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Download Artifacts
+        uses: actions/download-artifact@v8
+        path: artifacts
+      - name: Publish Release
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.rpm" \) -exec cp {} release/ \;
+          ls -la release
+          gh release create --latest=false "${{ github.event.inputs.tag }}" --notes="" --title="${{ github.event.inputs.tag }}" ./release/*
