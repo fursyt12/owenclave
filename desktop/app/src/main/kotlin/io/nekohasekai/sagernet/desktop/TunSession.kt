@@ -122,8 +122,9 @@ class TunSession(private val log: (String) -> Unit) {
         runQuiet("ifconfig", name, "mtu", mtu.toString())
         for (route in MAC_ROUTES) {
             run("route", "add", "-net", route, "198.18.0.1")
-            val parts = route.split("/")
-            teardown.add { runQuiet("route", "delete", "-net", "$parts[0]/${parts[1]}") }
+            // a for loop variable is a fresh val per iteration, so capturing it here
+            // deletes exactly the route that was just added
+            teardown.add { runQuiet("route", "delete", "-net", route) }
         }
         log("transparent mode: $name up, all IPv4 traffic routed into the tunnel (physical: $primaryInterface)")
     }
