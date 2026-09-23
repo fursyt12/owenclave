@@ -246,8 +246,12 @@ jobs:
             ip route add default dev lo || true
             export JAVA_TOOL_OPTIONS=-Dowenclave.dataDir=/tmp/owenclave-netns
             '$launcher' --selftest-tun-stub
-          " >"$log" 2>&1 || true
-          tail -12 "$log"
+          " >"$log" 2>&1
+          status=$?
+          echo "::notice::transparent mode, network namespace: launcher exit status $status"
+          # the job logs need a token, annotations do not: publish the end of the
+          # log either way so a failure here can be diagnosed from the API
+          tail -20 "$log" | while IFS= read -r line; do echo "::notice::tun-netns-log $line"; done
           if grep -q '\[selftest-tun\] PASS' "$log"; then
             echo "::notice::transparent mode, network namespace: PASS"
           else
