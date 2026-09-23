@@ -190,4 +190,76 @@ class DesktopConfigBuilderTest {
             .getAsJsonObject("log").get("loglevel").asString)
     }
 
+
+    @Test
+    fun `routing rules are emitted before the lan bypass`() {
+        val bean = ShadowsocksBean().apply {
+            serverAddress = "1.2.3.4"
+            serverPort = 8388
+            method = "aes-256-gcm"
+            password = "secret"
+        }
+        bean.initializeDefaultValues()
+
+        val config = DesktopConfigBuilder.build(
+            bean,
+            DesktopSettings(),
+            null,
+            listOf(
+                RoutingRule(name = "ads", domains = "keyword:ads, full:api.example.com", target = RuleTarget.BLOCK.tag),
+                RoutingRule(enabled = false, domains = "disabled.example.com"),
+                RoutingRule(ip = "10.0.0.0/8", target = RuleTarget.DIRECT.tag),
+                RoutingRule(name = "a rule without matchers"),
+            ),
+        )
+        val rules = JsonParser.parseString(config).asJsonObject
+            .getAsJsonObject("routing").getAsJsonArray("rules")
+
+        assertEquals(3, rules.size(), "two enabled user rules plus the LAN bypass")
+        val first = rules[0].asJsonObject
+        assertEquals("block", first.get("outboundTag").asString)
+        assertEquals(
+            listOf("keyword:ads", "full:api.example.com"),
+            first.getAsJsonArray("domains").map { it.asString },
+        )
+        val second = rules[1].asJsonObject
+        assertEquals("direct", second.get("outboundTag").asString)
+        assertEquals(listOf("10.0.0.0/8"), second.getAsJsonArray("ip").map { it.asString })
+        assertEquals("direct", rules[2].asJsonObject.get("outboundTag").asString)
+    }
+
+    @Test
+    fun `subscription and rule survive a json round trip`() {
+        val subscription = Subscription(name = "provider", url = "https://example.com/sub", sendHwid = true)
+        subscription.lastUpdated = 1234567890L
+        subscription.profileCount = 7
+        val parsedSubscription = Subscription.fromJson(subscription.toJson())
+        assertEquals("provider", parsedSubscription.name)
+        assertEquals("https://example.com/sub", parsedSubscription.url)
+        assertTrue(parsedSubscription.sendHwid)
+        assertEquals(1234567890L, parsedSubscription.lastUpdated)
+        assertEquals(7, parsedSubscription.profileCount)
+
+        val rule = RoutingRule(name = "ads", domains = "keyword:ads", port = "80,443", target = RuleTarget.BLOCK.tag)
+        val parsedRule = RoutingRule.fromJson(rule.toJson())
+        assertEquals("ads", parsedRule.name)
+        assertEquals("keyword:ads", parsedRule.domains)
+        assertEquals("80,443", parsedRule.port)
+        assertEquals(RuleTarget.BLOCK.tag, parsedRule.target)
+        assertTrue(parsedRule.enabled)
+        assertEquals("domain=keyword:ads, port=80,443", parsedRule.summary)
+    }
+
+    @Test
+    fun `hwid headers follow the global and per subscription switches`() {
+        val settings = DesktopSettings()
+        assertTrue(settings.hwidHeaders(subscriptionOverride = false).isEmpty())
+        val headers = settings.hwidHeaders(subscriptionOverride = true)
+        assertTrue(headers.containsKey("x-hwid"))
+        assertTrue(headers.containsKey("x-device-os"))
+        assertEquals(32, headers.getValue("x-hwid").length)
+
+        val global = settings.copy(sendHwid = true)
+        assertTrue(global.hwidHeaders(subscriptionOverride = false).containsKey("x-hwid"))
+    }
 }

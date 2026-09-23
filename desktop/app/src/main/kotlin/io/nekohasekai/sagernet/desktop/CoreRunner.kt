@@ -44,7 +44,7 @@ class CoreRunner(private val log: (String) -> Unit) {
     private var settings: DesktopSettings? = null
 
     /** Starts [profile]; throws with a human readable message when it cannot. */
-    fun start(profile: Profile, settings: DesktopSettings) {
+    fun start(profile: Profile, settings: DesktopSettings, rules: List<RoutingRule> = emptyList()) {
         stop()
         this.settings = settings
         lastError = null
@@ -67,7 +67,7 @@ class CoreRunner(private val log: (String) -> Unit) {
             else -> null
         }
 
-        val config = DesktopConfigBuilder.build(bean, settings, pluginBinding)
+        val config = DesktopConfigBuilder.build(bean, settings, pluginBinding, rules)
         startCore(profile, config, settings)
     }
 

@@ -21,6 +21,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -48,7 +49,12 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import io.nekohasekai.sagernet.LogLevel
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
 import java.io.File
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlin.system.exitProcess
 
 fun main(args: Array<String>) {
@@ -63,7 +69,7 @@ fun main(args: Array<String>) {
                 exitApplication()
             },
             title = "Owenclave ${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME} desktop",
-            state = rememberWindowState(size = DpSize(1120.dp, 720.dp)),
+            state = rememberWindowState(size = DpSize(1180.dp, 780.dp)),
         ) {
             App(state)
         }
@@ -124,18 +130,19 @@ private fun runCli(args: Array<String>): Int? {
 fun App(state: AppState) {
     MaterialTheme(colorScheme = darkColorScheme()) {
         Surface(modifier = Modifier.fillMaxSize()) {
-            Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                Header(state)
-                Spacer(Modifier.height(12.dp))
-                HorizontalDivider()
-                Spacer(Modifier.height(12.dp))
-                Row(modifier = Modifier.fillMaxSize()) {
-                    ProfilesPane(state, modifier = Modifier.weight(1f).fillMaxHeight())
-                    Spacer(Modifier.width(16.dp))
-                    Column(modifier = Modifier.weight(1.3f).fillMaxHeight()) {
-                        SettingsPane(state)
-                        Spacer(Modifier.height(12.dp))
-                        LogsPane(state, modifier = Modifier.weight(1f).fillMaxWidth())
+            Row(modifier = Modifier.fillMaxSize()) {
+                NavRail(state)
+                Column(modifier = Modifier.weight(1f).fillMaxHeight().padding(16.dp)) {
+                    Header(state)
+                    Spacer(Modifier.height(10.dp))
+                    HorizontalDivider()
+                    Spacer(Modifier.height(12.dp))
+                    when (state.section) {
+                        Section.PROFILES -> ProfilesSection(state)
+                        Section.SUBSCRIPTIONS -> SubscriptionsSection(state)
+                        Section.RULES -> RulesSection(state)
+                        Section.SETTINGS -> SettingsSection(state)
+                        Section.LOG -> LogsSection(state)
                     }
                 }
             }
@@ -144,27 +151,58 @@ fun App(state: AppState) {
 }
 
 @Composable
+private fun NavRail(state: AppState) {
+    Column(
+        modifier = Modifier
+            .width(190.dp)
+            .fillMaxHeight()
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(12.dp),
+    ) {
+        Text("Owenclave", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+        Text(
+            io.nekohasekai.sagernet.BuildConfig.VERSION_NAME,
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(16.dp))
+        Section.entries.forEach { entry ->
+            if (state.section == entry) {
+                Button(
+                    onClick = { state.show(entry) },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                ) { Text(entry.label, fontSize = 13.sp) }
+            } else {
+                OutlinedButton(
+                    onClick = { state.show(entry) },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                ) { Text(entry.label, fontSize = 13.sp) }
+            }
+        }
+        Spacer(Modifier.weight(1f))
+        Text(
+            state.runtimeLabel,
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
 private fun Header(state: AppState) {
-    var showImport by remember { mutableStateOf(false) }
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
+                Text(state.section.label, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                 Text(
-                    "Owenclave desktop",
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Text(
-                    "${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME} · ${state.runtimeLabel}",
+                    state.section.hint,
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Button(onClick = { showImport = !showImport }) { Text(if (showImport) "Close import" else "Import") }
-            Spacer(Modifier.width(8.dp))
             val connected = state.isConnected
             OutlinedButton(
-                onClick = { if (connected) state.disconnect() else state.selectedProfile?.let { state.connect(it) } },
+                onClick = { if (connected) state.disconnect() else state.connect() },
                 enabled = !state.busy && (connected || state.selectedProfile != null),
             ) { Text(if (connected) "Disconnect" else "Connect") }
             Spacer(Modifier.width(8.dp))
@@ -174,52 +212,93 @@ private fun Header(state: AppState) {
         }
         Spacer(Modifier.height(8.dp))
         Text(if (state.busy) "⏳ ${state.status}" else state.status, fontSize = 13.sp)
-        if (showImport) {
-            Spacer(Modifier.height(12.dp))
-            ImportPane(state) { showImport = false }
+    }
+}
+
+// ----------------------------------------------------------------- profiles
+
+@Composable
+private fun ProfilesSection(state: AppState) {
+    Row(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.weight(1.1f).fillMaxHeight()) {
+            Text("Profiles (${state.profiles.size})", fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(8.dp))
+            if (state.profiles.isEmpty()) {
+                Text(
+                    "No profiles yet. Add a subscription on the Subscriptions tab, or paste a share link on the right.",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                items(state.profiles, key = { it.id }) { profile ->
+                    val selected = profile.id == state.selectedProfileId
+                    val connected = profile.id == state.connectedProfileId
+                    val background = when {
+                        connected -> MaterialTheme.colorScheme.primaryContainer
+                        selected -> MaterialTheme.colorScheme.surfaceVariant
+                        else -> Color.Transparent
+                    }
+                    Card(modifier = Modifier.fillMaxWidth().clickable { state.select(profile) }) {
+                        Row(
+                            modifier = Modifier.background(background).fillMaxWidth().padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    (if (connected) "● " else "") + profile.displayName,
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 14.sp,
+                                )
+                                Text(
+                                    "${profile.protocolName} · ${profile.address}",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                state.subscriptionOf(profile)?.let { subscription ->
+                                    Text(
+                                        "from ${subscription.displayName}",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (profile.bean != null && !DesktopConfigBuilder.supports(profile.bean)) {
+                                    Text(
+                                        DesktopConfigBuilder.unsupportedReason(profile.bean),
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.error,
+                                    )
+                                }
+                            }
+                            TextButton(onClick = { state.connect(profile) }, enabled = !state.busy) { Text("Connect") }
+                            TextButton(onClick = { state.remove(profile) }) { Text("Delete") }
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            ImportCard(state)
         }
     }
 }
 
 @Composable
-private fun ImportPane(state: AppState, onDone: () -> Unit) {
-    var url by remember { mutableStateOf("") }
+private fun ImportCard(state: AppState) {
     var text by remember { mutableStateOf("") }
+    var path by remember { mutableStateOf("") }
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Text("Import from URL / file path", fontWeight = FontWeight.Medium)
+        Column(modifier = Modifier.padding(12.dp).verticalScroll(rememberScrollState())) {
+            Text("Import profiles", fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(6.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = url,
-                    onValueChange = { url = it },
-                    label = { Text("https://example.com/subscription or /path/to/file") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = {
-                        val value = url.trim()
-                        if (value.startsWith("http://") || value.startsWith("https://")) {
-                            state.importUrl(value)
-                        } else if (value.isNotEmpty()) {
-                            state.importFile(File(value))
-                        }
-                        url = ""
-                        onDone()
-                    },
-                    enabled = url.isNotBlank() && !state.busy,
-                ) { Text("Import") }
-            }
-            Spacer(Modifier.height(12.dp))
-            Text("Or paste share links / Clash YAML / V2Ray JSON", fontWeight = FontWeight.Medium)
+            Text("Share links, Clash/Mihomo YAML, V2Ray or sing-box JSON.", fontSize = 12.sp)
             Spacer(Modifier.height(6.dp))
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
-                label = { Text("naive+https://user:pass@host:443, vless://... , proxies: ...") },
-                modifier = Modifier.fillMaxWidth().height(120.dp),
+                label = { Text("naive+https://user:pass@host:443, vless://..., proxies: ...") },
+                modifier = Modifier.fillMaxWidth().height(200.dp),
             )
             Spacer(Modifier.height(6.dp))
             Row {
@@ -227,75 +306,145 @@ private fun ImportPane(state: AppState, onDone: () -> Unit) {
                     onClick = {
                         state.importText(text, "pasted input")
                         text = ""
-                        onDone()
                     },
                     enabled = text.isNotBlank() && !state.busy,
-                ) { Text("Import text") }
+                ) { Text("Import") }
                 Spacer(Modifier.width(8.dp))
                 OutlinedButton(
                     onClick = {
                         state.addCustomConfig(text, "Custom config")
                         text = ""
-                        onDone()
                     },
                     enabled = text.isNotBlank() && !state.busy,
                 ) { Text("Keep as raw config") }
+            }
+            Spacer(Modifier.height(16.dp))
+            Text("Import from a file", fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = path,
+                    onValueChange = { path = it },
+                    label = { Text("/path/to/config.json") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = { state.importFile(File(path.trim())) },
+                    enabled = path.isNotBlank() && !state.busy,
+                ) { Text("Import") }
             }
         }
     }
 }
 
+// ------------------------------------------------------------ subscriptions
+
 @Composable
-private fun ProfilesPane(state: AppState, modifier: Modifier = Modifier) {
-    Column(modifier = modifier) {
-        Text("Profiles (${state.profiles.size})", fontWeight = FontWeight.Medium)
+private fun SubscriptionsSection(state: AppState) {
+    var name by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("") }
+    var sendHwid by remember { mutableStateOf(state.settings.sendHwid) }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text("Add a subscription", fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("Name (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.width(240.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = url,
+                        onValueChange = { url = it },
+                        label = { Text("https://provider.example/sub/xxxx") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = sendHwid, onCheckedChange = { sendHwid = it })
+                    Text("Send HWID for this subscription", fontSize = 13.sp)
+                    Spacer(Modifier.width(16.dp))
+                    Button(
+                        onClick = {
+                            state.addSubscription(name, url, sendHwid)
+                            name = ""
+                            url = ""
+                        },
+                        enabled = url.isNotBlank() && !state.busy,
+                    ) { Text("Add and update") }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = { state.refreshAllSubscriptions() },
+                        enabled = state.subscriptions.isNotEmpty() && !state.busy,
+                    ) { Text("Update all") }
+                }
+                Text(
+                    "Updates are fetched through the connected profile when that is enabled in Settings, " +
+                        "which also gets around local filtering.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text("Subscriptions (${state.subscriptions.size})", fontWeight = FontWeight.Medium)
         Spacer(Modifier.height(8.dp))
-        if (state.profiles.isEmpty()) {
+        if (state.subscriptions.isEmpty()) {
             Text(
-                "No profiles yet. Use Import to add a subscription, a share link or a config.",
+                "No subscriptions yet.",
                 fontSize = 13.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            return
         }
-        LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            items(state.profiles, key = { it.id }) { profile ->
-                val selected = profile.id == state.selectedProfileId
-                val connected = profile.id == state.connectedProfileId
-                val background = when {
-                    connected -> MaterialTheme.colorScheme.primaryContainer
-                    selected -> MaterialTheme.colorScheme.surfaceVariant
-                    else -> Color.Transparent
-                }
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { state.select(profile) },
-                ) {
-                    Row(
-                        modifier = Modifier.background(background).fillMaxWidth().padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                (if (connected) "● " else "") + profile.displayName,
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 14.sp,
-                            )
-                            Text(
-                                "${profile.protocolName} · ${profile.address}",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            if (profile.bean != null && !DesktopConfigBuilder.supports(profile.bean)) {
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxSize()) {
+            items(state.subscriptions, key = { it.id }) { subscription ->
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(subscription.displayName, fontWeight = FontWeight.Medium, fontSize = 14.sp)
                                 Text(
-                                    DesktopConfigBuilder.unsupportedReason(profile.bean),
+                                    subscription.url,
                                     fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.error,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    buildString {
+                                        append("${subscription.profileCount} profile(s)")
+                                        if (subscription.lastUpdated > 0) {
+                                            append(" · updated ${formatTime(subscription.lastUpdated)}")
+                                        }
+                                        if (subscription.sendHwid) append(" · HWID")
+                                    },
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
+                            TextButton(
+                                onClick = { state.refreshSubscription(subscription) },
+                                enabled = !state.busy,
+                            ) { Text("Update") }
+                            TextButton(onClick = { state.removeSubscription(subscription) }) { Text("Delete") }
                         }
-                        TextButton(onClick = { state.remove(profile) }) { Text("Delete") }
+                        subscription.lastError?.let { error ->
+                            Spacer(Modifier.height(4.dp))
+                            Text("last error: $error", fontSize = 11.sp, color = MaterialTheme.colorScheme.error)
+                            Text(
+                                "the Log tab keeps the full attempt history",
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     }
                 }
             }
@@ -303,12 +452,166 @@ private fun ProfilesPane(state: AppState, modifier: Modifier = Modifier) {
     }
 }
 
+// -------------------------------------------------------------------- rules
+
 @Composable
-private fun SettingsPane(state: AppState) {
-    val settings = state.settings
-    Column(modifier = Modifier.fillMaxWidth()) {
-        Text("Settings", fontWeight = FontWeight.Medium)
+private fun RulesSection(state: AppState) {
+    var name by remember { mutableStateOf("") }
+    var target by remember { mutableStateOf(RuleTarget.PROXY) }
+    var domains by remember { mutableStateOf("") }
+    var ip by remember { mutableStateOf("") }
+    var port by remember { mutableStateOf("") }
+    var network by remember { mutableStateOf("") }
+    var protocol by remember { mutableStateOf("") }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text("Add a rule", fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Action: ", fontSize = 13.sp)
+                    RuleTarget.entries.forEach { candidate ->
+                        if (candidate == target) {
+                            Button(onClick = { target = candidate }) { Text(candidate.label) }
+                        } else {
+                            OutlinedButton(onClick = { target = candidate }) { Text(candidate.label) }
+                        }
+                        Spacer(Modifier.width(6.dp))
+                    }
+                    Spacer(Modifier.width(10.dp))
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("Name (optional)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = domains,
+                    onValueChange = { domains = it },
+                    label = { Text("Domains: example.com, full:api.example.com, keyword:ads, regexp:^a.*") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(6.dp))
+                Row {
+                    OutlinedTextField(
+                        value = ip,
+                        onValueChange = { ip = it },
+                        label = { Text("IP CIDR") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = port,
+                        onValueChange = { port = it },
+                        label = { Text("Port") },
+                        singleLine = true,
+                        modifier = Modifier.width(140.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = network,
+                        onValueChange = { network = it },
+                        label = { Text("Network (tcp/udp)") },
+                        singleLine = true,
+                        modifier = Modifier.width(180.dp),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = protocol,
+                        onValueChange = { protocol = it },
+                        label = { Text("Sniffed protocol") },
+                        singleLine = true,
+                        modifier = Modifier.width(180.dp),
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Button(
+                        onClick = {
+                            state.addRule(
+                                RoutingRule(
+                                    name = name.trim(),
+                                    target = target.tag,
+                                    domains = domains.trim(),
+                                    ip = ip.trim(),
+                                    port = port.trim(),
+                                    network = network.trim(),
+                                    protocol = protocol.trim(),
+                                )
+                            )
+                            name = ""
+                            domains = ""
+                            ip = ""
+                            port = ""
+                            network = ""
+                            protocol = ""
+                        },
+                        enabled = !state.busy,
+                    ) { Text("Add rule") }
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        "Rules are evaluated top to bottom, the first match wins, and they apply on the next connect.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text("Rules (${state.rules.size})", fontWeight = FontWeight.Medium)
         Spacer(Modifier.height(8.dp))
+        if (state.rules.isEmpty()) {
+            Text(
+                "No rules. Traffic goes through the selected profile, except private networks when " +
+                    "\"Bypass LAN\" is on.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxSize()) {
+            items(state.rules, key = { it.id }) { rule ->
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = rule.enabled, onCheckedChange = { state.toggleRule(rule) })
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(rule.displayName, fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                            Text(
+                                rule.summary,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Text(
+                            RuleTarget.entries.firstOrNull { it.tag == rule.target }?.label ?: rule.target,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        TextButton(onClick = { state.removeRule(rule) }) { Text("Delete") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------- settings
+
+@Composable
+private fun SettingsSection(state: AppState) {
+    val settings = state.settings
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        Text("Local inbounds", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             PortField("SOCKS port", settings.socksPort) { value ->
                 state.updateSettings { it.copy(socksPort = value) }
@@ -318,7 +621,18 @@ private fun SettingsPane(state: AppState) {
                 state.updateSettings { it.copy(httpPort = value) }
             }
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Point the system proxy or a browser at 127.0.0.1:${settings.socksPort} (SOCKS5) " +
+                "or 127.0.0.1:${settings.httpPort} (HTTP).",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Text("Routing", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Mode: ", fontSize = 13.sp)
             OutlinedButton(
@@ -329,15 +643,19 @@ private fun SettingsPane(state: AppState) {
             OutlinedButton(
                 onClick = { state.updateSettings { it.copy(routeMode = DesktopSettings.ROUTE_DIRECT) } },
                 enabled = settings.routeMode != DesktopSettings.ROUTE_DIRECT,
-            ) { Text("Direct") }
+            ) { Text("Direct only") }
             Spacer(Modifier.width(16.dp))
             OutlinedButton(
                 onClick = { state.updateSettings { it.copy(bypassPrivateNetworks = !it.bypassPrivateNetworks) } },
             ) { Text(if (settings.bypassPrivateNetworks) "Bypass LAN: on" else "Bypass LAN: off") }
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Text("Logging", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Log: ", fontSize = 13.sp)
+            Text("Level: ", fontSize = 13.sp)
             listOf(
                 LogLevel.NONE to "none",
                 LogLevel.ERROR to "error",
@@ -351,6 +669,60 @@ private fun SettingsPane(state: AppState) {
                     modifier = Modifier.padding(end = 4.dp),
                 ) { Text(label, fontSize = 12.sp) }
             }
+        }
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Text("Device identity (HWID)", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.sendHwid,
+                onCheckedChange = { value -> state.updateSettings { it.copy(sendHwid = value) } },
+            )
+            Text("Send HWID to subscriptions by default", fontSize = 13.sp)
+            Spacer(Modifier.width(16.dp))
+            OutlinedButton(onClick = { state.resetHwid() }) { Text("Generate a new identity") }
+        }
+        Text(
+            "Current: ${settings.currentHwid()}",
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Text("Subscriptions", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = settings.fetchSubscriptionsThroughProxy,
+                onCheckedChange = { value ->
+                    state.updateSettings { it.copy(fetchSubscriptionsThroughProxy = value) }
+                },
+            )
+            Text("Fetch through the connected profile when one is running", fontSize = 13.sp)
+        }
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+        Text("Runtime", fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        InfoLine("Platform", DesktopRuntime.platformTag)
+        InfoLine("Data directory", DesktopRuntime.dataDir.absolutePath)
+        InfoLine("Core", DesktopRuntime.coreBinary()?.absolutePath ?: "not found")
+        InfoLine("NaiveProxy", DesktopRuntime.naiveBinary()?.absolutePath ?: "not found")
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+@Composable
+private fun InfoLine(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+        Text(label, fontSize = 12.sp, modifier = Modifier.width(140.dp))
+        SelectionContainer {
+            Text(value, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
         }
     }
 }
@@ -370,18 +742,29 @@ private fun PortField(label: String, value: Int, onChange: (Int) -> Unit) {
     )
 }
 
+// ---------------------------------------------------------------------- log
+
 @Composable
-private fun LogsPane(state: AppState, modifier: Modifier = Modifier) {
+private fun LogsSection(state: AppState) {
     val listState = rememberLazyListState()
     LaunchedEffect(state.logs.size) {
         if (state.logs.isNotEmpty()) listState.scrollToItem(state.logs.size - 1)
     }
-    Column(modifier = modifier) {
+    Column(modifier = Modifier.fillMaxSize()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Log", fontWeight = FontWeight.Medium)
+            Text("Log (${state.logs.size} lines)", fontWeight = FontWeight.Medium)
             Spacer(Modifier.weight(1f))
+            OutlinedButton(
+                onClick = {
+                    Toolkit.getDefaultToolkit().systemClipboard
+                        .setContents(StringSelection(state.logText()), null)
+                    state.appendLog("log copied to the clipboard")
+                },
+            ) { Text("Copy") }
+            Spacer(Modifier.width(8.dp))
             TextButton(onClick = { state.clearLogs() }) { Text("Clear") }
         }
+        Spacer(Modifier.height(8.dp))
         Card(modifier = Modifier.fillMaxSize()) {
             Box(modifier = Modifier.fillMaxSize().padding(8.dp)) {
                 SelectionContainer {
@@ -399,3 +782,8 @@ private fun LogsPane(state: AppState, modifier: Modifier = Modifier) {
         }
     }
 }
+
+private val timeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+private fun formatTime(epochMillis: Long): String =
+    Instant.ofEpochMilli(epochMillis).atZone(ZoneId.systemDefault()).format(timeFormatter)

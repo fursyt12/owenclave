@@ -16,6 +16,12 @@ class DesktopSettings(
     var selectedProfileId: String? = null,
     /** Keep local/LAN traffic outside of the tunnel, like the Android default. */
     var bypassPrivateNetworks: Boolean = true,
+    /** Send the device HWID to subscription servers, the Android global switch. */
+    var sendHwid: Boolean = false,
+    /** Client owned device id, see [currentHwid]. */
+    var hwidValue: String = "",
+    /** Fetch subscriptions through the running core, which also bypasses local filtering. */
+    var fetchSubscriptionsThroughProxy: Boolean = true,
 ) {
 
     companion object {
@@ -31,7 +37,13 @@ class DesktopSettings(
         logLevel: Int = this.logLevel,
         selectedProfileId: String? = this.selectedProfileId,
         bypassPrivateNetworks: Boolean = this.bypassPrivateNetworks,
-    ) = DesktopSettings(socksPort, httpPort, routeMode, logLevel, selectedProfileId, bypassPrivateNetworks)
+        sendHwid: Boolean = this.sendHwid,
+        hwidValue: String = this.hwidValue,
+        fetchSubscriptionsThroughProxy: Boolean = this.fetchSubscriptionsThroughProxy,
+    ) = DesktopSettings(
+        socksPort, httpPort, routeMode, logLevel, selectedProfileId, bypassPrivateNetworks,
+        sendHwid, hwidValue, fetchSubscriptionsThroughProxy,
+    )
 
 }
 
@@ -41,6 +53,10 @@ class DesktopSettings(
  * data model inspectable and portable.
  */
 class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "desktop.json")) {
+
+    val subscriptions = ArrayList<Subscription>()
+
+    val rules = ArrayList<RoutingRule>()
 
     private val gson = GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create()
 
@@ -58,6 +74,16 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                     profiles.add(Profile.fromJson(element.asJsonObject))
                 }
             }
+            root.getAsJsonArray("subscriptions")?.forEach { element ->
+                if (element.isJsonObject) {
+                    subscriptions.add(Subscription.fromJson(element.asJsonObject))
+                }
+            }
+            root.getAsJsonArray("rules")?.forEach { element ->
+                if (element.isJsonObject) {
+                    rules.add(RoutingRule.fromJson(element.asJsonObject))
+                }
+            }
             root.getAsJsonObject("settings")?.let { json ->
                 settings = DesktopSettings(
                     socksPort = json.get("socksPort")?.asInt ?: 10808,
@@ -66,6 +92,9 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                     logLevel = json.get("logLevel")?.asInt ?: LogLevel.INFO,
                     selectedProfileId = json.get("selectedProfileId")?.takeIf { !it.isJsonNull }?.asString,
                     bypassPrivateNetworks = json.get("bypassPrivateNetworks")?.asBoolean ?: true,
+                    sendHwid = json.get("sendHwid")?.asBoolean ?: false,
+                    hwidValue = json.get("hwidValue")?.asString.orEmpty(),
+                    fetchSubscriptionsThroughProxy = json.get("fetchSubscriptionsThroughProxy")?.asBoolean ?: true,
                 )
             }
         }.onFailure {
@@ -83,7 +112,16 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                 addProperty("routeMode", settings.routeMode)
                 addProperty("logLevel", settings.logLevel)
                 addProperty("bypassPrivateNetworks", settings.bypassPrivateNetworks)
+                addProperty("sendHwid", settings.sendHwid)
+                addProperty("hwidValue", settings.hwidValue)
+                addProperty("fetchSubscriptionsThroughProxy", settings.fetchSubscriptionsThroughProxy)
                 settings.selectedProfileId?.let { addProperty("selectedProfileId", it) }
+            })
+            root.add("subscriptions", JsonArray().apply {
+                subscriptions.forEach { add(it.toJson()) }
+            })
+            root.add("rules", JsonArray().apply {
+                rules.forEach { add(it.toJson()) }
             })
             root.add("profiles", JsonArray().apply {
                 profiles.forEach { add(it.toJson()) }

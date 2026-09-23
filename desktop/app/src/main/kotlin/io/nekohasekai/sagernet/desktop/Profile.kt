@@ -18,6 +18,8 @@ class Profile(
     var name: String = "",
     var bean: AbstractBean? = null,
     var customConfig: String? = null,
+    /** Set when the profile came from a subscription, see [Subscription]. */
+    var subscriptionId: String? = null,
 ) {
 
     val displayName: String
@@ -33,6 +35,7 @@ class Profile(
     fun toJson(): JsonObject = JsonObject().apply {
         addProperty("id", id)
         addProperty("name", name)
+        subscriptionId?.let { addProperty("subscriptionId", it) }
         bean?.let {
             addProperty("beanClass", it.javaClass.name)
             add("bean", gson.toJsonTree(it))
@@ -47,6 +50,7 @@ class Profile(
                 id = json.get("id")?.asString ?: UUID.randomUUID().toString(),
                 name = json.get("name")?.asString.orEmpty(),
                 customConfig = json.get("customConfig")?.asString,
+                subscriptionId = json.get("subscriptionId")?.takeIf { !it.isJsonNull }?.asString,
             )
             val beanClass = json.get("beanClass")?.asString
             val beanJson = json.get("bean")

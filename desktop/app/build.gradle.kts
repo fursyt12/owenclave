@@ -177,6 +177,9 @@ tasks.configureEach {
     if (this is JavaExec && (name == "run" || name.startsWith("run"))) {
         dependsOn(prepareDesktopRuntime)
         systemProperty("owenclave.devRoot", rootProject.projectDir.absolutePath)
+        // `./gradlew :desktop:app:run -Psection=RULES` opens a specific tab, used
+        // when verifying that every screen renders.
+        (project.findProperty("section") as String?)?.let { systemProperty("owenclave.section", it) }
     }
     if (name.startsWith("package") || name.startsWith("createDistributable")) {
         dependsOn(prepareDesktopRuntime)

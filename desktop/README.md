@@ -132,12 +132,46 @@ desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest
 # NaiveProxy plugin integration (config accepted by the real naive binary)
 ./gradlew :desktop:app:run --args="--selftest-naive"
 
-# unit tests of the importers and the config builder
+# unit tests of the importers, the rule builder and the config builder
 ./gradlew :desktop:app:test
+
+# open a specific tab right away, handy when checking that every screen renders
+./gradlew :desktop:app:run -Psection=RULES
 ```
 
 The self test prints `[selftest] PASS` and exits with code 0 on success, which
 makes it usable on Linux and Windows (including under Wine) in CI.
+
+## UI
+
+The window is a left navigation rail with the screens modelled after the Android
+app:
+
+| Tab | What it does |
+| --- | --- |
+| **Profiles** | imported profiles (with the subscription they came from), one click connect, delete; paste/share-link/raw-config import on the right |
+| **Subscriptions** | subscription URLs with a name and a per-subscription HWID switch, "Update" / "Update all", last update time and the last error |
+| **Rules** | routing rules (`Proxy` / `Direct` / `Block`) with domains (including the `domain:` / `full:` / `keyword:` / `regexp:` prefixes), IP CIDR, port, network and sniffed protocol; rules apply on the next connect |
+| **Settings** | SOCKS/HTTP ports, routing mode, LAN bypass, log level, HWID (global switch, current value, "generate a new identity"), fetch-through-the-tunnel switch, and the runtime paths |
+| **Log** | everything the core and the plugins print, with copy and clear |
+
+Subscriptions are refreshed through the connected profile when one is running and
+`Settings → Fetch through the connected profile` is on, which also gets around
+local filtering that would break a plain HTTPS request.
+
+HWID reporting follows the Android implementation: the same `x-hwid`,
+`x-device-os`, `x-ver-os` and `x-device-model` headers, sent when the global
+switch or the per-subscription switch is on.
+
+### Not there yet compared to Android
+
+* no per-protocol profile editor: profiles are imported, renamed via their import
+  source, connected and deleted, but the protocol forms of the Android app are not
+  rebuilt on desktop;
+* rules have no per-app / package matching (SSID and package rules are Android
+  concepts) and there is no rule reordering UI yet;
+* no subscription auto-update scheduling, no QR scanning and no TUN / system wide
+  transparent proxying (the SOCKS and HTTP inbounds are the integration point).
 
 ## Supported protocols
 

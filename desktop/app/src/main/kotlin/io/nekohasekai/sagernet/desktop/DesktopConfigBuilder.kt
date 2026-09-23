@@ -73,7 +73,12 @@ object DesktopConfigBuilder {
      *   (and eventually OLCRTC) profiles, which are reached through a local SOCKS
      *   listener exactly like on Android.
      */
-    fun build(bean: AbstractBean, settings: DesktopSettings, plugin: PluginBinding?): String {
+    fun build(
+        bean: AbstractBean,
+        settings: DesktopSettings,
+        plugin: PluginBinding?,
+        rules: List<RoutingRule> = emptyList(),
+    ): String {
         val root = JsonObject()
 
         root.add("log", JsonObject().apply {
@@ -103,16 +108,41 @@ object DesktopConfigBuilder {
             })
         })
 
-        if (settings.routeMode != DesktopSettings.ROUTE_DIRECT && settings.bypassPrivateNetworks) {
+        // User rules come first because the core uses the first matching rule;
+        // `domains` accepts the usual domain:/full:/keyword:/regexp: prefixes,
+        // exactly like the Android rule editor.
+        val routingRules = JsonArray()
+        rules.filter { it.enabled && it.hasMatchers }.forEach { rule ->
+            routingRules.add(JsonObject().apply {
+                addProperty("type", "field")
+                if (rule.domains.isNotBlank()) {
+                    add("domains", JsonArray().apply { rule.domains.listByLineOrComma().forEach { add(it) } })
+                }
+                if (rule.ip.isNotBlank()) {
+                    add("ip", JsonArray().apply { rule.ip.listByLineOrComma().forEach { add(it) } })
+                }
+                if (rule.port.isNotBlank()) addProperty("port", rule.port.trim())
+                if (rule.network.isNotBlank()) addProperty("network", rule.network.trim())
+                if (rule.protocol.isNotBlank()) {
+                    add("protocol", JsonArray().apply { rule.protocol.listByLineOrComma().forEach { add(it) } })
+                }
+                addProperty(
+                    "outboundTag",
+                    RuleTarget.entries.firstOrNull { it.tag == rule.target }?.tag ?: RuleTarget.PROXY.tag,
+                )
+            })
+        }
+        if (settings.bypassPrivateNetworks) {
+            routingRules.add(JsonObject().apply {
+                addProperty("type", "field")
+                add("ip", JsonArray().apply { PRIVATE_NETWORKS.forEach { add(it) } })
+                addProperty("outboundTag", "direct")
+            })
+        }
+        if (routingRules.size() > 0) {
             root.add("routing", JsonObject().apply {
                 addProperty("domainStrategy", "AsIs")
-                add("rules", JsonArray().apply {
-                    add(JsonObject().apply {
-                        addProperty("type", "field")
-                        add("ip", JsonArray().apply { PRIVATE_NETWORKS.forEach { add(it) } })
-                        addProperty("outboundTag", "direct")
-                    })
-                })
+                add("rules", routingRules)
             })
         }
 

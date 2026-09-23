@@ -11,36 +11,132 @@ import io.nekohasekai.sagernet.ktx.Logs
 import io.nekohasekai.sagernet.ktx.applyDefaultValues
 import io.nekohasekai.sagernet.ktx.parseShareLinks
 import org.yaml.snakeyaml.Yaml
+import java.io.ByteArrayInputStream
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.URI
+import java.net.URL
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.util.zip.GZIPInputStream
+import java.util.zip.InflaterInputStream
 
 /**
  * Subscription import for the desktop client.
  *
  * Parsing itself is the shared Android code (`ktx/Formats.kt` for share links and
- * `group/` parsers for Clash YAML / V2Ray / sing-box documents); only the
+ * the `group` parsers for Clash YAML / V2Ray / sing-box documents); only the
  * document level walking and the HTTP download are desktop specific, because the
  * Android `RawUpdater` is tied to Room, WorkManager and the app context.
+ *
+ * Downloading tries, in order: through the running core (when a profile is
+ * connected, which also gets around local network filtering), a JDK HTTP client
+ * pinned to HTTP/1.1 (subscription servers behind CDNs often break the HTTP/2
+ * upgrade) and finally the classic `HttpURLConnection`. All failures are reported
+ * together so the UI can show a real reason instead of "java http error".
  */
 object SubscriptionImporter {
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(20))
         .followRedirects(HttpClient.Redirect.NORMAL)
+        .version(HttpClient.Version.HTTP_1_1)
         .build()
 
-    fun download(url: String): String {
-        val request = HttpRequest.newBuilder(URI.create(url))
-            .timeout(Duration.ofSeconds(45))
-            .header("User-Agent", "Owenclave/${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME}")
-            .GET()
-            .build()
-        val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-        check(response.statusCode() in 200..299) { "HTTP ${response.statusCode()} while fetching the subscription" }
-        return response.body()
+    private val userAgent: String get() = "Owenclave/${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME}"
+
+    /**
+     * Downloads [url].
+     *
+     * @param socksPort local SOCKS port of a connected core; when set the request
+     *   is sent through the tunnel.
+     * @param headers extra request headers, used for HWID reporting.
+     */
+    fun download(url: String, socksPort: Int? = null, headers: Map<String, String> = emptyMap()): String {
+        val problems = ArrayList<String>()
+        if (socksPort != null) {
+            runCatching { fetchWithUrlConnection(url, socksPort, headers) }
+                .onSuccess { return it }
+                .onFailure { problems += "via the connected profile: ${describe(it)}" }
+        }
+        runCatching { fetchWithHttpClient(url, headers) }
+            .onSuccess { return it }
+            .onFailure { problems += "http/1.1: ${describe(it)}" }
+        runCatching { fetchWithUrlConnection(url, null, headers) }
+            .onSuccess { return it }
+            .onFailure { problems += "direct: ${describe(it)}" }
+        throw IOException("cannot download the subscription: ${problems.joinToString("; ")}")
+    }
+
+    /** Flattens an exception chain so the reason is visible in the UI. */
+    fun describe(error: Throwable): String {
+        val parts = ArrayList<String>()
+        var current: Throwable? = error
+        while (current != null && parts.size < 4) {
+            val item = current
+            parts += buildString {
+                append(item.javaClass.simpleName)
+                item.message?.takeIf { it.isNotBlank() }?.let { append(": ").append(it) }
+            }
+            current = item.cause?.takeIf { it !== item }
+        }
+        return parts.joinToString(" <- ")
+    }
+
+    private fun fetchWithHttpClient(url: String, headers: Map<String, String>): String {
+        val builder = HttpRequest.newBuilder(URI.create(url))
+            .timeout(Duration.ofSeconds(60))
+            .header("User-Agent", userAgent)
+            .header("Accept", "*/*")
+        headers.forEach { (key, value) -> builder.header(key, value) }
+        val response = httpClient.send(builder.GET().build(), HttpResponse.BodyHandlers.ofByteArray())
+        requireSuccess(response.statusCode())
+        return decodeBody(response.body(), response.headers().firstValue("content-encoding").orElse(""))
+    }
+
+    private fun fetchWithUrlConnection(url: String, socksPort: Int?, headers: Map<String, String>): String {
+        val connection = (if (socksPort != null) {
+            URL(url).openConnection(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort)))
+        } else {
+            URL(url).openConnection()
+        }) as HttpURLConnection
+        connection.connectTimeout = 20_000
+        connection.readTimeout = 60_000
+        connection.instanceFollowRedirects = true
+        connection.setRequestProperty("User-Agent", userAgent)
+        connection.setRequestProperty("Accept", "*/*")
+        headers.forEach { (key, value) -> connection.setRequestProperty(key, value) }
+        return try {
+            val code = connection.responseCode
+            requireSuccess(code)
+            decodeBody(connection.inputStream.readBytes(), connection.getHeaderField("Content-Encoding").orEmpty())
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun requireSuccess(code: Int) {
+        if (code !in 200..299) {
+            throw IOException(
+                "the server answered HTTP $code" +
+                    if (code in 300..399) " (redirect was not followed)" else ""
+            )
+        }
+    }
+
+    private fun decodeBody(body: ByteArray, encoding: String): String {
+        val bytes = when {
+            encoding.contains("gzip", ignoreCase = true) ->
+                GZIPInputStream(ByteArrayInputStream(body)).use { it.readBytes() }
+            encoding.contains("deflate", ignoreCase = true) ->
+                InflaterInputStream(ByteArrayInputStream(body)).use { it.readBytes() }
+            else -> body
+        }
+        return String(bytes, Charsets.UTF_8)
     }
 
     /** Parses share links, Clash YAML, V2Ray JSON, sing-box JSON and V2Ray v5 JSON. */
