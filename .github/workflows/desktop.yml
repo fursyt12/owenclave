@@ -106,12 +106,15 @@ jobs:
       - name: Download NaiveProxy
         shell: bash
         run: TARGETS="${{ matrix.target }}" bash bin/desktop/naive/download.sh
+      - name: Download tun2socks (transparent mode)
+        shell: bash
+        run: TARGETS="${{ matrix.target }}" bash bin/desktop/tun2socks/download.sh
       - name: Verify binaries
         shell: bash
         run: |
           tag="${{ matrix.target }}"
           tag="${tag//\//-}"
-          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag"
+          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag" "desktop/tun2socks/dist/$tag"
       - name: Gradle cache
         uses: actions/cache@v6
         with:
@@ -172,6 +175,40 @@ jobs:
             exit 1
           fi
           tail -3 /tmp/portable.log
+      - name: Verify the bundled runtime
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The binaries are staged into the application jar under bin/: a missing
+          # download step used to ship an application without tun2socks, which only
+          # showed up as a silent transparent mode failure, so it is asserted here.
+          jar="$(find desktop/app/build/compose/binaries/main/app -type f -name 'app-*.jar' | head -1)"
+          echo "application jar: $jar"
+          listing=""
+          if command -v unzip >/dev/null 2>&1; then
+            listing="$(unzip -Z1 "$jar" | grep -a '^bin/' || true)"
+          fi
+          if [ -z "$listing" ] && command -v python3 >/dev/null 2>&1; then
+            listing="$(python3 -c 'import sys,zipfile;print("\n".join(n for n in zipfile.ZipFile(sys.argv[1]).namelist() if n.startswith("bin/")))' "$jar" 2>/dev/null || true)"
+          fi
+          if [ -z "$listing" ]; then
+            echo "::error::cannot read the contents of $jar"
+            exit 1
+          fi
+          printf '%s\n' "$listing"
+          missing=0
+          for name in owenclave-core naive tun2socks; do
+            fileName="$name"
+            if [ "$RUNNER_OS" = "Windows" ]; then fileName="$name.exe"; fi
+            if ! printf '%s\n' "$listing" | grep -qx "bin/$fileName"; then
+              echo "::error::bin/$fileName is missing from the application image"
+              missing=1
+            fi
+          done
+          if [ "$RUNNER_OS" = "Windows" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/wintun.dll'; then
+            echo "::warning::bin/wintun.dll is missing: transparent mode on Windows needs it next to the launcher"
+          fi
+          exit "$missing"
       - name: Development self test (core tunnel)
         shell: bash
         run: ./gradlew :desktop:app:run --args="--selftest" --console=plain
