@@ -278,6 +278,9 @@ jobs:
           echo "::notice::transparent mode, network namespace: launcher exit status $status"
           # the job logs need a token, annotations do not: publish the end of the
           # log either way so a failure here can be diagnosed from the API
+          if [ ! -s "$log" ]; then
+            echo "::warning::transparent mode, network namespace: the launcher wrote nothing to stderr or stdout; unshare=$(command -v unshare || echo missing) sudo=$(command -v sudo || echo missing)"
+          fi
           tail -20 "$log" | while IFS= read -r line; do echo "::notice::tun-netns-log $line"; done
           if grep -q '\[selftest-tun\] PASS' "$log"; then
             echo "::notice::transparent mode, network namespace: PASS"
