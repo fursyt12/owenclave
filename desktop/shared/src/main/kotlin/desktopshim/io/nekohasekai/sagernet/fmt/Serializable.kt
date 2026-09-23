@@ -13,7 +13,7 @@ import com.esotericsoftware.kryo.io.ByteBufferOutput
  * (which declare `public static final Creator<X> CREATOR = new CREATOR<X>() ...`)
  * keep compiling unchanged.
  */
-abstract class Serializable {
+abstract class Serializable : SerializableBase() {
 
     abstract fun initializeDefaultValues()
 
@@ -21,17 +21,8 @@ abstract class Serializable {
 
     abstract fun deserializeFromBuffer(input: ByteBufferInput)
 
-    /** Mirrors `android.os.Parcelable.Creator`. */
-    interface Creator<T> {
-
-        fun newInstance(): T
-
-        fun newArray(size: Int): Array<T>
-
-    }
-
     /** Mirrors the `Serializable.CREATOR` helper of the Android implementation. */
-    abstract class CREATOR<T : Serializable> : Creator<T> {
+    abstract class CREATOR<T : Serializable> : SerializableBase.Creator<T> {
 
         abstract override fun newInstance(): T
 

@@ -34,7 +34,7 @@ jobs:
             target: linux/amd64
             artifact: linux-x64
           - name: macOS x64
-            os: macos-13
+            os: macos-15-intel
             target: darwin/amd64
             artifact: macos-x64
           - name: macOS arm64
@@ -61,9 +61,42 @@ jobs:
       - name: Install WiX (Windows MSI)
         if: runner.os == 'Windows'
         run: choco install wixtoolset --no-progress -y
+      - name: Warm Go module cache
+        shell: bash
+        env:
+          # `|` lets Go fall back on any proxy error, not only on 404/410;
+          # proxy.golang.org occasionally fails mid download with INTERNAL_ERROR.
+          GOPROXY: "https://proxy.golang.org|https://goproxy.io|direct"
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3 4; do
+            echo "::group::go mod download (attempt $attempt)"
+            if (cd library/core && go mod download); then
+              echo "module cache is warm"
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "attempt $attempt failed, retrying in 20s"
+            sleep 20
+          done
+          echo "::error::go mod download failed after 4 attempts"
+          exit 1
       - name: Build core
         shell: bash
-        run: TARGETS="${{ matrix.target }}" bash bin/desktop/core/build.sh
+        env:
+          GOPROXY: "https://proxy.golang.org|https://goproxy.io|direct"
+        run: |
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if TARGETS="${{ matrix.target }}" bash bin/desktop/core/build.sh; then
+              exit 0
+            fi
+            echo "core build attempt $attempt failed, retrying in 20s"
+            sleep 20
+          done
+          echo "::error::core build failed after 3 attempts"
+          exit 1
       - name: Download NaiveProxy
         shell: bash
         run: TARGETS="${{ matrix.target }}" bash bin/desktop/naive/download.sh
@@ -91,7 +124,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave*' | head -1)"
+          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
+          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
           echo "launcher: $launcher"
           "$launcher" --version
           "$launcher" --selftest
@@ -100,7 +134,8 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave*' | head -1)"
+          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
+          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
           "$launcher" --selftest-naive
       - name: Package installer (best effort)
         shell: bash
