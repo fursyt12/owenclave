@@ -17,7 +17,7 @@ enum class Section(val label: String, val hint: String) {
     PROFILES("Profiles", "Import or pick a profile and connect"),
     SUBSCRIPTIONS("Subscriptions", "Subscription URLs, refresh and HWID reporting"),
     RULES("Rules", "Routing rules, the first match wins"),
-    SETTINGS("Settings", "Ports, routing mode, logging, device identity"),
+    SETTINGS("Settings", "The Android global settings one to one, plus the desktop-only options"),
     LOG("Log", "Core and plugin output"),
 }
 

@@ -470,7 +470,9 @@ jobs:
             config, so a binding that stores a value without applying it fails the build
           * the settings page is exercised end to end: auto connect, night theme, HWID
             reset, the insecure profile warning and the local DNS inbound with its port
-            all have desktop behaviour instead of being disabled
+            all have desktop behaviour instead of being disabled; the Android service
+            mode maps onto the desktop transparent mode and the VPN interface IPv6
+            switch adds the IPv6 routes to the tunnel device
           * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
           * transparent mode test: `tun2socks` creates a TUN device inside a network
             namespace, the client's traffic enters it and reaches a stub SOCKS server,

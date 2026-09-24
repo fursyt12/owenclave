@@ -169,7 +169,7 @@ app:
 | **Profiles** | imported profiles (with the subscription they came from), one click connect, delete; paste/share-link/raw-config import on the right |
 | **Subscriptions** | subscription URLs with a name and a per-subscription HWID switch, "Update" / "Update all", last update time and the last error |
 | **Rules** | routing rules (`Proxy` / `Direct` / `Block`) with domains (including the `domain:` / `full:` / `keyword:` / `regexp:` prefixes), IP CIDR, port, network and sniffed protocol; rules apply on the next connect |
-| **Settings** | SOCKS/HTTP ports, routing mode, LAN bypass, log level, HWID (global switch, current value, "generate a new identity"), fetch-through-the-tunnel switch, and the runtime paths |
+| **Settings** | the **entire Android global settings screen**, generated from `app/src/main/res/xml/global_preferences.xml` (seven categories, 86 rows; see "Settings" below), plus a "Desktop only" section for the settings Android has no row for (TUN interface name, subscription fetching, HWID identity, runtime paths) |
 | **Log** | everything the core and the plugins print, with copy and clear |
 
 Subscriptions are refreshed through the connected profile when one is running and
@@ -209,7 +209,9 @@ system traffic -> TUN device -> tun2socks -> SOCKS 127.0.0.1:<port> -> core -> u
   (`0.0.0.0/1` + `128.0.0.0/1`) on Linux, the documented route list on macOS,
   `netsh` address/DNS/route on Windows. Everything is removed again on disconnect.
 
-Enable it in **Settings → Transparent mode (TUN)**; it applies on the next connect.
+Enable it with **Settings → Service mode = VPN** (the Android VpnService row maps to
+the desktop TUN device; "Proxy only" is the default). The IPv6 address and routes are
+controlled by the Android **IPv6 route** row. It applies on the next connect.
 
 ### Privileges
 
@@ -276,13 +278,15 @@ them at runtime, so the desktop shows the same seven categories in the same orde
 with the same titles, summaries, defaults and widget kinds as Android - 86
 preferences today. Entries that make no sense on desktop (per-app proxy, packet
 capture, WakeLock, the quick settings tile, Tasker, ...) stay in their place but are
-disabled and state why - 21 of the 86 today.
+disabled and state why - 19 of the 86 today.
 
 Mobile-only preferences that *do* have a desktop meaning are adapted instead of
 disabled, through the binding table:
 
 | Android row | Desktop behaviour |
 | --- | --- |
+| Service mode (`serviceMode`) | the VpnService replacement: **VPN** creates the desktop TUN device (tun2socks), **Proxy only** keeps the local SOCKS/HTTP inbounds. The generated core config is always built in proxy mode, so no `--android_vpn` arguments are emitted |
+| IPv6 route (`enableVPNInterfaceIPv6Address`) | IPv6 address (`fdfe:dcba:9876::1`) plus split default routes on the desktop TUN device |
 | Auto connect (`isAutoConnect`) | connect the selected profile when the client starts |
 | Night mode (`nightTheme`) | light / dark / follow the system theme |
 | Theme colour (`appTheme`) | the Compose accent colour (palette) |
@@ -294,12 +298,21 @@ disabled, through the binding table:
 | Route mode (`routeMode`) | desktop rules / proxy all / direct only |
 | SOCKS proxy chaining, fragment, sniffing, DNS, inbounds, ... | pushed straight into the shared `ConfigBuilder` |
 
+Still Android-only and why: `tunImplementation` (tun2socks has a single userspace
+stack), `enablePcap`/`discardICMP` (no pcap/ICMP policy in the core or tun2socks),
+`proxyApps`/`allowAppsBypassVpn` (per-app routing needs Android package UIDs),
+`appendHttpProxy`/`httpProxyException` (Android sets the VPN HTTP proxy; set the OS
+proxy yourself), `requireTransproxy`/`transproxyPort` (use Service mode = VPN),
+`meteredNetwork`, `acquireWakeLock`, `queryAllPackagesAlternativeMethod`, the
+notification/statistics rows and `appLanguage`.
+
 Values are persisted next to the profiles and pushed into the shared `DataStore`
 before every config build through the binding table in `SettingsBindings.kt`, so a
 setting the user changes changes the config the core receives. A few desktop
 specific defaults are listed in `DesktopSettings.DESKTOP_DEFAULTS` (`requireHttp`
 on, `profileTrafficStatistics` off, `alwaysShowAddress` on) to keep the older
-desktop behaviour, everything else follows the Android defaults.
+desktop behaviour, everything else follows the Android defaults - except Service
+mode, where the desktop default is "Proxy only" because a TUN device needs root.
 
 The page also has a filter box (match key, title or summary), masks password
 fields, renders list values (hosts, STUN servers, ...) as multi-line fields and
