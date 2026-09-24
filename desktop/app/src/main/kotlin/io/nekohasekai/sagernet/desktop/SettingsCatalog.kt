@@ -47,9 +47,14 @@ data class MenuOption(val title: String, val value: String)
 /**
  * One Android preference entry, in file order.
  *
- * [enabled] is false for Android-only preferences (VPN service mode, per-app
- * proxy, notifications, ...): the row stays in its original place so the menu is
- * structurally identical, but it is rendered disabled with [disabledReason].
+ * [enabled] is false for preferences the current platform cannot honour
+ * (packet capture, WakeLock, the platform-specific per-app rows, ...):
+ * the row stays in its original place so the menu is structurally identical, but
+ * it is rendered disabled with [disabledReason].
+ *
+ * [options] is the dropdown declared by the Android XML; [desktopOptions] is the
+ * desktop replacement when the binding declares one (Service mode gains the
+ * desktop "System proxy" choice). The renderer uses [choices].
  */
 data class CatalogEntry(
     val key: String,
@@ -63,7 +68,13 @@ data class CatalogEntry(
     val disabledReason: String?,
     val binding: Binding,
     val note: String?,
-)
+    val desktopOptions: List<MenuOption>? = null,
+) {
+
+    /** The options the UI renders: the desktop override when there is one. */
+    val choices: List<MenuOption> get() = desktopOptions ?: options
+
+}
 
 /** One `PreferenceCategory`, in file order. */
 data class CatalogSection(
@@ -110,6 +121,11 @@ data class SettingsCatalog(
                 entry.note?.let { appendLine("  NOTE\t${oneLine(it)}") }
                 if (entry.options.isNotEmpty()) {
                     appendLine("  OPTIONS\t" + entry.options.joinToString(", ") {
+                        "${oneLine(it.title)}=${oneLine(it.value)}"
+                    })
+                }
+                entry.desktopOptions?.let { options ->
+                    appendLine("  DESKTOP-OPTIONS\t" + options.joinToString(", ") {
                         "${oneLine(it.title)}=${oneLine(it.value)}"
                     })
                 }
@@ -293,7 +309,8 @@ object SettingsCatalogParser {
             }
         }
         val binding = SettingsBindings.bindingFor(key)
-        val androidOnly = binding as? AndroidOnly
+        val disabledReason = binding.disabledReason(DesktopRuntime.os)
+        val desktopOptions = binding.desktopOptions(DesktopRuntime.os)
         return CatalogEntry(
             key = key,
             tag = tag,
@@ -305,10 +322,11 @@ object SettingsCatalogParser {
                 element.attribute("entries"),
                 element.attribute("entryValues"),
             ),
-            enabled = androidOnly == null,
-            disabledReason = androidOnly?.reason,
+            enabled = disabledReason == null,
+            disabledReason = disabledReason,
             binding = binding,
             note = binding.note,
+            desktopOptions = desktopOptions,
         )
     }
 

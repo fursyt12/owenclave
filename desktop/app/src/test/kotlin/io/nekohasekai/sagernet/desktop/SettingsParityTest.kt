@@ -264,10 +264,74 @@ class SettingsParityTest {
     }
 
     @Test
-    fun `the catalog is enabled except for the documented Android-only keys`() {
+    fun `the catalog is enabled except for the documented platform-only keys`() {
         val catalog = SettingsCatalogParser.reload()
+        val os = DesktopRuntime.os
         val disabled = catalog.entries.filter { !it.enabled }
-        assertEquals(19, disabled.size, "Android-only rows: $disabled")
-        assertTrue(disabled.all { it.binding is AndroidOnly })
+
+        val alwaysDisabled = setOf(
+            "appLanguage",
+            "tunImplementation",
+            "meteredNetwork",
+            "enablePcap",
+            "discardICMP",
+            "appTrafficStatistics",
+            "speedInterval",
+            "showDirectSpeed",
+            "appendHttpProxy",
+            "httpProxyException",
+            "requireTransproxy",
+            "transproxyPort",
+            "showGroupName",
+            "acquireWakeLock",
+            "fabStyle",
+            "useIECUnit",
+            "queryAllPackagesAlternativeMethod",
+            "allowAppsBypassVpn",
+        )
+        val expected = if (os == "linux") alwaysDisabled else alwaysDisabled + "proxyApps"
+
+        assertEquals(expected, disabled.map { it.key }.toSet())
+        assertTrue(disabled.all { !it.disabledReason.isNullOrBlank() }, "every disabled row needs a reason")
+        // The catalog agrees with the binding table for the running platform.
+        assertTrue(
+            catalog.entries.all { it.enabled == (it.binding.disabledReason(os) == null) },
+            "catalog enabled flags disagree with SettingsBindings",
+        )
+    }
+
+    @Test
+    fun `service mode offers the desktop system proxy choice`() {
+        val entry = SettingsCatalogParser.reload().entries.single { it.key == "serviceMode" }
+        assertTrue(entry.enabled, "Service mode is real on desktop")
+        // The Android XML only knows vpn/proxy; the desktop adds System proxy.
+        assertEquals(listOf("vpn", "proxy"), entry.options.map { it.value })
+        assertEquals(listOf("vpn", "system", "proxy"), entry.choices.map { it.value })
+    }
+
+    @Test
+    fun `the per-app rows state the truth for the running platform`() {
+        val catalog = SettingsCatalogParser.reload()
+        val proxyApps = catalog.entries.single { it.key == "proxyApps" }
+        val bypass = catalog.entries.single { it.key == "allowAppsBypassVpn" }
+        when (DesktopRuntime.os) {
+            "linux" -> {
+                assertTrue(proxyApps.enabled, "per-app routing is implemented on Linux")
+                assertFalse(bypass.enabled)
+                assertTrue(bypass.disabledReason!!.contains("include list"))
+            }
+            "windows" -> {
+                assertFalse(proxyApps.enabled)
+                assertFalse(bypass.enabled)
+                assertTrue(proxyApps.disabledReason!!.contains("WFP callout"))
+                assertTrue(bypass.disabledReason!!.contains("WFP callout"))
+            }
+            else -> {
+                assertFalse(proxyApps.enabled)
+                assertFalse(bypass.enabled)
+                assertTrue(proxyApps.disabledReason!!.contains("NetworkExtension"))
+                assertTrue(bypass.disabledReason!!.contains("NetworkExtension"))
+            }
+        }
     }
 }

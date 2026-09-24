@@ -847,13 +847,13 @@ private val NUMERIC_KEYS = setOf(
 @Composable
 private fun MenuControl(state: AppState, entry: CatalogEntry, current: String) {
     var expanded by remember { mutableStateOf(false) }
-    val selected = entry.options.firstOrNull { it.value == current }
+    val selected = entry.choices.firstOrNull { it.value == current }
     Box {
         OutlinedButton(onClick = { expanded = true }, enabled = entry.enabled) {
             Text(selected?.title?.ifBlank { "(none)" } ?: current.ifBlank { "(none)" }, fontSize = 12.sp)
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            entry.options.forEach { option ->
+            entry.choices.forEach { option ->
                 DropdownMenuItem(
                     text = { Text(option.title.ifBlank { "(none)" }, fontSize = 12.sp) },
                     onClick = {
@@ -922,18 +922,30 @@ private fun DesktopOnlySection(state: AppState) {
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
     Spacer(Modifier.height(12.dp))
-    Text("Transparent mode (TUN)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    Text("Service mode", fontWeight = FontWeight.Medium, fontSize = 13.sp)
     Text(
-        if (settings.tunEnabled) {
-            "On: selected with Service mode = VPN in App settings above. All system traffic is " +
-                "routed through the selected profile when you connect."
-        } else {
-            "Off: selected with Service mode = Proxy only in App settings above. This is the " +
-                "desktop equivalent of the Android VpnService mode."
+        when (settings.serviceMode) {
+            DesktopSettings.SERVICE_VPN ->
+                "VPN (TUN device): all system traffic is routed through the selected profile on " +
+                    "connect; the routes and the device are removed on disconnect."
+            DesktopSettings.SERVICE_SYSTEM ->
+                "System proxy: the OS proxy is pointed at 127.0.0.1:${settings.httpPort} " +
+                    "(SOCKS 127.0.0.1:${settings.socksPort}) on connect and the previous settings " +
+                    "are restored on disconnect."
+            else ->
+                "Proxy only: only the local inbounds are served; point apps at " +
+                    "127.0.0.1:${settings.socksPort} (SOCKS5) or 127.0.0.1:${settings.httpPort} (HTTP)."
         },
         fontSize = 11.sp,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    Text(
+        "Selected with the \"Service mode\" row in App settings above (VPN / System proxy / Proxy only).",
+        fontSize = 11.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Text("Transparent mode (TUN)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
     Row(verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             value = settings.tunInterface,
@@ -960,6 +972,68 @@ private fun DesktopOnlySection(state: AppState) {
         fontFamily = FontFamily.Monospace,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+    Spacer(Modifier.height(12.dp))
+    Text("System proxy", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    val proxyStatus = remember(settings.serviceMode) {
+        if (settings.serviceMode != DesktopSettings.SERVICE_SYSTEM) {
+            null
+        } else {
+            val proxy = SystemProxy()
+            proxy.unavailableReason()?.let { "unavailable: $it" } ?: "backend: ${proxy.backendName()}"
+        }
+    }
+    Text(
+        "When Service mode = System proxy, the OS proxy is set on connect and the previous " +
+            "settings are restored on disconnect, on exit and on the next start after a crash. " +
+            "GNOME (gsettings), KDE (kwriteconfig) and the macOS / Windows proxy settings are " +
+            "supported.",
+        fontSize = 11.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    if (proxyStatus != null) {
+        Text(
+            proxyStatus,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            color = if (proxyStatus.startsWith("unavailable")) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+    }
+    Spacer(Modifier.height(12.dp))
+    Text("Per-app routing", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    if (DesktopRuntime.os == "linux") {
+        Text(
+            "With Service mode = VPN and the Android \"Proxy apps\" row on, only the processes " +
+                "listed here are routed through the TUN device; every other process keeps the " +
+                "normal route (cgroup v2 + nftables/iptables marks + policy routing). One process " +
+                "name or absolute path per line. Needs root; the rules are removed on disconnect. " +
+                "A process that is not running yet has to be started and the connection re-done.",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OutlinedTextField(
+            value = settings.perAppProcesses,
+            onValueChange = { value -> state.updateSettings { it.copy(perAppProcesses = value) } },
+            label = { Text("Processes routed through the TUN device") },
+            minLines = 3,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    } else {
+        Text(
+            if (DesktopRuntime.os == "windows") {
+                "Not implemented on Windows: per-app routing needs a WFP callout driver, which " +
+                    "is out of scope for this application. Use the rule list instead."
+            } else {
+                "Not implemented on macOS: per-app routing needs a NetworkExtension, which is " +
+                    "out of scope for this application. Use the rule list instead."
+            },
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
     Spacer(Modifier.height(12.dp))
     Text("Device identity (HWID)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
     Row(verticalAlignment = Alignment.CenterVertically) {

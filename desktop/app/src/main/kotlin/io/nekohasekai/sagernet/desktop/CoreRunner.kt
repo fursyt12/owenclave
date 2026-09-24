@@ -20,9 +20,13 @@ import java.net.URL
  * starts the in-process core plus the plugin binaries and wires them together
  * through a local SOCKS listener.
  */
-class CoreRunner(private val log: (String) -> Unit) {
+class CoreRunner(
+    private val systemProxy: SystemProxy = SystemProxy(),
+    private val log: (String) -> Unit,
+) {
 
     private var tunSession: TunSession? = null
+    private var perAppRouting: PerAppRouting? = null
     private var coreProcess: Process? = null
     private var coreConfigFile: File = File(DesktopRuntime.dataDir, "core.json")
     private val plugins = ExternalPlugins { line -> log(line) }
@@ -65,18 +69,56 @@ class CoreRunner(private val log: (String) -> Unit) {
         startCore(profile, config.json, settings)
 
         if (tunInterface != null) {
+            // The Android `proxyApps` row: route only the listed processes through
+            // the TUN device (Linux cgroup v2 + nftables, see PerAppRouting).
+            val perAppProcesses = parseHostList(settings.perAppProcesses)
+            val perAppRequested = settings.value(Key.PROXY_APPS) == "true"
+            val perApp = perAppRequested && perAppProcesses.isNotEmpty()
+            if (perAppRequested && perAppProcesses.isEmpty()) {
+                log("per-app routing is on but the process list is empty; all traffic goes through the tunnel")
+            }
+
             val session = TunSession { line -> log(line) }
             // The Android `enableVPNInterfaceIPv6Address` row adds the IPv6 address
             // and split default routes to the desktop TUN device.
             val ipv6 = settings.value(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS) == "true"
             try {
-                session.start(tunInterface, settings.tunMtu, settings.socksPort, settings.tunInterface, ipv6)
+                session.start(
+                    tunInterface,
+                    settings.tunMtu,
+                    settings.socksPort,
+                    settings.tunInterface,
+                    ipv6,
+                    perApp,
+                )
             } catch (e: Exception) {
                 stop()
                 throw e
             }
             tunSession = session
             log("transparent mode ready on ${session.device}")
+
+            if (perApp) {
+                val routing = PerAppRouting(log = { line -> log(line) })
+                try {
+                    routing.install(perAppProcesses, session.device)
+                } catch (e: Exception) {
+                    stop()
+                    throw e
+                }
+                perAppRouting = routing
+            }
+        } else if (settings.systemProxyEnabled) {
+            // The desktop "System proxy" service mode: point the OS proxy at the
+            // local HTTP port, remembering (and restoring) the previous state.
+            val bypass = parseHostList(settings.value(Key.HTTP_PROXY_EXCEPTION))
+            val message = systemProxy.apply(
+                host = "127.0.0.1",
+                httpPort = settings.httpPort,
+                socksPort = settings.socksPort,
+                bypass = bypass,
+            )
+            log(message)
         }
     }
 
@@ -128,12 +170,24 @@ class CoreRunner(private val log: (String) -> Unit) {
         SagerNet.started = false
         DataStore.startedProfile = 0L
 
+        // The marks and the policy route go before the device disappears.
+        perAppRouting?.let { routing ->
+            log("stopping per-app routing")
+            routing.remove()
+        }
+        perAppRouting = null
+
         // The routes and the device have to go before the core disappears.
         tunSession?.let { session ->
             log("stopping transparent mode")
             session.stop()
         }
         tunSession = null
+
+        // The OS proxy is put back whether or not a TUN session existed; the call
+        // is a no-op when this run never touched it.
+        val restore = systemProxy.restore()
+        if (restore.restored || systemProxy.hasBackup()) log(restore.message)
 
         plugins.stop()
 

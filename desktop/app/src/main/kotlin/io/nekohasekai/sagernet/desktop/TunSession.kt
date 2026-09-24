@@ -35,13 +35,19 @@ class TunSession(private val log: (String) -> Unit) {
 
     val running: Boolean get() = pump?.isAlive == true
 
-    /** Starts the pump and configures the OS. Throws [TunException] with a reason. */
+    /**
+     * Starts the pump and configures the OS. Throws [TunException] with a reason.
+     *
+     * @param perApp Linux only: do not install the global split default routes.
+     *   [PerAppRouting] then sends only the marked cgroup traffic into the device.
+     */
     fun start(
         primaryInterface: String,
         mtu: Int,
         socksPort: Int,
         requestedDevice: String = "",
         ipv6: Boolean = false,
+        perApp: Boolean = false,
     ) {
         val binary = DesktopRuntime.tun2socksBinary()
             ?: throw TunException(
@@ -59,7 +65,7 @@ class TunSession(private val log: (String) -> Unit) {
             when (DesktopRuntime.os) {
                 "windows" -> startWindows(binary, primaryInterface, mtu, socksPort, ipv6)
                 "darwin" -> startMac(binary, primaryInterface, mtu, socksPort, ipv6)
-                else -> startLinux(binary, primaryInterface, mtu, socksPort, requestedDevice, ipv6)
+                else -> startLinux(binary, primaryInterface, mtu, socksPort, requestedDevice, ipv6, perApp)
             }
         } catch (e: Exception) {
             stop()
@@ -89,6 +95,7 @@ class TunSession(private val log: (String) -> Unit) {
         socksPort: Int,
         requestedDevice: String,
         ipv6: Boolean,
+        perApp: Boolean,
     ) {
         val name = requestedDevice.ifBlank { DEFAULT_LINUX_DEVICE }
         device = name
@@ -99,14 +106,22 @@ class TunSession(private val log: (String) -> Unit) {
         run("ip", "addr", "add", TUN_ADDRESS, "dev", name)
         run("ip", "link", "set", "dev", name, "up", "mtu", mtu.toString())
 
-        // Split defaults are more specific than the real default route, so the
-        // original one stays untouched and simply takes over again on teardown.
-        run("ip", "route", "add", "0.0.0.0/1", "dev", name, "metric", "1")
-        teardown.add { runQuiet("ip", "route", "del", "0.0.0.0/1", "dev", name) }
-        run("ip", "route", "add", "128.0.0.0/1", "dev", name, "metric", "1")
-        teardown.add { runQuiet("ip", "route", "del", "128.0.0.0/1", "dev", name) }
+        if (perApp) {
+            // No global routes: PerAppRouting installs the fwmark rule and the
+            // default route in its own table, so only the listed processes are
+            // captured. IPv6 split routes would capture everything, so they are
+            // skipped too.
+            log("transparent mode: $name up, per-app routing (no global routes)")
+        } else {
+            // Split defaults are more specific than the real default route, so the
+            // original one stays untouched and simply takes over again on teardown.
+            run("ip", "route", "add", "0.0.0.0/1", "dev", name, "metric", "1")
+            teardown.add { runQuiet("ip", "route", "del", "0.0.0.0/1", "dev", name) }
+            run("ip", "route", "add", "128.0.0.0/1", "dev", name, "metric", "1")
+            teardown.add { runQuiet("ip", "route", "del", "128.0.0.0/1", "dev", name) }
 
-        if (ipv6) setupIpv6Linux(name)
+            if (ipv6) setupIpv6Linux(name)
+        }
 
         // tun2socks receives packets from other interfaces; loose rp_filter is the
         // documented requirement.
@@ -114,7 +129,9 @@ class TunSession(private val log: (String) -> Unit) {
         runQuiet("sysctl", "-q", "-w", "net.ipv4.conf.$name.rp_filter=0")
 
         startPump(binary, name, primaryInterface, socksPort)
-        log("transparent mode: $name up, $TUN_ADDRESS, default via the tunnel (physical: $primaryInterface)")
+        if (!perApp) {
+            log("transparent mode: $name up, $TUN_ADDRESS, default via the tunnel (physical: $primaryInterface)")
+        }
     }
 
     /**

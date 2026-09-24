@@ -73,6 +73,12 @@ class AppState(private val scope: CoroutineScope) {
         appendLog("data directory: ${DesktopRuntime.dataDir.absolutePath}")
         appendLog("core binary: ${DesktopRuntime.coreBinary()?.absolutePath ?: "not found"}")
         appendLog("naive binary: ${DesktopRuntime.naiveBinary()?.absolutePath ?: "not found"}")
+        // A previous run may have crashed while the system proxy was set: put the
+        // remembered values back before doing anything else.
+        runCatching { SystemProxy().restoreStale() }.getOrNull()?.let { appendLog(it.message) }
+        // Restore the OS proxy even when the window is not closed through the UI
+        // (the ordinary path is AppState.shutdown; both are idempotent).
+        Runtime.getRuntime().addShutdownHook(Thread { runCatching { shutdown() } })
         // The Android `isAutoConnect` row ("restore the previous connection status")
         // maps to connecting the selected profile when the desktop client starts.
         if (store.settings.value(Key.PERSIST_ACROSS_REBOOT) == "true" && selectedProfile != null) {

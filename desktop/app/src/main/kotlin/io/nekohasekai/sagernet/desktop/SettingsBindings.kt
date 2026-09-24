@@ -14,6 +14,18 @@ sealed interface Binding {
     /** Optional human readable note shown by `--print-settings`. */
     val note: String?
 
+    /**
+     * Null when the preference is usable on [os] (`linux`, `windows`, `darwin`),
+     * otherwise the reason the row is rendered disabled there.
+     */
+    fun disabledReason(os: String): String? = null
+
+    /**
+     * Desktop-only dropdown options replacing the ones declared in the Android
+     * XML, or null to keep the Android list. Keyed by OS; `*` is the fallback.
+     */
+    fun desktopOptions(os: String): List<MenuOption>? = null
+
 }
 
 /**
@@ -31,7 +43,13 @@ data class DataStoreMember(val member: String) : Binding {
  * than by a plain shim property (for example the LAN bypass rule, or the
  * route mode that desktop expresses in `postProcess`).
  */
-data class DesktopOverride(override val note: String) : Binding
+data class DesktopOverride(
+    override val note: String,
+    private val optionsByOs: Map<String, List<MenuOption>>? = null,
+) : Binding {
+    override fun desktopOptions(os: String): List<MenuOption>? =
+        optionsByOs?.let { it[os] ?: it["*"] }
+}
 
 /**
  * Parsed and stored, but not consumed by the desktop core config (for example
@@ -46,6 +64,21 @@ data class StoredOnly(override val note: String) : Binding
  */
 data class AndroidOnly(val reason: String) : Binding {
     override val note: String? = null
+    override fun disabledReason(os: String): String = reason
+}
+
+/**
+ * A preference the desktop supports on some platforms only: [reasons] maps an OS
+ * (`linux`, `windows`, `darwin`, `*`) to the disabled reason, and a null value
+ * means the row is enabled there. Used by the per-app rows, which are real on
+ * Linux and honestly out of scope on Windows and macOS.
+ */
+data class PlatformOnly(
+    private val reasons: Map<String, String?>,
+    override val note: String? = null,
+) : Binding {
+    override fun disabledReason(os: String): String? =
+        if (reasons.containsKey(os)) reasons[os] else reasons["*"]
 }
 
 /**
@@ -74,6 +107,21 @@ object SettingsBindings {
     private const val NO_NOTIFICATION = "Android only: the desktop client has no notifications"
     private const val NO_PACKAGE_MANAGER = "Android only: Android package manager feature"
 
+    /**
+     * Per-app routing is real on Linux (see [PerAppRouting]) and explicitly not
+     * faked on Windows and macOS: the honest answer is that it would need a
+     * kernel driver / system extension this application does not ship.
+     */
+    private const val PER_APP_WINDOWS =
+        "Windows: per-app routing needs a WFP callout driver, which is out of scope for this " +
+            "application. Use the desktop rule list instead."
+    private const val PER_APP_MACOS =
+        "macOS: per-app routing needs a NetworkExtension, which is out of scope for this " +
+            "application. Use the desktop rule list instead."
+    private const val PER_APP_BYPASS_LINUX =
+        "Android only: per-app bypass is not implemented; the desktop supports an include list " +
+            "instead (Desktop only → Per-app routing)"
+
     private val TABLE: Map<String, Binding> = linkedMapOf(
         // ------------------------------------------------------- App settings
         // Adapted for desktop: connect the selected profile when the client starts.
@@ -83,9 +131,21 @@ object SettingsBindings {
         "nightTheme" to DesktopOverride("the desktop light/dark theme"),
         "appLanguage" to AndroidOnly("Android only: the desktop UI ships in English"),
         // Adapted for desktop: Android "VPN" is the desktop TUN device, "Proxy
-        // only" keeps the local SOCKS/HTTP inbounds (the Android VpnService itself
-        // has no desktop counterpart, the TUN device is created with tun2socks).
-        "serviceMode" to DesktopOverride("desktop transparent mode: VPN = TUN device, Proxy only = local inbounds"),
+        // only" keeps the local SOCKS/HTTP inbounds, and the desktop adds a third
+        // mode that points the operating system proxy at the local HTTP port.
+        // (The Android VpnService itself has no desktop counterpart, the TUN
+        // device is created with tun2socks.)
+        "serviceMode" to DesktopOverride(
+            note = "desktop service mode: VPN = TUN device, System proxy = the OS proxy, " +
+                "Proxy only = local inbounds",
+            optionsByOs = mapOf(
+                "*" to listOf(
+                    MenuOption("VPN (TUN device)", "vpn"),
+                    MenuOption("System proxy", "system"),
+                    MenuOption("Proxy only", "proxy"),
+                ),
+            ),
+        ),
         "tunImplementation" to AndroidOnly("Android only: the desktop TUN engine (tun2socks) has a single userspace stack"),
         // NOTE: key `mtu` (VpnService MTU) drives the desktop TUN MTU field.
         "mtu" to DesktopOverride("the desktop TUN device MTU"),
@@ -103,8 +163,26 @@ object SettingsBindings {
         // Adapted for desktop: adds the IPv6 address and split default routes to
         // the desktop TUN device (see TunSession).
         "enableVPNInterfaceIPv6Address" to DesktopOverride("IPv6 address and routes in the desktop TUN device"),
-        "proxyApps" to AndroidOnly("Android only: the desktop TUN device captures all processes; per-app routing needs Android package UIDs"),
-        "allowAppsBypassVpn" to AndroidOnly("Android only: per-app bypass needs Android package UIDs"),
+        // Real on Linux through the cgroup v2 + nftables layer in PerAppRouting;
+        // explicitly out of scope (not faked) on Windows and macOS.
+        "proxyApps" to PlatformOnly(
+            reasons = mapOf(
+                "linux" to null,
+                "windows" to PER_APP_WINDOWS,
+                "darwin" to PER_APP_MACOS,
+                "*" to PER_APP_WINDOWS,
+            ),
+            note = "desktop: route only the processes listed under Desktop only → " +
+                "Per-app routing through the TUN device (Linux)",
+        ),
+        "allowAppsBypassVpn" to PlatformOnly(
+            reasons = mapOf(
+                "linux" to PER_APP_BYPASS_LINUX,
+                "windows" to PER_APP_WINDOWS,
+                "darwin" to PER_APP_MACOS,
+                "*" to PER_APP_WINDOWS,
+            ),
+        ),
         // NOTE: ConfigBuilder does not read bypassLan; the desktop turns it into
         // the "Bypass private networks" routing rule (see DesktopConfigBuilder).
         "bypassLan" to DesktopOverride("the desktop \"Bypass private networks\" routing rule"),
@@ -176,8 +254,8 @@ object SettingsBindings {
         "httpPort" to DataStoreMember("httpPort"),
         "httpUsername" to DataStoreMember("httpUsername"),
         "httpPassword" to DataStoreMember("httpPassword"),
-        "appendHttpProxy" to AndroidOnly("Android only: Android sets the VPN HTTP proxy; on desktop set your OS system proxy"),
-        "httpProxyException" to AndroidOnly("Android only: Android sets the VPN HTTP proxy; on desktop set your OS system proxy"),
+        "appendHttpProxy" to AndroidOnly("Android only: Android sets the VPN HTTP proxy; the desktop uses Service mode = System proxy"),
+        "httpProxyException" to AndroidOnly("Android only: Android sets the VPN HTTP proxy; the desktop uses Service mode = System proxy"),
         "requireTransproxy" to AndroidOnly("Android only: use Service mode = VPN (the desktop TUN device) instead of iptables tproxy"),
         "transproxyPort" to AndroidOnly("Android only: use Service mode = VPN (the desktop TUN device) instead of iptables tproxy"),
         // Adapted for desktop: the core listens for DNS on 127.0.0.1:<portLocalDns>

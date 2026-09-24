@@ -276,7 +276,7 @@ object SelfTest {
             routeMode = DesktopSettings.ROUTE_DIRECT,
             logLevel = LogLevel.INFO,
             bypassPrivateNetworks = false,
-            tunEnabled = true,
+            serviceMode = DesktopSettings.SERVICE_VPN,
         )
 
         return try {

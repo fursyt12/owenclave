@@ -192,6 +192,13 @@ tasks.test {
     // Tests resolve the development core/plugin binaries straight from the
     // repository, and validate generated configs with `owenclave-core test`.
     systemProperty("owenclave.devRoot", rootProject.projectDir.absolutePath)
+    // Opt-in host tests (they really set the system proxy):
+    //   ./gradlew :desktop:app:test --tests '*SystemProxyE2eTest*' \
+    //     -Dowenclave.e2e.systemProxy=true
+    (project.findProperty("owenclave.e2e.systemProxy")
+        ?: System.getProperty("owenclave.e2e.systemProxy"))?.let {
+        systemProperty("owenclave.e2e.systemProxy", it.toString())
+    }
 }
 
 compose.desktop {

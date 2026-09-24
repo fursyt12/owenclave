@@ -159,6 +159,21 @@ desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest
 The self test prints `[selftest] PASS` and exits with code 0 on success, which
 makes it usable on Linux and Windows (including under Wine) in CI.
 
+`:desktop:app:test` also covers the host state changes without touching the
+developer machine: `SystemProxyTest` drives the GNOME/KDE/macOS/Windows proxy layer
+and `PerAppRoutingTest` the Linux cgroup/nftables rules, both through a fake
+`CommandRunner` (set/restore symmetry, idempotence, stale-backup restore, hand-edit
+protection and every failure path).
+
+The one test that *does* touch the host is opt-in, because it sets the real system
+proxy, fetches through the endpoint the OS proxy setting points at with `curl` and
+checks that the previous values come back byte for byte:
+
+```sh
+./gradlew :desktop:app:test --tests '*SystemProxyE2eTest*' \
+  -Dowenclave.e2e.systemProxy=true -i
+```
+
 ## UI
 
 The window is a left navigation rail with the screens modelled after the Android
@@ -186,7 +201,9 @@ switch or the per-subscription switch is on.
   source, connected and deleted, but the protocol forms of the Android app are not
   rebuilt on desktop;
 * rules have no per-app / package matching (SSID and package rules are Android
-  concepts) and there is no rule reordering UI yet;
+  concepts) and there is no rule reordering UI yet; Linux per-app routing is a
+  separate include list (see [Per-app routing](#per-app-routing-linux)), not a rule
+  matcher;
 * no subscription auto-update scheduling and no QR scanning.
 
 ## Transparent mode (TUN)
@@ -212,6 +229,40 @@ system traffic -> TUN device -> tun2socks -> SOCKS 127.0.0.1:<port> -> core -> u
 Enable it with **Settings → Service mode = VPN** (the Android VpnService row maps to
 the desktop TUN device; "Proxy only" is the default). The IPv6 address and routes are
 controlled by the Android **IPv6 route** row. It applies on the next connect.
+
+### Per-app routing (Linux)
+
+The core has **no process based route rules** (`process_name`/`process_path` is
+rejected with "this rule has no effective fields"), and the Android app expresses
+per-app proxying through `VpnService` package UIDs, which do not exist on desktop.
+On Linux the operating system can do it, so the desktop client implements the include
+list instead of faking it:
+
+```
+listed processes -> cgroup v2 slice -> nftables mark -> policy route -> TUN device
+unlisted processes -> the normal routing table
+```
+
+`PerAppRouting.kt` (one file, every command through the injectable `CommandRunner`):
+
+1. creates `/sys/fs/cgroup/owenclave.slice` and moves the matching PIDs into it;
+2. marks packets whose socket belongs to that cgroup
+   (`nft ... meta cgroup <slice inode> meta mark set 0x1`; when `nft` is missing the
+   `iptables -m cgroup --path` fallback is used);
+3. adds `ip rule add fwmark 0x1 lookup 1188` plus a default route in table 1188
+   pointing at the TUN device.
+
+The global split default routes are **not** installed in this mode (otherwise every
+process would be captured), so the list is meaningful. Everything needs root and is
+removed on disconnect. A process that is not running yet has to be started and the
+connection re-done; the log says how many processes matched.
+
+Turn it on with **Settings → Proxy apps** (the Android row is real on Linux) and edit
+the process list under **Desktop only → Per-app routing**, one process name or
+absolute path per line.
+
+Failure paths are explicit: not root, no cgroup v2, neither `nft` nor `iptables`
+with the cgroup match, or a failing command each raise a message naming the cause.
 
 ### Privileges
 
@@ -241,6 +292,34 @@ sudo ./desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --sel
 
 CI runs both: the namespace variant on Linux, the real one (last step, non blocking)
 on Linux, macOS and Windows.
+
+## System proxy mode
+
+The third Service mode ("System proxy", a desktop-only choice on top of the Android
+VPN / Proxy only list) points the operating system proxy at the local HTTP port on
+connect and reliably restores the previous state:
+
+| OS | Backend | What is set |
+| --- | --- | --- |
+| Linux | GNOME (`gsettings`) | `org.gnome.system.proxy` mode = manual, `.http` and `.socks` host/port, `ignore-hosts` when a bypass list is configured |
+| Linux | KDE (`kwriteconfig5`/`kwriteconfig6`) | `kioslaverc` `[Proxy Settings]` `ProxyType`, `httpProxy`, `httpsProxy`, `socksProxy`, `NoProxyFor` |
+| macOS | `networksetup` | `-setwebproxy` / `-setsecurewebproxy` / `-setsocksfirewallproxy` plus the matching `-set*proxystate` on the active service (resolved from `networkserviceorder`, primary interface first), bypass domains when configured |
+| Windows | `reg.exe` + WinINet | `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` `ProxyEnable`/`ProxyServer`/`ProxyOverride`, then `InternetSetOption` (`INTERNET_OPTION_SETTINGS_CHANGED` 39 and `INTERNET_OPTION_REFRESH` 37) through an inline PowerShell `Add-Type` P/Invoke |
+
+GNOME is preferred over KDE; if neither is available the client says so explicitly
+instead of pretending (the connect fails with that reason). The whole layer is
+`SystemProxy.kt`; every command goes through the injectable `CommandRunner`.
+
+**Restore semantics.** Before touching anything the previous values are written to
+`system-proxy-backup.json` in the data directory (GNOME/KDE/macOS/Windows all use the
+same JSON). On disconnect, on exit (JVM shutdown hook) and on the next start when the
+file is still there (the process crashed) the backup is consumed: a field is put back
+only when the OS still holds exactly the value this client set - a value the user
+changed by hand while connected is left alone and reported. A restore deletes the
+backup, so it is idempotent; if a restore command fails, the backup is kept and the
+next start retries. Applying twice is safe: when the OS still holds our values, the
+already recorded original backup is kept instead of being overwritten. A backup
+written on another OS is discarded, not applied.
 
 ## Arch Linux
 
@@ -276,17 +355,19 @@ preference definition. The `copyAndroidPreferences` Gradle task copies
 resource merger) into the application resources, and `SettingsCatalog.kt` parses
 them at runtime, so the desktop shows the same seven categories in the same order,
 with the same titles, summaries, defaults and widget kinds as Android - 86
-preferences today. Entries that make no sense on desktop (per-app proxy, packet
-capture, WakeLock, the quick settings tile, Tasker, ...) stay in their place but are
-disabled and state why - 19 of the 86 today.
+preferences today. Entries the running platform cannot honour (packet capture,
+WakeLock, the quick settings tile, Tasker, the per-app rows on Windows/macOS, ...)
+stay in their place but are disabled and state why - 18 of the 86 on Linux, 19 on
+Windows and macOS today.
 
 Mobile-only preferences that *do* have a desktop meaning are adapted instead of
 disabled, through the binding table:
 
 | Android row | Desktop behaviour |
 | --- | --- |
-| Service mode (`serviceMode`) | the VpnService replacement: **VPN** creates the desktop TUN device (tun2socks), **Proxy only** keeps the local SOCKS/HTTP inbounds. The generated core config is always built in proxy mode, so no `--android_vpn` arguments are emitted |
+| Service mode (`serviceMode`) | the VpnService replacement, with a desktop-only third choice: **VPN** creates the desktop TUN device (tun2socks), **System proxy** points the OS proxy at the local HTTP port (see [System proxy mode](#system-proxy-mode)), **Proxy only** keeps the local SOCKS/HTTP inbounds. The generated core config is always built in proxy mode, so no `--android_vpn` arguments are emitted |
 | IPv6 route (`enableVPNInterfaceIPv6Address`) | IPv6 address (`fdfe:dcba:9876::1`) plus split default routes on the desktop TUN device |
+| Per-app proxy (`proxyApps`) | real on Linux: only the processes listed under Desktop only → Per-app routing go through the TUN device (see [Per-app routing](#per-app-routing-linux)). Disabled on Windows/macOS with the WFP-callout / NetworkExtension reason |
 | Auto connect (`isAutoConnect`) | connect the selected profile when the client starts |
 | Night mode (`nightTheme`) | light / dark / follow the system theme |
 | Theme colour (`appTheme`) | the Compose accent colour (palette) |
@@ -298,13 +379,23 @@ disabled, through the binding table:
 | Route mode (`routeMode`) | desktop rules / proxy all / direct only |
 | SOCKS proxy chaining, fragment, sniffing, DNS, inbounds, ... | pushed straight into the shared `ConfigBuilder` |
 
-Still Android-only and why: `tunImplementation` (tun2socks has a single userspace
-stack), `enablePcap`/`discardICMP` (no pcap/ICMP policy in the core or tun2socks),
-`proxyApps`/`allowAppsBypassVpn` (per-app routing needs Android package UIDs),
-`appendHttpProxy`/`httpProxyException` (Android sets the VPN HTTP proxy; set the OS
-proxy yourself), `requireTransproxy`/`transproxyPort` (use Service mode = VPN),
-`meteredNetwork`, `acquireWakeLock`, `queryAllPackagesAlternativeMethod`, the
-notification/statistics rows and `appLanguage`.
+Still not available on desktop, and why: `tunImplementation` (tun2socks has a single
+userspace stack), `enablePcap`/`discardICMP` (no pcap/ICMP policy in the core or
+tun2socks), `allowAppsBypassVpn` (the desktop supports an include list on Linux, not
+a bypass list), `proxyApps` on Windows/macOS (needs a WFP callout driver /
+NetworkExtension), `appendHttpProxy`/`httpProxyException` (Android sets the VPN HTTP
+proxy; use Service mode = System proxy), `requireTransproxy`/`transproxyPort` (use
+Service mode = VPN), `meteredNetwork`, `acquireWakeLock`,
+`queryAllPackagesAlternativeMethod`, the notification/statistics rows and
+`appLanguage`.
+
+The platform matrix for the two features that are not portable is:
+
+| Feature | Linux | Windows | macOS |
+| --- | --- | --- | --- |
+| System proxy (Service mode = System proxy) | GNOME `gsettings` or KDE `kwriteconfig` | `reg.exe` + WinINet refresh | `networksetup` on the active service |
+| Per-app include list | cgroup v2 + nftables (or iptables) marks + policy routing | **not implemented** (WFP callout driver out of scope; use the rule list) | **not implemented** (NetworkExtension out of scope; use the rule list) |
+| Per-app bypass (`allowAppsBypassVpn`) | **not implemented** (include list only) | **not implemented** | **not implemented** |
 
 Values are persisted next to the profiles and pushed into the shared `DataStore`
 before every config build through the binding table in `SettingsBindings.kt`, so a
@@ -350,7 +441,9 @@ mode).
 
 Android-only concepts have no desktop equivalent and are intentionally absent:
 `VpnService` (desktop builds the same idea from `tun2socks` plus the core's SOCKS
-inbound, see [Transparent mode](#transparent-mode-tun)), per-app proxy, WorkManager
+inbound, see [Transparent mode](#transparent-mode-tun)), package-UID based per-app
+routing on Windows/macOS (Linux uses its own cgroup list, see
+[Per-app routing](#per-app-routing-linux)), WorkManager
 based subscription refresh and the AIDL plugin discovery.
 
 ## Layout

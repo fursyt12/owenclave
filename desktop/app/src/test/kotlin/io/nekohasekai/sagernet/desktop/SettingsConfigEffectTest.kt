@@ -242,11 +242,17 @@ class SettingsConfigEffectTest {
         val off = DesktopSettings()
         assertEquals("proxy", off.value(Key.SERVICE_MODE))
         assertFalse(off.tunEnabled, "the desktop TUN is off by default")
+        assertFalse(off.systemProxyEnabled)
 
         val on = off.withValue(Key.SERVICE_MODE, "vpn")
         assertTrue(on.tunEnabled, "Service mode = VPN must enable the desktop TUN")
         assertEquals("vpn", on.value(Key.SERVICE_MODE))
         assertFalse(on.withValue(Key.SERVICE_MODE, "proxy").tunEnabled)
+
+        // The desktop-only third choice points the OS proxy at the local inbound.
+        val system = off.withValue(Key.SERVICE_MODE, "system")
+        assertTrue(system.systemProxyEnabled)
+        assertFalse(system.tunEnabled, "System proxy is not a TUN mode")
 
         // The generated config must still be told "proxy": the desktop TUN device is
         // built by tun2socks, never through the Android VpnService arguments.
@@ -255,6 +261,28 @@ class SettingsConfigEffectTest {
             io.nekohasekai.sagernet.Key.MODE_PROXY,
             io.nekohasekai.sagernet.database.DataStore.serviceMode,
         )
+    }
+
+    @Test
+    fun `system proxy and per-app routing leave the core config unchanged`() {
+        // The same Profile, so the generated outbound tag is identical.
+        val profile = Profile(bean = vmess())
+        val base = JsonParser.parseString(
+            DesktopConfigBuilder.build(profile, DesktopSettings(), emptyList(), null).json
+        ).asJsonObject
+        val external = JsonParser.parseString(
+            DesktopConfigBuilder.build(
+                profile,
+                DesktopSettings()
+                    .withValue(Key.SERVICE_MODE, "system")
+                    .withValue(Key.PROXY_APPS, "true")
+                    .copy(perAppProcesses = "curl\n/usr/bin/firefox"),
+                emptyList(),
+                null,
+            ).json
+        ).asJsonObject
+        // Both features act on the operating system, never on the core JSON.
+        assertEquals(base, external)
     }
 
     @Test
@@ -278,6 +306,7 @@ class SettingsConfigEffectTest {
                 .withValue(Key.SOCKS_PORT, "23456")
                 .withValue(Key.SERVICE_MODE, "vpn")
                 .withValue(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS, "true")
+                .copy(perAppProcesses = "curl\nfirefox")
             store.save()
 
             val reloaded = ProfileStore(file).apply { load() }
@@ -287,6 +316,7 @@ class SettingsConfigEffectTest {
             assertEquals("vpn", reloaded.settings.value(Key.SERVICE_MODE))
             assertTrue(reloaded.settings.tunEnabled)
             assertEquals("true", reloaded.settings.value(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS))
+            assertEquals("curl\nfirefox", reloaded.settings.perAppProcesses)
         } finally {
             file.delete()
         }

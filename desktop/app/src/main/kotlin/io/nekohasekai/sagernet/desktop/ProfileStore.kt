@@ -24,11 +24,21 @@ class DesktopSettings(
     var hwidValue: String = "",
     /** Fetch subscriptions through the running core, which also bypasses local filtering. */
     var fetchSubscriptionsThroughProxy: Boolean = true,
-    /** Transparent mode: capture all system traffic through a TUN device. */
-    var tunEnabled: Boolean = false,
+    /**
+     * The Android "Service mode" row: [SERVICE_VPN] creates the desktop TUN
+     * device, [SERVICE_SYSTEM] points the operating system proxy at the local
+     * HTTP port, [SERVICE_PROXY] only keeps the local SOCKS/HTTP inbounds.
+     */
+    var serviceMode: String = SERVICE_PROXY,
     /** TUN interface name on Linux, empty for the default. */
     var tunInterface: String = "",
     var tunMtu: Int = 1500,
+    /**
+     * Linux per-app routing: process names (or absolute paths) whose traffic goes
+     * through the TUN device. Only read when Service mode = VPN and the Android
+     * `proxyApps` row is on. See [PerAppRouting].
+     */
+    var perAppProcesses: String = "",
     /**
      * Values of the Android global preferences, keyed by the constants in
      * [io.nekohasekai.sagernet.Key]. The keys backed by a typed field above
@@ -42,12 +52,23 @@ class DesktopSettings(
     val preferences: MutableMap<String, String> = LinkedHashMap(),
 ) {
 
+    /** Transparent mode: capture all system traffic through a TUN device. */
+    val tunEnabled: Boolean get() = serviceMode == SERVICE_VPN
+
+    /** System proxy mode: point the OS proxy at the local HTTP port on connect. */
+    val systemProxyEnabled: Boolean get() = serviceMode == SERVICE_SYSTEM
+
     companion object {
         const val ROUTE_GLOBAL = "global"
         const val ROUTE_DIRECT = "direct"
 
         /** The Android `routeMode` "rule" value; the desktop rule list is always evaluated. */
         const val ROUTE_RULE = "rule"
+
+        /** Android `serviceMode` values, plus the desktop-only "system" mode. */
+        const val SERVICE_VPN = "vpn"
+        const val SERVICE_PROXY = "proxy"
+        const val SERVICE_SYSTEM = "system"
 
         /**
          * Desktop defaults that intentionally differ from the Android XML/defaults
@@ -122,11 +143,12 @@ class DesktopSettings(
             Key.SOCKS_PORT -> settings.socksPort.toString()
             Key.HTTP_PORT -> settings.httpPort.toString()
             Key.LOG_LEVEL -> settings.logLevel.toString()
-            // Android "Service mode" is the desktop transparent-mode switch:
-            // VPN = the desktop TUN device, Proxy only = local SOCKS/HTTP inbounds.
-            // The desktop default is "proxy" because a TUN device needs root; the
-            // Android default is "vpn".
-            Key.SERVICE_MODE -> if (settings.tunEnabled) "vpn" else "proxy"
+            // Android "Service mode" maps to the desktop service mode: VPN = the
+            // desktop TUN device, System proxy = the OS proxy, Proxy only = local
+            // SOCKS/HTTP inbounds. The desktop default is "proxy" because both a
+            // TUN device and the OS proxy touch the host; the Android default is
+            // "vpn".
+            Key.SERVICE_MODE -> settings.serviceMode
             Key.ROUTE_MODE -> when (settings.routeMode) {
                 ROUTE_DIRECT -> RouteMode.DIRECT.toString()
                 ROUTE_RULE -> RouteMode.RULE.toString()
@@ -160,8 +182,9 @@ class DesktopSettings(
             Key.SOCKS_PORT -> value.toIntOrNull()?.let { socksPort = it }
             Key.HTTP_PORT -> value.toIntOrNull()?.let { httpPort = it }
             Key.LOG_LEVEL -> value.toIntOrNull()?.let { logLevel = it }
-            // VPN enables the desktop TUN device, Proxy only keeps the local inbounds.
-            Key.SERVICE_MODE -> tunEnabled = value == "vpn"
+            // VPN enables the desktop TUN device, System proxy points the OS proxy
+            // at the local HTTP port, Proxy only keeps the local inbounds.
+            Key.SERVICE_MODE -> if (value.isNotBlank()) serviceMode = value
             Key.ROUTE_MODE -> routeMode = when (value.toIntOrNull()) {
                 RouteMode.DIRECT -> ROUTE_DIRECT
                 RouteMode.RULE -> ROUTE_RULE
@@ -185,14 +208,15 @@ class DesktopSettings(
         sendHwid: Boolean = this.sendHwid,
         hwidValue: String = this.hwidValue,
         fetchSubscriptionsThroughProxy: Boolean = this.fetchSubscriptionsThroughProxy,
-        tunEnabled: Boolean = this.tunEnabled,
+        serviceMode: String = this.serviceMode,
         tunInterface: String = this.tunInterface,
         tunMtu: Int = this.tunMtu,
+        perAppProcesses: String = this.perAppProcesses,
         preferences: Map<String, String> = LinkedHashMap(this.preferences),
     ) = DesktopSettings(
         socksPort, httpPort, routeMode, logLevel, selectedProfileId, bypassPrivateNetworks,
-        sendHwid, hwidValue, fetchSubscriptionsThroughProxy, tunEnabled, tunInterface, tunMtu,
-        LinkedHashMap(preferences),
+        sendHwid, hwidValue, fetchSubscriptionsThroughProxy, serviceMode, tunInterface, tunMtu,
+        perAppProcesses, LinkedHashMap(preferences),
     )
 
     /** Returns a copy with one Android preference key changed. */
@@ -252,9 +276,16 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                     sendHwid = json.get("sendHwid")?.asBoolean ?: false,
                     hwidValue = json.get("hwidValue")?.asString.orEmpty(),
                     fetchSubscriptionsThroughProxy = json.get("fetchSubscriptionsThroughProxy")?.asBoolean ?: true,
-                    tunEnabled = json.get("tunEnabled")?.asBoolean ?: false,
+                    // Older documents only stored the `tunEnabled` boolean.
+                    serviceMode = json.get("serviceMode")?.asString
+                        ?: if (json.get("tunEnabled")?.asBoolean == true) {
+                            DesktopSettings.SERVICE_VPN
+                        } else {
+                            DesktopSettings.SERVICE_PROXY
+                        },
                     tunInterface = json.get("tunInterface")?.asString.orEmpty(),
                     tunMtu = json.get("tunMtu")?.asInt ?: 1500,
+                    perAppProcesses = json.get("perAppProcesses")?.asString.orEmpty(),
                     preferences = preferences,
                 )
             }
@@ -276,9 +307,10 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                 addProperty("sendHwid", settings.sendHwid)
                 addProperty("hwidValue", settings.hwidValue)
                 addProperty("fetchSubscriptionsThroughProxy", settings.fetchSubscriptionsThroughProxy)
-                addProperty("tunEnabled", settings.tunEnabled)
+                addProperty("serviceMode", settings.serviceMode)
                 addProperty("tunInterface", settings.tunInterface)
                 addProperty("tunMtu", settings.tunMtu)
+                addProperty("perAppProcesses", settings.perAppProcesses)
                 settings.selectedProfileId?.let { addProperty("selectedProfileId", it) }
                 add("preferences", JsonObject().apply {
                     settings.preferences.forEach { (key, value) -> addProperty(key, value) }
