@@ -1,0 +1,224 @@
+package io.nekohasekai.sagernet.desktop
+
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.RouteMode
+import io.nekohasekai.sagernet.fmt.AbstractBean
+import io.nekohasekai.sagernet.fmt.trojan.TrojanBean
+import io.nekohasekai.sagernet.fmt.v2ray.VMessBean
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
+
+/**
+ * Proves that the Android global preferences the desktop Settings tab renders
+ * actually reach the generated core config: every setting here is changed through
+ * [DesktopSettings.withValue] (the same path the UI uses) and then observed in
+ * the JSON produced by [DesktopConfigBuilder.build].
+ *
+ * This is the counterpart of `SettingsParityTest`: that one guarantees the menu is
+ * complete, this one guarantees the values are not decorative.
+ */
+class SettingsConfigEffectTest {
+
+    private val testUuid = "b831381d-6324-4d53-ad4f-8cda48b30811"
+
+    private fun vmess(mux: Boolean = false): VMessBean = VMessBean().apply {
+        serverAddress = "1.2.3.4"
+        serverPort = 443
+        uuid = testUuid
+        alterId = 0
+        encryption = "auto"
+        type = "tcp"
+        security = "none"
+        this.mux = mux
+        initializeDefaultValues()
+    }
+
+    private fun trojanTls(): TrojanBean = TrojanBean().apply {
+        serverAddress = "1.2.3.4"
+        serverPort = 443
+        password = "secret"
+        type = "tcp"
+        security = "tls"
+        sni = "example.com"
+        allowInsecure = true
+        initializeDefaultValues()
+    }
+
+    private fun build(bean: AbstractBean, settings: DesktopSettings = DesktopSettings()): JsonObject =
+        JsonParser.parseString(
+            DesktopConfigBuilder.build(Profile(bean = bean), settings, emptyList(), null).json
+        ).asJsonObject
+
+    private fun JsonObject.outbounds(): List<JsonObject> =
+        getAsJsonArray("outbounds").map { it.asJsonObject }
+
+    /** The outbound that carries the selected profile. */
+    private fun JsonObject.proxyOutbound(): JsonObject = outbounds().first {
+        val tag = it.get("tag")?.asString ?: ""
+        tag == "proxy" || tag.startsWith("proxy-global-")
+    }
+
+    private fun JsonObject.inbound(protocol: String): JsonObject? =
+        getAsJsonArray("inbounds").map { it.asJsonObject }.firstOrNull {
+            it.get("protocol")?.asString == protocol
+        }
+
+    private fun tlsFragmentOf(config: JsonObject): JsonObject? = config.proxyOutbound()
+        .getAsJsonObject("streamSettings")
+        ?.getAsJsonObject("sockopt")
+        ?.getAsJsonObject("tlsFragmentation")
+
+    // ------------------------------------------------------------------ routing
+
+    @Test
+    fun `remoteDNS and its query strategy reach the dns block`() {
+        val base = build(vmess())
+        assertEquals("tcp://1.1.1.1", base.getAsJsonObject("dns")
+            .getAsJsonArray("servers")[0].asJsonObject.get("address").asString)
+
+        val changed = build(
+            vmess(),
+            DesktopSettings()
+                .withValue(Key.REMOTE_DNS, "tcp://9.9.9.9")
+                .withValue(Key.REMOTE_DNS_QUERY_STRATEGY, "UseIPv4"),
+        )
+        val server = changed.getAsJsonObject("dns").getAsJsonArray("servers")[0].asJsonObject
+        assertEquals("tcp://9.9.9.9", server.get("address").asString)
+        assertEquals("UseIPv4", server.get("queryStrategy").asString)
+        assertNotEquals(base, changed)
+    }
+
+    @Test
+    fun `dns routing and fake dns switches reach the config`() {
+        val withRouting = build(
+            vmess(),
+            DesktopSettings().withValue(Key.ENABLE_DNS_ROUTING, "false"),
+        )
+        assertNotEquals(build(vmess()), withRouting)
+
+        val withFakeDns = build(
+            vmess(),
+            DesktopSettings().withValue(Key.ENABLE_FAKEDNS, "true"),
+        )
+        // Fake DNS adds a fakedns pool to the DNS block.
+        assertTrue(withFakeDns.getAsJsonObject("dns").toString().contains("fakedns"))
+    }
+
+    @Test
+    fun `fragment can be switched on and off`() {
+        val off = build(trojanTls())
+        assertTrue(tlsFragmentOf(off) == null, "fragmentation must be off by default")
+
+        val on = build(trojanTls(), DesktopSettings().withValue(Key.ENABLE_FRAGMENT, "true"))
+        val fragment = tlsFragmentOf(on)
+        assertTrue(fragment != null, "fragmentation must be present when switched on")
+        assertEquals(true, fragment!!.get("tlsRecordFragmentation").asBoolean)
+
+        val segmented = build(
+            trojanTls(),
+            DesktopSettings()
+                .withValue(Key.ENABLE_FRAGMENT, "true")
+                .withValue(Key.FRAGMENT_METHOD, "1"),
+        )
+        assertEquals(true, tlsFragmentOf(segmented)!!.get("tcpSegmentation").asBoolean)
+    }
+
+    @Test
+    fun `sniffing can be switched on and off`() {
+        val on = build(vmess())
+        assertEquals(true, on.inbound("socks")!!.getAsJsonObject("sniffing").get("enabled").asBoolean)
+
+        val off = build(vmess(), DesktopSettings().withValue(Key.TRAFFIC_SNIFFING, "false"))
+        assertFalse(off.inbound("socks")!!.has("sniffing"), "sniffing must be gone when disabled")
+        assertNotEquals(on, off)
+    }
+
+    @Test
+    fun `route mode direct drops the upstream profile`() {
+        val global = build(vmess())
+        assertTrue(global.proxyOutbound().get("protocol").asString == "vmess")
+
+        val direct = build(vmess(), DesktopSettings().withValue(Key.ROUTE_MODE, RouteMode.DIRECT.toString()))
+        assertEquals("freedom", direct.proxyOutbound().get("protocol").asString)
+    }
+
+    @Test
+    fun `socks and http ports reach the inbounds`() {
+        val base = build(vmess())
+        assertEquals(10808, base.inbound("socks")!!.get("port").asInt)
+        assertEquals(10809, base.inbound("http")!!.get("port").asInt)
+
+        val changed = build(
+            vmess(),
+            DesktopSettings()
+                .withValue(Key.SOCKS_PORT, "12345")
+                .withValue(Key.HTTP_PORT, "12346"),
+        )
+        assertEquals(12345, changed.inbound("socks")!!.get("port").asInt)
+        assertEquals(12346, changed.inbound("http")!!.get("port").asInt)
+    }
+
+    @Test
+    fun `inbound switches and credentials reach the inbounds`() {
+        val settings = DesktopSettings()
+            .withValue(Key.REQUIRE_SOCKS, "false")
+            .withValue(Key.REQUIRE_HTTP, "true")
+            .withValue(Key.SOCKS_USERNAME, "user")
+            .withValue(Key.SOCKS_PASSWORD, "pass")
+            .withValue(Key.ALLOW_ACCESS, "true")
+        val config = build(vmess(), settings)
+        assertTrue(config.inbound("socks") == null, "the SOCKS inbound is switched off")
+        val http = config.inbound("http")!!
+        // allowAccess binds the inbounds to all interfaces.
+        assertEquals("0.0.0.0", http.get("listen").asString)
+    }
+
+    @Test
+    fun `mux on the profile changes the outbound`() {
+        val off = build(vmess(mux = false))
+        val on = build(vmess(mux = true))
+        assertNotEquals(off, on)
+        assertTrue(on.proxyOutbound().has("mux"), "mux must appear on the outbound")
+        assertFalse(off.proxyOutbound().has("mux"))
+    }
+
+    // ---------------------------------------------------------------- mapping
+
+    @Test
+    fun `every DataStoreMember binding has a shim mapping`() {
+        val members = SettingsCatalogParser.load().entries
+            .mapNotNull { (it.binding as? DataStoreMember)?.member }
+        assertTrue(members.isNotEmpty())
+        members.forEach { member -> DesktopConfigBuilder.applyToDataStore(member, null) }
+        assertFailsWith<IllegalStateException> {
+            DesktopConfigBuilder.applyToDataStore("no-such-member", null)
+        }
+    }
+
+    @Test
+    fun `desktop preferences survive a store round trip`() {
+        val file = kotlin.io.path.createTempFile("owenclave-settings", ".json").toFile()
+        try {
+            val store = ProfileStore(file)
+            store.load()
+            store.settings = DesktopSettings()
+                .withValue(Key.REMOTE_DNS, "tcp://8.8.8.8")
+                .withValue(Key.ENABLE_FRAGMENT, "true")
+                .withValue(Key.SOCKS_PORT, "23456")
+            store.save()
+
+            val reloaded = ProfileStore(file).apply { load() }
+            assertEquals("tcp://8.8.8.8", reloaded.settings.value(Key.REMOTE_DNS))
+            assertEquals("true", reloaded.settings.value(Key.ENABLE_FRAGMENT))
+            assertEquals(23456, reloaded.settings.socksPort)
+        } finally {
+            file.delete()
+        }
+    }
+}
