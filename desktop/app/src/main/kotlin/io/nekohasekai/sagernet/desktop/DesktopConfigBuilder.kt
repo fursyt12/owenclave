@@ -165,10 +165,9 @@ object DesktopConfigBuilder {
         // proxy outbound into a freedom outbound in postProcess(). This keeps the
         // desktop rule list working for every route mode.
         DataStore.routeMode = RouteMode.RULE
-        // The desktop client has no transparent proxy inbound and no Android
-        // local-DNS socket; the TUN device is served by the SOCKS inbound.
+        // The desktop client has no Android transparent proxy inbound; the TUN
+        // device is served by the SOCKS inbound.
         DataStore.requireTransproxy = false
-        DataStore.requireDnsInbound = false
     }
 
     /**
@@ -241,6 +240,10 @@ object DesktopConfigBuilder {
             "httpPort" -> DataStore.httpPort = value?.toIntOrNull() ?: 9080
             "httpUsername" -> DataStore.httpUsername = value.orEmpty()
             "httpPassword" -> DataStore.httpPassword = value.orEmpty()
+            // The desktop keeps the core's own DNS listener instead of the
+            // Android UDS one (postProcess drops only the UDS inbound).
+            "requireDnsInbound" -> DataStore.requireDnsInbound = value.toBoolean()
+            "localDNSPort" -> DataStore.localDNSPort = value?.toIntOrNull() ?: 6450
 
             // experimental flags are a java.util.Properties document
             "experimentalFlagsProperties" -> {
@@ -324,13 +327,19 @@ object DesktopConfigBuilder {
         val root = runCatching { JsonParser.parseString(config).asJsonObject }.getOrElse { return config }
 
         // 1. Drop the Android-only inbounds: the `ipc-in` UDS Android uses for
-        //    per-app traffic stats, and the `ipc_dns.sock` UDS of the local DNS.
+        //    per-app traffic stats, and the `ipc_dns.sock` UDS of the Android
+        //    local DNS. The port based `dns-in` listener the Android XML exposes
+        //    through `requireDnsInbound` is a real UDP/TCP socket and is kept, so
+        //    the desktop can serve DNS on `127.0.0.1:<portLocalDns>` too.
         val inbounds = root.getAsJsonArray("inbounds") ?: JsonArray()
         val keptInbounds = JsonArray()
         inbounds.forEach { element ->
             val inbound = element.asJsonObject
             val tag = inbound.get("tag")?.asString
-            if (tag == TAG_IPC_IN || tag == TAG_DNS_IN) return@forEach
+            if (tag == TAG_IPC_IN) return@forEach
+            if (tag == TAG_DNS_IN && inbound.get("listen")?.asString.orEmpty().endsWith(".sock")) {
+                return@forEach
+            }
             keptInbounds.add(inbound)
         }
         root.add("inbounds", keptInbounds)

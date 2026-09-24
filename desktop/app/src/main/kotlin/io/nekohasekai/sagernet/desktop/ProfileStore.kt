@@ -61,6 +61,8 @@ class DesktopSettings(
         private val DESKTOP_DEFAULTS = mapOf(
             Key.REQUIRE_HTTP to "true",
             Key.PROFILE_TRAFFIC_STATISTICS to "false",
+            // The desktop profile list has always shown the server address.
+            Key.ALWAYS_SHOW_ADDRESS to "true",
         )
 
         /**
@@ -70,6 +72,7 @@ class DesktopSettings(
          * on whatever a previous build left behind.
          */
         private val ANDROID_DATASTORE_DEFAULTS = mapOf(
+            Key.PERSIST_ACROSS_REBOOT to "false",
             Key.SOCKS_PROXY_CHAIN_ENABLED to "false",
             Key.SOCKS_PROXY_CHAIN_HOST to "",
             Key.SOCKS_PROXY_CHAIN_PORT to "0",
@@ -91,6 +94,7 @@ class DesktopSettings(
             Key.HTTP_USERNAME to "",
             Key.HTTP_PASSWORD to "",
             Key.ALLOW_ACCESS to "false",
+            Key.LOCAL_DNS_PORT to "6450",
             Key.EXPERIMENTAL_FLAGS to "",
         )
 

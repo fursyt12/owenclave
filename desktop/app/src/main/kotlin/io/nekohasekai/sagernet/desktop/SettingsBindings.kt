@@ -48,6 +48,14 @@ data class AndroidOnly(val reason: String) : Binding {
     override val note: String? = null
 }
 
+/**
+ * An Android plain `Preference` action the desktop implements too: the row stays
+ * enabled and activating it runs [action] (see the Settings renderer).
+ */
+data class DesktopAction(val action: String) : Binding {
+    override val note: String? = null
+}
+
 /** A key the desktop does not know about; only possible before the table is updated. */
 data class Unsupported(val key: String) : Binding {
     override val note: String? = null
@@ -69,18 +77,20 @@ object SettingsBindings {
 
     private val TABLE: Map<String, Binding> = linkedMapOf(
         // ------------------------------------------------------- App settings
-        "isAutoConnect" to AndroidOnly("Android only: the desktop client does not start on boot"),
+        // Adapted for desktop: connect the selected profile when the client starts.
+        "isAutoConnect" to DesktopOverride("auto connect the selected profile on desktop startup"),
         "appTheme" to DesktopOverride("the desktop window accent colour"),
-        "nightTheme" to AndroidOnly("Android only: the desktop window always uses the dark theme"),
+        // Adapted for desktop: light / dark / follow the system theme.
+        "nightTheme" to DesktopOverride("the desktop light/dark theme"),
         "appLanguage" to AndroidOnly("Android only: the desktop UI ships in English"),
         "serviceMode" to AndroidOnly("$NO_VPN_SERVICE; use Transparent mode (TUN) in the desktop section"),
         "tunImplementation" to AndroidOnly("$NO_VPN_SERVICE; the desktop TUN device uses the system stack"),
         // NOTE: key `mtu` (VpnService MTU) drives the desktop TUN MTU field.
         "mtu" to DesktopOverride("the desktop TUN device MTU"),
-        "meteredNetwork" to AndroidOnly(NO_VPN_SERVICE),
-        "enablePcap" to AndroidOnly(NO_VPN_SERVICE),
-        "discardICMP" to AndroidOnly(NO_VPN_SERVICE),
-        "appTrafficStatistics" to AndroidOnly(NO_VPN_SERVICE),
+        "meteredNetwork" to AndroidOnly("Android only: the desktop client has no metered-network handling"),
+        "enablePcap" to AndroidOnly("Android only: packet capture is done inside the Android VpnService"),
+        "discardICMP" to AndroidOnly("Android only: the desktop tun2socks TUN stack does not expose ICMP policy"),
+        "appTrafficStatistics" to AndroidOnly("Android only: the desktop client has no per-app traffic statistics"),
         "profileTrafficStatistics" to DataStoreMember("profileTrafficStatistics"),
         "speedInterval" to AndroidOnly(NO_NOTIFICATION),
         "showDirectSpeed" to AndroidOnly(NO_NOTIFICATION),
@@ -88,7 +98,7 @@ object SettingsBindings {
         "providerRootCA" to StoredOnly("Android core root CA provider; the desktop core keeps its system roots"),
 
         // ----------------------------------------------------- Route settings
-        "enableVPNInterfaceIPv6Address" to AndroidOnly(NO_VPN_SERVICE),
+        "enableVPNInterfaceIPv6Address" to AndroidOnly("Android only: the desktop TUN device routes IPv4 only"),
         "proxyApps" to AndroidOnly("$NO_VPN_SERVICE; the desktop client cannot capture per-app traffic"),
         "allowAppsBypassVpn" to AndroidOnly(NO_VPN_SERVICE),
         // NOTE: ConfigBuilder does not read bypassLan; the desktop turns it into
@@ -128,13 +138,15 @@ object SettingsBindings {
         "enableFragmentForDirect" to DataStoreMember("enableFragmentForDirect"),
         // NOTE: key `interruptReusedConnections0` -> shim member `interruptReusedConnections`.
         "interruptReusedConnections0" to DataStoreMember("interruptReusedConnections"),
-        "profileSecurityAdvisory" to AndroidOnly("Android only: the profile editor security advisory"),
+        // Adapted for desktop: shows the insecure-profile warning in the profile list.
+        "profileSecurityAdvisory" to DesktopOverride("the insecure profile warning in the desktop profile list"),
 
         // ----------------------------------------------------------------- HWID
         // NOTE: sendHwid is used by the Android subscription updater only; the
         // desktop keeps it as its own typed setting (used for the same headers).
         "sendHwid" to DesktopOverride("the desktop HWID reporting default"),
-        "resetHwid" to AndroidOnly("Android only: use \"Generate a new identity\" in the desktop section below"),
+        // Adapted for desktop: the row regenerates the desktop device identity.
+        "resetHwid" to DesktopAction("resetHwid"),
 
         // ----------------------------------------------------------- DNS settings
         "remoteDns" to DataStoreMember("remoteDns"),
@@ -164,13 +176,17 @@ object SettingsBindings {
         "httpProxyException" to AndroidOnly("Android only: the desktop client does not set a system HTTP proxy"),
         "requireTransproxy" to AndroidOnly("Android only: transparent proxy needs Android iptables integration"),
         "transproxyPort" to AndroidOnly("Android only: transparent proxy needs Android iptables integration"),
-        "requireDnsInbound" to AndroidOnly("Android only: the local DNS UDS inbound is Android only"),
-        "portLocalDns" to AndroidOnly("Android only: the local DNS UDS inbound is Android only"),
+        // Adapted for desktop: the core listens for DNS on 127.0.0.1:<portLocalDns>
+        // (the Android UDS variant is dropped by DesktopConfigBuilder.postProcess).
+        "requireDnsInbound" to DataStoreMember("requireDnsInbound"),
+        // NOTE: key `portLocalDns` -> shim member `localDNSPort`.
+        "portLocalDns" to DataStoreMember("localDNSPort"),
         "allowAccess" to DataStoreMember("allowAccess"),
 
         // ---------------------------------------------------------- Misc settings
         "showGroupName" to AndroidOnly(NO_NOTIFICATION),
-        "alwaysShowAddress" to AndroidOnly("Android only: the Android profile list display"),
+        // Adapted for desktop: hide or show the address in the desktop profile list.
+        "alwaysShowAddress" to DesktopOverride("show the server address in the desktop profile list"),
         "acquireWakeLock" to AndroidOnly("Android only: keeps the Android VPN service alive"),
         "stunServers" to StoredOnly("used by the Android STUN test; stored for parity"),
         "fabStyle" to AndroidOnly("Android only: the floating action button"),

@@ -3,6 +3,7 @@ package io.nekohasekai.sagernet.desktop
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +37,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,12 +50,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import io.nekohasekai.sagernet.Key
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
@@ -157,9 +162,17 @@ private fun runCli(args: Array<String>): Int? {
 
 @Composable
 fun App(state: AppState) {
+    // The Android `nightTheme` row picks the desktop theme: 1 = dark, 2 = light,
+    // anything else (follow system / auto) follows the OS.
+    val night = state.settings.value(io.nekohasekai.sagernet.Key.NIGHT_THEME).toIntOrNull() ?: 1
+    val dark = when (night) {
+        1 -> true
+        2 -> false
+        else -> isSystemInDarkTheme()
+    }
+    val baseScheme = if (dark) darkColorScheme() else lightColorScheme()
     // The theme colour is the Android `appTheme` preference: the desktop client
     // uses the same row (see SettingsSection) as the Compose accent colour.
-    val baseScheme = darkColorScheme()
     val accent = state.settings.value(io.nekohasekai.sagernet.Key.APP_THEME).toLongOrNull()?.toInt()
     val scheme = if (accent == null) baseScheme else baseScheme.copy(primary = Color(accent))
     MaterialTheme(colorScheme = scheme) {
@@ -253,6 +266,10 @@ private fun Header(state: AppState) {
 
 @Composable
 private fun ProfilesSection(state: AppState) {
+    // The Android `alwaysShowAddress` and `profileSecurityAdvisory` rows drive the
+    // desktop profile list the same way they drive the Android one.
+    val showAddress = state.settings.value(io.nekohasekai.sagernet.Key.ALWAYS_SHOW_ADDRESS) == "true"
+    val showAdvisory = state.settings.value(io.nekohasekai.sagernet.Key.PROFILE_SECURITY_ADVISORY) == "true"
     Row(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.weight(1.1f).fillMaxHeight()) {
             Text("Profiles (${state.profiles.size})", fontWeight = FontWeight.Medium)
@@ -285,7 +302,8 @@ private fun ProfilesSection(state: AppState) {
                                     fontSize = 14.sp,
                                 )
                                 Text(
-                                    "${profile.protocolName} · ${profile.address}",
+                                    if (showAddress) "${profile.protocolName} · ${profile.address}"
+                                    else profile.protocolName,
                                     fontSize = 12.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -294,6 +312,13 @@ private fun ProfilesSection(state: AppState) {
                                         "from ${subscription.displayName}",
                                         fontSize = 11.sp,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (showAdvisory && profile.bean?.isInsecure() == true) {
+                                    Text(
+                                        "⚠ insecure settings (allowInsecure / no TLS verification)",
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.error,
                                     )
                                 }
                                 // Every parsed bean is supported; only a really
@@ -655,6 +680,20 @@ private fun RulesSection(state: AppState) {
 private fun SettingsSection(state: AppState) {
     val catalog = remember { SettingsCatalogParser.load() }
     val settings = state.settings
+    var filter by remember { mutableStateOf("") }
+    val needle = filter.trim().lowercase()
+    val sections = if (needle.isEmpty()) {
+        catalog.sections
+    } else {
+        catalog.sections.mapNotNull { section ->
+            val entries = section.entries.filter { entry ->
+                entry.key.lowercase().contains(needle) ||
+                    entry.title.lowercase().contains(needle) ||
+                    entry.summary.lowercase().contains(needle)
+            }
+            if (entries.isEmpty()) null else section.copy(entries = entries)
+        }
+    }
     Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Text(
             "Generated from the Android app's global settings " +
@@ -663,7 +702,22 @@ private fun SettingsSection(state: AppState) {
             fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        catalog.sections.forEach { section ->
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = filter,
+            onValueChange = { filter = it },
+            label = { Text("Filter settings (key, title, summary)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        if (needle.isNotEmpty()) {
+            Text(
+                "${sections.sumOf { it.entries.size }} of ${catalog.entries.size} settings match",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        sections.forEach { section ->
             Spacer(Modifier.height(16.dp))
             HorizontalDivider()
             Spacer(Modifier.height(10.dp))
@@ -672,13 +726,19 @@ private fun SettingsSection(state: AppState) {
                 SettingsRow(state, entry, settings.value(entry.key))
             }
         }
-        DesktopOnlySection(state)
+        if (needle.isEmpty()) DesktopOnlySection(state)
     }
 }
 
 @Composable
 private fun SettingsRow(state: AppState, entry: CatalogEntry, current: String) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+    val action = (entry.binding as? DesktopAction)?.action
+    val rowModifier = if (action != null && entry.enabled) {
+        Modifier.fillMaxWidth().clickable { runDesktopAction(state, action) }
+    } else {
+        Modifier.fillMaxWidth()
+    }
+    Column(modifier = rowModifier.padding(vertical = 4.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(entry.title.ifBlank { entry.key }, fontWeight = FontWeight.Medium, fontSize = 13.sp)
@@ -709,9 +769,14 @@ private fun SettingsRow(state: AppState, entry: CatalogEntry, current: String) {
                 WidgetKind.MENU -> MenuControl(state, entry, current)
                 WidgetKind.COLOR -> ColorControl(state, entry, current)
                 WidgetKind.PLAIN -> Text(
-                    if (entry.enabled) "›" else "—",
+                    when {
+                        !entry.enabled -> "—"
+                        action != null -> "Run ›"
+                        else -> "›"
+                    },
                     fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (entry.enabled) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 WidgetKind.EDIT, WidgetKind.NUMBER, WidgetKind.LINK -> Unit
             }
@@ -721,23 +786,63 @@ private fun SettingsRow(state: AppState, entry: CatalogEntry, current: String) {
             entry.widget == WidgetKind.LINK
         ) {
             Spacer(Modifier.height(4.dp))
+            val multiline = entry.key in MULTILINE_KEYS
+            val numeric = entry.widget == WidgetKind.NUMBER || entry.key in NUMERIC_KEYS
             OutlinedTextField(
                 value = current,
                 onValueChange = { input ->
-                    val value = if (entry.widget == WidgetKind.NUMBER) {
-                        input.filter { it.isDigit() }.take(6)
-                    } else {
-                        input
-                    }
+                    val value = if (numeric) input.filter { it.isDigit() }.take(6) else input
                     state.setPreference(entry.key, value)
                 },
                 enabled = entry.enabled,
-                singleLine = true,
+                singleLine = !multiline,
+                minLines = if (multiline) 3 else 1,
+                visualTransformation = if (entry.key in PASSWORD_KEYS) {
+                    PasswordVisualTransformation()
+                } else {
+                    VisualTransformation.None
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
         }
     }
 }
+
+/** The Android plain-Preference actions the desktop implements. */
+private fun runDesktopAction(state: AppState, action: String) {
+    when (action) {
+        "resetHwid" -> state.resetHwid()
+    }
+}
+
+/**
+ * Preferences whose value is a list (one entry per line on Android): the desktop
+ * renders them as a multi-line field. These are rendering choices only, the
+ * catalog widget kind still comes from the Android XML.
+ */
+private val MULTILINE_KEYS = setOf(
+    Key.DNS_HOSTS,
+    Key.HTTP_PROXY_EXCEPTION,
+    Key.STUN_SERVERS,
+    Key.EXPERIMENTAL_FLAGS,
+)
+
+/** Secrets: masked in the UI. */
+private val PASSWORD_KEYS = setOf(
+    Key.SOCKS_PASSWORD,
+    Key.HTTP_PASSWORD,
+    Key.SOCKS_PROXY_CHAIN_PASSWORD,
+)
+
+/** Ports and sizes: the Android XML has no `inputType`, but these are integers. */
+private val NUMERIC_KEYS = setOf(
+    Key.SOCKS_PORT,
+    Key.HTTP_PORT,
+    Key.TRANSPROXY_PORT,
+    Key.LOCAL_DNS_PORT,
+    Key.MTU,
+    Key.SOCKS_PROXY_CHAIN_PORT,
+)
 
 @Composable
 private fun MenuControl(state: AppState, entry: CatalogEntry, current: String) {

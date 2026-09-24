@@ -69,6 +69,11 @@ class SettingsConfigEffectTest {
             it.get("protocol")?.asString == protocol
         }
 
+    private fun JsonObject.inboundsByTag(tag: String): List<JsonObject> =
+        getAsJsonArray("inbounds").map { it.asJsonObject }.filter {
+            it.get("tag")?.asString == tag
+        }
+
     private fun tlsFragmentOf(config: JsonObject): JsonObject? = config.proxyOutbound()
         .getAsJsonObject("streamSettings")
         ?.getAsJsonObject("sockopt")
@@ -186,6 +191,35 @@ class SettingsConfigEffectTest {
         assertNotEquals(off, on)
         assertTrue(on.proxyOutbound().has("mux"), "mux must appear on the outbound")
         assertFalse(off.proxyOutbound().has("mux"))
+    }
+
+    @Test
+    fun `the Android local DNS inbound is adapted for desktop`() {
+        // The Android UDS (`ipc_dns.sock`) is always dropped, the port based
+        // `requireDnsInbound` listener is kept and honours `portLocalDns`.
+        val off = build(vmess())
+        assertTrue(off.inboundsByTag("dns-in").isEmpty(), "no DNS inbound by default")
+
+        val on = build(
+            vmess(),
+            DesktopSettings()
+                .withValue(Key.REQUIRE_DNS_INBOUND, "true")
+                .withValue(Key.LOCAL_DNS_PORT, "15353"),
+        )
+        val dns = on.inboundsByTag("dns-in").single()
+        assertEquals("dokodemo-door", dns.get("protocol").asString)
+        assertEquals(15353, dns.get("port").asInt)
+        assertEquals("127.0.0.1", dns.get("listen").asString)
+        assertFalse(dns.get("listen").asString.endsWith(".sock"))
+        // the inboundTag dns-in -> dns-out routing rule survives postProcess
+        val rules = on.getAsJsonObject("routing").getAsJsonArray("rules")
+        assertTrue(
+            rules.any { rule ->
+                rule.asJsonObject.getAsJsonArray("inboundTag")
+                    ?.any { it.asString == "dns-in" } == true
+            },
+            "the dns-in -> dns-out routing rule must be kept",
+        )
     }
 
     // ---------------------------------------------------------------- mapping

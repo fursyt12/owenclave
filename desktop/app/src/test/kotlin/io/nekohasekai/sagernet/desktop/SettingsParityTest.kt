@@ -267,7 +267,7 @@ class SettingsParityTest {
     fun `the catalog is enabled except for the documented Android-only keys`() {
         val catalog = SettingsCatalogParser.reload()
         val disabled = catalog.entries.filter { !it.enabled }
-        assertEquals(28, disabled.size, "Android-only rows: $disabled")
+        assertEquals(21, disabled.size, "Android-only rows: $disabled")
         assertTrue(disabled.all { it.binding is AndroidOnly })
     }
 }

@@ -274,16 +274,37 @@ preference definition. The `copyAndroidPreferences` Gradle task copies
 resource merger) into the application resources, and `SettingsCatalog.kt` parses
 them at runtime, so the desktop shows the same seven categories in the same order,
 with the same titles, summaries, defaults and widget kinds as Android - 86
-preferences today. Entries that make no sense on desktop (the VpnService service
-mode, per-app proxy, notifications, the quick settings tile, Tasker, ...) stay in
-their place but are disabled and state why.
+preferences today. Entries that make no sense on desktop (per-app proxy, packet
+capture, WakeLock, the quick settings tile, Tasker, ...) stay in their place but are
+disabled and state why - 21 of the 86 today.
+
+Mobile-only preferences that *do* have a desktop meaning are adapted instead of
+disabled, through the binding table:
+
+| Android row | Desktop behaviour |
+| --- | --- |
+| Auto connect (`isAutoConnect`) | connect the selected profile when the client starts |
+| Night mode (`nightTheme`) | light / dark / follow the system theme |
+| Theme colour (`appTheme`) | the Compose accent colour (palette) |
+| Reset HWID (`resetHwid`) | an active row that regenerates the device identity |
+| Security tips (`profileSecurityAdvisory`) | insecure-profile warning in the profile list |
+| Always show address (`alwaysShowAddress`) | show or hide the server address in the profile list |
+| Local DNS inbound + port (`requireDnsInbound`, `portLocalDns`) | the core serves DNS on `127.0.0.1:<port>` (only the Android UDS inbound is dropped) |
+| TUN MTU (`mtu`) | the desktop TUN device MTU |
+| Route mode (`routeMode`) | desktop rules / proxy all / direct only |
+| SOCKS proxy chaining, fragment, sniffing, DNS, inbounds, ... | pushed straight into the shared `ConfigBuilder` |
 
 Values are persisted next to the profiles and pushed into the shared `DataStore`
 before every config build through the binding table in `SettingsBindings.kt`, so a
-setting the user changes changes the config the core receives. Two desktop specific
-defaults are listed in `DesktopSettings.DESKTOP_DEFAULTS` (`requireHttp` on,
-`profileTrafficStatistics` off) to keep the older desktop behaviour, everything else
-follows the Android defaults.
+setting the user changes changes the config the core receives. A few desktop
+specific defaults are listed in `DesktopSettings.DESKTOP_DEFAULTS` (`requireHttp`
+on, `profileTrafficStatistics` off, `alwaysShowAddress` on) to keep the older
+desktop behaviour, everything else follows the Android defaults.
+
+The page also has a filter box (match key, title or summary), masks password
+fields, renders list values (hosts, STUN servers, ...) as multi-line fields and
+treats ports/sizes as integers even though the Android XML declares no
+`inputType`.
 
 * `--print-settings` prints the whole catalog (section, key, title, summary, widget,
   default, current value, enabled/disabled and reason) without starting the UI, which

@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import io.nekohasekai.sagernet.Key
 import io.nekohasekai.sagernet.ktx.Logs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -72,6 +73,12 @@ class AppState(private val scope: CoroutineScope) {
         appendLog("data directory: ${DesktopRuntime.dataDir.absolutePath}")
         appendLog("core binary: ${DesktopRuntime.coreBinary()?.absolutePath ?: "not found"}")
         appendLog("naive binary: ${DesktopRuntime.naiveBinary()?.absolutePath ?: "not found"}")
+        // The Android `isAutoConnect` row ("restore the previous connection status")
+        // maps to connecting the selected profile when the desktop client starts.
+        if (store.settings.value(Key.PERSIST_ACROSS_REBOOT) == "true" && selectedProfile != null) {
+            appendLog("auto connect: ${selectedProfile?.displayName}")
+            connect()
+        }
     }
 
     val selectedProfile: Profile?
