@@ -923,13 +923,17 @@ private fun DesktopOnlySection(state: AppState) {
     )
     Spacer(Modifier.height(12.dp))
     Text("Transparent mode (TUN)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Checkbox(
-            checked = settings.tunEnabled,
-            onCheckedChange = { value -> state.updateSettings { it.copy(tunEnabled = value) } },
-        )
-        Text("Route all system traffic through the selected profile", fontSize = 13.sp)
-    }
+    Text(
+        if (settings.tunEnabled) {
+            "On: selected with Service mode = VPN in App settings above. All system traffic is " +
+                "routed through the selected profile when you connect."
+        } else {
+            "Off: selected with Service mode = Proxy only in App settings above. This is the " +
+                "desktop equivalent of the Android VpnService mode."
+        },
+        fontSize = 11.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
     Row(verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             value = settings.tunInterface,
@@ -940,10 +944,10 @@ private fun DesktopOnlySection(state: AppState) {
         )
     }
     Text(
-        "The MTU is the Android \"MTU\" row in App settings above. TUN mode needs administrator " +
-            "rights: on Linux start the client as root (or grant CAP_NET_ADMIN), on macOS with " +
-            "sudo, on Windows as Administrator. It applies when you connect, and the routes are " +
-            "restored when you disconnect.",
+        "The MTU and the IPv6 switch are the Android \"MTU\" and \"IPv6 route\" rows in App " +
+            "settings above. TUN mode needs administrator rights: on Linux start the client as " +
+            "root (or grant CAP_NET_ADMIN), on macOS with sudo, on Windows as Administrator. It " +
+            "applies when you connect, and the routes are restored when you disconnect.",
         fontSize = 11.sp,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )

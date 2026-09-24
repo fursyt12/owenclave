@@ -96,13 +96,37 @@ class DesktopSettings(
             Key.ALLOW_ACCESS to "false",
             Key.LOCAL_DNS_PORT to "6450",
             Key.EXPERIMENTAL_FLAGS to "",
+            // Android-only rows keep a readable CURRENT value in `--print-settings`.
+            Key.METERED_NETWORK to "false",
+            Key.ENABLE_PCAP to "false",
+            Key.APP_TRAFFIC_STATISTICS to "false",
+            Key.SHOW_DIRECT_SPEED to "false",
+            Key.ACQUIRE_WAKE_LOCK to "false",
+            Key.USE_IEC_UNIT to "false",
+            Key.SHOW_GROUP_NAME to "false",
+            Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS to "false",
+            Key.PROXY_APPS to "false",
+            Key.ALLOW_APPS_BYPASS_VPN to "false",
+            Key.HTTP_PROXY_EXCEPTION to "",
+            Key.REQUIRE_TRANSPROXY to "false",
+            Key.TRANSPROXY_PORT to "9200",
+            Key.QUERY_ALL_PACKAGES_ALTERNATIVE_METHOD to "false",
+            Key.APP_LANGUAGE to "",
+            Key.ENABLE_TWPS2 to "false",
+            Key.STUN_SERVERS to "",
+            Key.PPROF_SERVER to "",
         )
 
-        /** The seven preference keys backed by a typed desktop field, or null. */
+        /** The preference keys backed by a typed desktop field, or null. */
         private fun typedValue(settings: DesktopSettings, key: String): String? = when (key) {
             Key.SOCKS_PORT -> settings.socksPort.toString()
             Key.HTTP_PORT -> settings.httpPort.toString()
             Key.LOG_LEVEL -> settings.logLevel.toString()
+            // Android "Service mode" is the desktop transparent-mode switch:
+            // VPN = the desktop TUN device, Proxy only = local SOCKS/HTTP inbounds.
+            // The desktop default is "proxy" because a TUN device needs root; the
+            // Android default is "vpn".
+            Key.SERVICE_MODE -> if (settings.tunEnabled) "vpn" else "proxy"
             Key.ROUTE_MODE -> when (settings.routeMode) {
                 ROUTE_DIRECT -> RouteMode.DIRECT.toString()
                 ROUTE_RULE -> RouteMode.RULE.toString()
@@ -136,6 +160,8 @@ class DesktopSettings(
             Key.SOCKS_PORT -> value.toIntOrNull()?.let { socksPort = it }
             Key.HTTP_PORT -> value.toIntOrNull()?.let { httpPort = it }
             Key.LOG_LEVEL -> value.toIntOrNull()?.let { logLevel = it }
+            // VPN enables the desktop TUN device, Proxy only keeps the local inbounds.
+            Key.SERVICE_MODE -> tunEnabled = value == "vpn"
             Key.ROUTE_MODE -> routeMode = when (value.toIntOrNull()) {
                 RouteMode.DIRECT -> ROUTE_DIRECT
                 RouteMode.RULE -> ROUTE_RULE

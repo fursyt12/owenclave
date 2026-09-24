@@ -36,7 +36,13 @@ class TunSession(private val log: (String) -> Unit) {
     val running: Boolean get() = pump?.isAlive == true
 
     /** Starts the pump and configures the OS. Throws [TunException] with a reason. */
-    fun start(primaryInterface: String, mtu: Int, socksPort: Int, requestedDevice: String = "") {
+    fun start(
+        primaryInterface: String,
+        mtu: Int,
+        socksPort: Int,
+        requestedDevice: String = "",
+        ipv6: Boolean = false,
+    ) {
         val binary = DesktopRuntime.tun2socksBinary()
             ?: throw TunException(
                 "tun2socks is not available for ${DesktopRuntime.platformTag}; " +
@@ -51,9 +57,9 @@ class TunSession(private val log: (String) -> Unit) {
 
         try {
             when (DesktopRuntime.os) {
-                "windows" -> startWindows(binary, primaryInterface, mtu, socksPort)
-                "darwin" -> startMac(binary, primaryInterface, mtu, socksPort)
-                else -> startLinux(binary, primaryInterface, mtu, socksPort, requestedDevice)
+                "windows" -> startWindows(binary, primaryInterface, mtu, socksPort, ipv6)
+                "darwin" -> startMac(binary, primaryInterface, mtu, socksPort, ipv6)
+                else -> startLinux(binary, primaryInterface, mtu, socksPort, requestedDevice, ipv6)
             }
         } catch (e: Exception) {
             stop()
@@ -82,6 +88,7 @@ class TunSession(private val log: (String) -> Unit) {
         mtu: Int,
         socksPort: Int,
         requestedDevice: String,
+        ipv6: Boolean,
     ) {
         val name = requestedDevice.ifBlank { DEFAULT_LINUX_DEVICE }
         device = name
@@ -99,6 +106,8 @@ class TunSession(private val log: (String) -> Unit) {
         run("ip", "route", "add", "128.0.0.0/1", "dev", name, "metric", "1")
         teardown.add { runQuiet("ip", "route", "del", "128.0.0.0/1", "dev", name) }
 
+        if (ipv6) setupIpv6Linux(name)
+
         // tun2socks receives packets from other interfaces; loose rp_filter is the
         // documented requirement.
         runQuiet("sysctl", "-q", "-w", "net.ipv4.conf.all.rp_filter=0")
@@ -108,9 +117,28 @@ class TunSession(private val log: (String) -> Unit) {
         log("transparent mode: $name up, $TUN_ADDRESS, default via the tunnel (physical: $primaryInterface)")
     }
 
+    /**
+     * The Android `enableVPNInterfaceIPv6Address` row: add the tunnel's IPv6
+     * address and the split default routes. Best effort, because a host without
+     * IPv6 still gets a working IPv4 tunnel; the failure is logged.
+     */
+    private fun setupIpv6Linux(name: String) {
+        try {
+            run("ip", "-6", "addr", "add", "$TUN_ADDRESS6/128", "dev", name)
+            teardown.add { runQuiet("ip", "-6", "addr", "del", "$TUN_ADDRESS6/128", "dev", name) }
+            run("ip", "-6", "route", "add", "::/1", "dev", name, "metric", "1")
+            teardown.add { runQuiet("ip", "-6", "route", "del", "::/1", "dev", name) }
+            run("ip", "-6", "route", "add", "8000::/1", "dev", name, "metric", "1")
+            teardown.add { runQuiet("ip", "-6", "route", "del", "8000::/1", "dev", name) }
+            log("transparent mode: IPv6 $TUN_ADDRESS6 routed into $name")
+        } catch (e: Exception) {
+            log("transparent mode: IPv6 setup failed, continuing with IPv4 only: ${e.message}")
+        }
+    }
+
     // ------------------------------------------------------------------- macos
 
-    private fun startMac(binary: File, primaryInterface: String, mtu: Int, socksPort: Int) {
+    private fun startMac(binary: File, primaryInterface: String, mtu: Int, socksPort: Int, ipv6: Boolean) {
         // macOS assigns utun devices, so a free name has to be picked up front and
         // tun2socks has to create the device before it can be configured.
         val name = freeUtun()
@@ -126,12 +154,26 @@ class TunSession(private val log: (String) -> Unit) {
             // deletes exactly the route that was just added
             teardown.add { runQuiet("route", "delete", "-net", route) }
         }
+        if (ipv6) setupIpv6Mac(name)
         log("transparent mode: $name up, all IPv4 traffic routed into the tunnel (physical: $primaryInterface)")
+    }
+
+    private fun setupIpv6Mac(name: String) {
+        try {
+            run("ifconfig", name, "inet6", TUN_ADDRESS6, "prefixlen", "128", "up")
+            run("route", "add", "-inet6", "-net", "::/1", "-interface", name)
+            teardown.add { runQuiet("route", "delete", "-inet6", "-net", "::/1", "-interface", name) }
+            run("route", "add", "-inet6", "-net", "8000::/1", "-interface", name)
+            teardown.add { runQuiet("route", "delete", "-inet6", "-net", "8000::/1", "-interface", name) }
+            log("transparent mode: IPv6 $TUN_ADDRESS6 routed into $name")
+        } catch (e: Exception) {
+            log("transparent mode: IPv6 setup failed, continuing with IPv4 only: ${e.message}")
+        }
     }
 
     // ----------------------------------------------------------------- windows
 
-    private fun startWindows(binary: File, primaryInterface: String, mtu: Int, socksPort: Int) {
+    private fun startWindows(binary: File, primaryInterface: String, mtu: Int, socksPort: Int, ipv6: Boolean) {
         val name = WINDOWS_DEVICE
         device = name
         startPump(binary, name, primaryInterface, socksPort)
@@ -150,7 +192,24 @@ class TunSession(private val log: (String) -> Unit) {
             runQuiet("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/0", name)
         }
         runQuiet("netsh", "interface", "ipv4", "set", "interface", "name=$name", "mtu=$mtu")
+        if (ipv6) setupIpv6Windows(name)
         log("transparent mode: $name up, default route via the tunnel (physical: $primaryInterface)")
+    }
+
+    private fun setupIpv6Windows(name: String) {
+        try {
+            run("netsh", "interface", "ipv6", "add", "address", "name=$name", "address=$TUN_ADDRESS6")
+            teardown.add {
+                runQuiet("netsh", "interface", "ipv6", "delete", "address", "name=$name", "address=$TUN_ADDRESS6")
+            }
+            run("netsh", "interface", "ipv6", "add", "route", "prefix=::/1", "name=$name", "metric=1")
+            teardown.add { runQuiet("netsh", "interface", "ipv6", "delete", "route", "prefix=::/1", "name=$name") }
+            run("netsh", "interface", "ipv6", "add", "route", "prefix=8000::/1", "name=$name", "metric=1")
+            teardown.add { runQuiet("netsh", "interface", "ipv6", "delete", "route", "prefix=8000::/1", "name=$name") }
+            log("transparent mode: IPv6 $TUN_ADDRESS6 routed into $name")
+        } catch (e: Exception) {
+            log("transparent mode: IPv6 setup failed, continuing with IPv4 only: ${e.message}")
+        }
     }
 
     // -------------------------------------------------------------------- pump
@@ -249,6 +308,13 @@ class TunSession(private val log: (String) -> Unit) {
 
         /** Address of the tunnel, matching the ranges used by the tun2socks docs. */
         const val TUN_ADDRESS = "198.18.0.1/15"
+
+        /**
+         * IPv6 address of the tunnel when `enableVPNInterfaceIPv6Address` is on.
+         * It is a unique local address, the same range the Android app uses for
+         * its fake DNS pools, so it never collides with a public prefix.
+         */
+        const val TUN_ADDRESS6 = "fdfe:dcba:9876::1"
 
         /** Windows names the adapter itself. */
         const val WINDOWS_DEVICE = "wintun"

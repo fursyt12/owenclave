@@ -1,5 +1,6 @@
 package io.nekohasekai.sagernet.desktop
 
+import io.nekohasekai.sagernet.Key
 import io.nekohasekai.sagernet.SagerNet
 import io.nekohasekai.sagernet.database.DataStore
 import java.io.File
@@ -65,8 +66,11 @@ class CoreRunner(private val log: (String) -> Unit) {
 
         if (tunInterface != null) {
             val session = TunSession { line -> log(line) }
+            // The Android `enableVPNInterfaceIPv6Address` row adds the IPv6 address
+            // and split default routes to the desktop TUN device.
+            val ipv6 = settings.value(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS) == "true"
             try {
-                session.start(tunInterface, settings.tunMtu, settings.socksPort, settings.tunInterface)
+                session.start(tunInterface, settings.tunMtu, settings.socksPort, settings.tunInterface, ipv6)
             } catch (e: Exception) {
                 stop()
                 throw e

@@ -235,6 +235,37 @@ class SettingsConfigEffectTest {
         }
     }
 
+    // ------------------------------------------------- VpnService -> TUN bridge
+
+    @Test
+    fun `service mode VPN is the desktop TUN device`() {
+        val off = DesktopSettings()
+        assertEquals("proxy", off.value(Key.SERVICE_MODE))
+        assertFalse(off.tunEnabled, "the desktop TUN is off by default")
+
+        val on = off.withValue(Key.SERVICE_MODE, "vpn")
+        assertTrue(on.tunEnabled, "Service mode = VPN must enable the desktop TUN")
+        assertEquals("vpn", on.value(Key.SERVICE_MODE))
+        assertFalse(on.withValue(Key.SERVICE_MODE, "proxy").tunEnabled)
+
+        // The generated config must still be told "proxy": the desktop TUN device is
+        // built by tun2socks, never through the Android VpnService arguments.
+        build(vmess(), on)
+        assertEquals(
+            io.nekohasekai.sagernet.Key.MODE_PROXY,
+            io.nekohasekai.sagernet.database.DataStore.serviceMode,
+        )
+    }
+
+    @Test
+    fun `the IPv6 TUN switch is persisted and read by the runner`() {
+        assertEquals("false", DesktopSettings().value(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS))
+        // CoreRunner turns exactly this predicate into TunSession's ipv6 flag.
+        val on = DesktopSettings().withValue(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS, "true")
+        assertTrue(on.value(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS) == "true")
+        assertTrue(TunSession.TUN_ADDRESS6.startsWith("fd"), "the tunnel uses a ULA address")
+    }
+
     @Test
     fun `desktop preferences survive a store round trip`() {
         val file = kotlin.io.path.createTempFile("owenclave-settings", ".json").toFile()
@@ -245,12 +276,17 @@ class SettingsConfigEffectTest {
                 .withValue(Key.REMOTE_DNS, "tcp://8.8.8.8")
                 .withValue(Key.ENABLE_FRAGMENT, "true")
                 .withValue(Key.SOCKS_PORT, "23456")
+                .withValue(Key.SERVICE_MODE, "vpn")
+                .withValue(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS, "true")
             store.save()
 
             val reloaded = ProfileStore(file).apply { load() }
             assertEquals("tcp://8.8.8.8", reloaded.settings.value(Key.REMOTE_DNS))
             assertEquals("true", reloaded.settings.value(Key.ENABLE_FRAGMENT))
             assertEquals(23456, reloaded.settings.socksPort)
+            assertEquals("vpn", reloaded.settings.value(Key.SERVICE_MODE))
+            assertTrue(reloaded.settings.tunEnabled)
+            assertEquals("true", reloaded.settings.value(Key.ENABLE_VPN_INTERFACE_IPV6_ADDRESS))
         } finally {
             file.delete()
         }

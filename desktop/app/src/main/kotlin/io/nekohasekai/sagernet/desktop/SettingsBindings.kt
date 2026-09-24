@@ -71,7 +71,6 @@ data class Unsupported(val key: String) : Binding {
 object SettingsBindings {
 
     /** Android-only reason strings, kept short and specific. */
-    private const val NO_VPN_SERVICE = "Android only: there is no VpnService on desktop"
     private const val NO_NOTIFICATION = "Android only: the desktop client has no notifications"
     private const val NO_PACKAGE_MANAGER = "Android only: Android package manager feature"
 
@@ -83,8 +82,11 @@ object SettingsBindings {
         // Adapted for desktop: light / dark / follow the system theme.
         "nightTheme" to DesktopOverride("the desktop light/dark theme"),
         "appLanguage" to AndroidOnly("Android only: the desktop UI ships in English"),
-        "serviceMode" to AndroidOnly("$NO_VPN_SERVICE; use Transparent mode (TUN) in the desktop section"),
-        "tunImplementation" to AndroidOnly("$NO_VPN_SERVICE; the desktop TUN device uses the system stack"),
+        // Adapted for desktop: Android "VPN" is the desktop TUN device, "Proxy
+        // only" keeps the local SOCKS/HTTP inbounds (the Android VpnService itself
+        // has no desktop counterpart, the TUN device is created with tun2socks).
+        "serviceMode" to DesktopOverride("desktop transparent mode: VPN = TUN device, Proxy only = local inbounds"),
+        "tunImplementation" to AndroidOnly("Android only: the desktop TUN engine (tun2socks) has a single userspace stack"),
         // NOTE: key `mtu` (VpnService MTU) drives the desktop TUN MTU field.
         "mtu" to DesktopOverride("the desktop TUN device MTU"),
         "meteredNetwork" to AndroidOnly("Android only: the desktop client has no metered-network handling"),
@@ -98,9 +100,11 @@ object SettingsBindings {
         "providerRootCA" to StoredOnly("Android core root CA provider; the desktop core keeps its system roots"),
 
         // ----------------------------------------------------- Route settings
-        "enableVPNInterfaceIPv6Address" to AndroidOnly("Android only: the desktop TUN device routes IPv4 only"),
-        "proxyApps" to AndroidOnly("$NO_VPN_SERVICE; the desktop client cannot capture per-app traffic"),
-        "allowAppsBypassVpn" to AndroidOnly(NO_VPN_SERVICE),
+        // Adapted for desktop: adds the IPv6 address and split default routes to
+        // the desktop TUN device (see TunSession).
+        "enableVPNInterfaceIPv6Address" to DesktopOverride("IPv6 address and routes in the desktop TUN device"),
+        "proxyApps" to AndroidOnly("Android only: the desktop TUN device captures all processes; per-app routing needs Android package UIDs"),
+        "allowAppsBypassVpn" to AndroidOnly("Android only: per-app bypass needs Android package UIDs"),
         // NOTE: ConfigBuilder does not read bypassLan; the desktop turns it into
         // the "Bypass private networks" routing rule (see DesktopConfigBuilder).
         "bypassLan" to DesktopOverride("the desktop \"Bypass private networks\" routing rule"),
@@ -172,10 +176,10 @@ object SettingsBindings {
         "httpPort" to DataStoreMember("httpPort"),
         "httpUsername" to DataStoreMember("httpUsername"),
         "httpPassword" to DataStoreMember("httpPassword"),
-        "appendHttpProxy" to AndroidOnly("Android only: the desktop client does not set a system HTTP proxy"),
-        "httpProxyException" to AndroidOnly("Android only: the desktop client does not set a system HTTP proxy"),
-        "requireTransproxy" to AndroidOnly("Android only: transparent proxy needs Android iptables integration"),
-        "transproxyPort" to AndroidOnly("Android only: transparent proxy needs Android iptables integration"),
+        "appendHttpProxy" to AndroidOnly("Android only: Android sets the VPN HTTP proxy; on desktop set your OS system proxy"),
+        "httpProxyException" to AndroidOnly("Android only: Android sets the VPN HTTP proxy; on desktop set your OS system proxy"),
+        "requireTransproxy" to AndroidOnly("Android only: use Service mode = VPN (the desktop TUN device) instead of iptables tproxy"),
+        "transproxyPort" to AndroidOnly("Android only: use Service mode = VPN (the desktop TUN device) instead of iptables tproxy"),
         // Adapted for desktop: the core listens for DNS on 127.0.0.1:<portLocalDns>
         // (the Android UDS variant is dropped by DesktopConfigBuilder.postProcess).
         "requireDnsInbound" to DataStoreMember("requireDnsInbound"),
