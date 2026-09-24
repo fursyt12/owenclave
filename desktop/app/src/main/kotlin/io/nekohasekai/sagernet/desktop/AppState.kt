@@ -267,9 +267,14 @@ class AppState(private val scope: CoroutineScope) {
                     else "Updated ${subscription.displayName}: ${beans.size} profile(s)"
                 appendLog(status)
             }.onFailure {
-                subscription.lastError = SubscriptionImporter.describe(it)
-                status = "Subscription update failed: ${subscription.lastError}"
-                appendLog("subscription update failed: ${subscription.lastError}")
+                // Never let the failure path depend on the class that just failed to
+                // load: describe() re-triggers SubscriptionImporter.<clinit> and a
+                // missing module would kill the whole UI thread instead of reporting.
+                val reason = runCatching { SubscriptionImporter.describe(it) }
+                    .getOrElse { it.toString() }
+                subscription.lastError = reason
+                status = "Subscription update failed: $reason"
+                appendLog("subscription update failed: $reason")
             }
             persist()
             busy = false

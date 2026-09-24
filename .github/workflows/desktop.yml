@@ -222,6 +222,21 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/wintun.dll'; then
             echo "::warning::bin/wintun.dll is missing: transparent mode on Windows needs it next to the launcher"
           fi
+          # jlink silently leaves java.net.http out; the packaged app then dies with
+          # NoClassDefFoundError the first time a subscription is fetched
+          runtime="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type d -name runtime | head -1)"
+          if [ -n "$runtime" ] && [ -f "$runtime/release" ]; then
+            found="$(grep -o 'java.net.http\|jdk.crypto.ec' "$runtime/release" | sort -u | tr '\n' ' ')"
+            echo "::notice::jlink runtime modules: $found"
+            for module in java.net.http jdk.crypto.ec; do
+              if ! grep -q "$module" "$runtime/release"; then
+                echo "::error::the bundled runtime is missing $module, so subscriptions or TLS would fail at runtime"
+                missing=1
+              fi
+            done
+          else
+            echo "::warning::no bundled runtime release file found to check"
+          fi
           exit "$missing"
       - name: Development self test (core tunnel)
         shell: bash

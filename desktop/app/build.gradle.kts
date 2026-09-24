@@ -213,6 +213,12 @@ compose.desktop {
             vendor = "owenewans"
             copyright = "GPL-3.0"
 
+            // jlink does not add java.net.http on its own. SubscriptionImporter uses
+            // HttpClient to download subscriptions, so without this the packaged
+            // application dies with NoClassDefFoundError as soon as a subscription is
+            // fetched - a path that no self test exercised, which is why it shipped.
+            modules("java.net.http", "jdk.crypto.ec")
+
             linux {
                 packageName = "owenclave"
                 debMaintainer = "owenewans"
