@@ -1,6 +1,7 @@
 package io.nekohasekai.sagernet.desktop
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,21 +13,26 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -48,7 +54,6 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
-import io.nekohasekai.sagernet.LogLevel
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
@@ -637,162 +642,251 @@ private fun RulesSection(state: AppState) {
 
 // ----------------------------------------------------------------- settings
 
+/**
+ * The Settings tab is the Android global settings screen, rendered from the
+ * catalog that [SettingsCatalogParser] builds out of the real Android XML.
+ *
+ * Entries keep the Android order and section titles. Android-only preferences
+ * stay in their original position but disabled with a reason, and the desktop
+ * only settings (TUN mode, subscription fetching, HWID identity, runtime paths)
+ * follow in one clearly separated section.
+ */
 @Composable
 private fun SettingsSection(state: AppState) {
+    val catalog = remember { SettingsCatalogParser.load() }
     val settings = state.settings
     Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        Text("Local inbounds", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            PortField("SOCKS port", settings.socksPort) { value ->
-                state.updateSettings { it.copy(socksPort = value) }
-            }
-            Spacer(Modifier.width(12.dp))
-            PortField("HTTP port", settings.httpPort) { value ->
-                state.updateSettings { it.copy(httpPort = value) }
-            }
-        }
-        Spacer(Modifier.height(6.dp))
         Text(
-            "Point the system proxy or a browser at 127.0.0.1:${settings.socksPort} (SOCKS5) " +
-                "or 127.0.0.1:${settings.httpPort} (HTTP).",
+            "Generated from the Android app's global settings " +
+                "(app/src/main/res/xml/global_preferences.xml), one row per Android preference. " +
+                "Rows marked \"Android only\" stay in place but are disabled.",
             fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(16.dp))
-        Text("Routing", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Mode: ", fontSize = 13.sp)
-            OutlinedButton(
-                onClick = { state.updateSettings { it.copy(routeMode = DesktopSettings.ROUTE_GLOBAL) } },
-                enabled = settings.routeMode != DesktopSettings.ROUTE_GLOBAL,
-            ) { Text("Proxy all") }
-            Spacer(Modifier.width(8.dp))
-            OutlinedButton(
-                onClick = { state.updateSettings { it.copy(routeMode = DesktopSettings.ROUTE_DIRECT) } },
-                enabled = settings.routeMode != DesktopSettings.ROUTE_DIRECT,
-            ) { Text("Direct only") }
-            Spacer(Modifier.width(16.dp))
-            OutlinedButton(
-                onClick = { state.updateSettings { it.copy(bypassPrivateNetworks = !it.bypassPrivateNetworks) } },
-            ) { Text(if (settings.bypassPrivateNetworks) "Bypass LAN: on" else "Bypass LAN: off") }
-        }
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(16.dp))
-        Text("Logging", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Level: ", fontSize = 13.sp)
-            listOf(
-                LogLevel.NONE to "none",
-                LogLevel.ERROR to "error",
-                LogLevel.WARNING to "warn",
-                LogLevel.INFO to "info",
-                LogLevel.DEBUG to "debug",
-            ).forEach { (level, label) ->
-                OutlinedButton(
-                    onClick = { state.updateSettings { it.copy(logLevel = level) } },
-                    enabled = settings.logLevel != level,
-                    modifier = Modifier.padding(end = 4.dp),
-                ) { Text(label, fontSize = 12.sp) }
+        catalog.sections.forEach { section ->
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(10.dp))
+            Text(section.title, fontWeight = FontWeight.Medium, fontSize = 16.sp)
+            section.entries.forEach { entry ->
+                SettingsRow(state, entry, settings.value(entry.key))
             }
         }
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(16.dp))
-        Text("Transparent mode (TUN)", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.tunEnabled,
-                onCheckedChange = { value -> state.updateSettings { it.copy(tunEnabled = value) } },
-            )
-            Text("Route all system traffic through the selected profile", fontSize = 13.sp)
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = settings.tunInterface,
-                onValueChange = { value -> state.updateSettings { it.copy(tunInterface = value.trim()) } },
-                label = { Text("Interface name (Linux, optional)") },
-                singleLine = true,
-                modifier = Modifier.width(280.dp),
-            )
-            Spacer(Modifier.width(12.dp))
-            OutlinedTextField(
-                value = settings.tunMtu.toString(),
-                onValueChange = { value ->
-                    value.filter { it.isDigit() }.take(5).toIntOrNull()
-                        ?.takeIf { it in 576..9000 }
-                        ?.let { mtu -> state.updateSettings { it.copy(tunMtu = mtu) } }
-                },
-                label = { Text("MTU") },
-                singleLine = true,
-                modifier = Modifier.width(120.dp),
-            )
-        }
-        Text(
-            "TUN mode needs administrator rights: on Linux start the client as root (or grant " +
-                "CAP_NET_ADMIN), on macOS with sudo, on Windows as Administrator. It applies when " +
-                "you connect, and the routes are restored when you disconnect.",
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            "tun2socks: " + (DesktopRuntime.tun2socksBinary()?.absolutePath ?: "not found (run ./run desktop tun2socks download)"),
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(16.dp))
-        Text("Device identity (HWID)", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.sendHwid,
-                onCheckedChange = { value -> state.updateSettings { it.copy(sendHwid = value) } },
-            )
-            Text("Send HWID to subscriptions by default", fontSize = 13.sp)
-            Spacer(Modifier.width(16.dp))
-            OutlinedButton(onClick = { state.resetHwid() }) { Text("Generate a new identity") }
-        }
-        Text(
-            "Current: ${settings.currentHwid()}",
-            fontSize = 11.sp,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(16.dp))
-        Text("Subscriptions", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(
-                checked = settings.fetchSubscriptionsThroughProxy,
-                onCheckedChange = { value ->
-                    state.updateSettings { it.copy(fetchSubscriptionsThroughProxy = value) }
-                },
-            )
-            Text("Fetch through the connected profile when one is running", fontSize = 13.sp)
-        }
-        Spacer(Modifier.height(16.dp))
-        HorizontalDivider()
-        Spacer(Modifier.height(16.dp))
-        Text("Runtime", fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        InfoLine("Platform", DesktopRuntime.platformTag)
-        InfoLine("Data directory", DesktopRuntime.dataDir.absolutePath)
-        InfoLine("Core", DesktopRuntime.coreBinary()?.absolutePath ?: "not found")
-        InfoLine("NaiveProxy", DesktopRuntime.naiveBinary()?.absolutePath ?: "not found")
-        InfoLine("olcrtc", DesktopRuntime.olcrtcBinary()?.absolutePath ?: "not found")
-        Spacer(Modifier.height(16.dp))
+        DesktopOnlySection(state)
     }
+}
+
+@Composable
+private fun SettingsRow(state: AppState, entry: CatalogEntry, current: String) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(entry.title.ifBlank { entry.key }, fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                if (entry.summary.isNotEmpty()) {
+                    Text(entry.summary, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (!entry.enabled) {
+                    Text(
+                        entry.disabledReason.orEmpty(),
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                } else if (entry.note != null) {
+                    Text(
+                        "desktop: ${entry.note}",
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(Modifier.width(12.dp))
+            when (entry.widget) {
+                WidgetKind.SWITCH -> Switch(
+                    checked = current.equals("true", ignoreCase = true),
+                    onCheckedChange = { state.setPreference(entry.key, it.toString()) },
+                    enabled = entry.enabled,
+                )
+                WidgetKind.MENU -> MenuControl(state, entry, current)
+                WidgetKind.COLOR -> ColorControl(state, entry, current)
+                WidgetKind.PLAIN -> Text(
+                    if (entry.enabled) "›" else "—",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                WidgetKind.EDIT, WidgetKind.NUMBER, WidgetKind.LINK -> Unit
+            }
+        }
+        if (entry.widget == WidgetKind.EDIT ||
+            entry.widget == WidgetKind.NUMBER ||
+            entry.widget == WidgetKind.LINK
+        ) {
+            Spacer(Modifier.height(4.dp))
+            OutlinedTextField(
+                value = current,
+                onValueChange = { input ->
+                    val value = if (entry.widget == WidgetKind.NUMBER) {
+                        input.filter { it.isDigit() }.take(6)
+                    } else {
+                        input
+                    }
+                    state.setPreference(entry.key, value)
+                },
+                enabled = entry.enabled,
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun MenuControl(state: AppState, entry: CatalogEntry, current: String) {
+    var expanded by remember { mutableStateOf(false) }
+    val selected = entry.options.firstOrNull { it.value == current }
+    Box {
+        OutlinedButton(onClick = { expanded = true }, enabled = entry.enabled) {
+            Text(selected?.title?.ifBlank { "(none)" } ?: current.ifBlank { "(none)" }, fontSize = 12.sp)
+        }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            entry.options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(option.title.ifBlank { "(none)" }, fontSize = 12.sp) },
+                    onClick = {
+                        expanded = false
+                        state.setPreference(entry.key, option.value)
+                    },
+                )
+            }
+        }
+    }
+}
+
+/** Accent colours offered for the Android `appTheme` row. */
+private val ACCENT_PALETTE = listOf(
+    0xFF80CBC4, 0xFF90CAF9, 0xFFA5D6A7, 0xFFFFCC80,
+    0xFFEF9A9A, 0xFFCE93D8, 0xFFF48FB1, 0xFFB0BEC5,
+)
+
+@Composable
+private fun ColorControl(state: AppState, entry: CatalogEntry, current: String) {
+    val selected = current.toLongOrNull()?.toInt()
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        ACCENT_PALETTE.forEach { argb ->
+            val value = argb.toInt()
+            val border = if (value == selected) {
+                Modifier.border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape)
+            } else {
+                Modifier
+            }
+            Box(
+                modifier = Modifier
+                    .padding(2.dp)
+                    .size(22.dp)
+                    .then(border)
+                    .padding(3.dp)
+                    .background(Color(value), CircleShape)
+                    .clickable(enabled = entry.enabled) {
+                        state.setPreference(entry.key, value.toString())
+                    },
+            )
+        }
+    }
+}
+
+/**
+ * Settings the Android global screen has no entry for. They stay in the same tab
+ * so nothing the desktop client offered before this parity work is lost.
+ */
+@Composable
+private fun DesktopOnlySection(state: AppState) {
+    val settings = state.settings
+    Spacer(Modifier.height(16.dp))
+    HorizontalDivider()
+    Spacer(Modifier.height(10.dp))
+    Text("Desktop only", fontWeight = FontWeight.Medium, fontSize = 16.sp)
+    Text(
+        "Settings without an Android global preference; kept so no desktop functionality is lost.",
+        fontSize = 11.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Text(
+        "Point the system proxy or a browser at 127.0.0.1:${settings.socksPort} (SOCKS5) " +
+            "or 127.0.0.1:${settings.httpPort} (HTTP).",
+        fontSize = 11.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(12.dp))
+    Text("Transparent mode (TUN)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(
+            checked = settings.tunEnabled,
+            onCheckedChange = { value -> state.updateSettings { it.copy(tunEnabled = value) } },
+        )
+        Text("Route all system traffic through the selected profile", fontSize = 13.sp)
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedTextField(
+            value = settings.tunInterface,
+            onValueChange = { value -> state.updateSettings { it.copy(tunInterface = value.trim()) } },
+            label = { Text("Interface name (Linux, optional)") },
+            singleLine = true,
+            modifier = Modifier.width(280.dp),
+        )
+    }
+    Text(
+        "The MTU is the Android \"MTU\" row in App settings above. TUN mode needs administrator " +
+            "rights: on Linux start the client as root (or grant CAP_NET_ADMIN), on macOS with " +
+            "sudo, on Windows as Administrator. It applies when you connect, and the routes are " +
+            "restored when you disconnect.",
+        fontSize = 11.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(
+        "tun2socks: " + (
+            DesktopRuntime.tun2socksBinary()?.absolutePath
+                ?: "not found (run ./run desktop tun2socks download)"
+            ),
+        fontSize = 11.sp,
+        fontFamily = FontFamily.Monospace,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(12.dp))
+    Text("Device identity (HWID)", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedButton(onClick = { state.resetHwid() }) { Text("Generate a new identity") }
+        Spacer(Modifier.width(12.dp))
+        Text(
+            "The \"Send HWID\" switch is the Android row above.",
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Text(
+        "Current: ${settings.currentHwid()}",
+        fontSize = 11.sp,
+        fontFamily = FontFamily.Monospace,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(12.dp))
+    Text("Subscriptions", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(
+            checked = settings.fetchSubscriptionsThroughProxy,
+            onCheckedChange = { value ->
+                state.updateSettings { it.copy(fetchSubscriptionsThroughProxy = value) }
+            },
+        )
+        Text("Fetch through the connected profile when one is running", fontSize = 13.sp)
+    }
+    Spacer(Modifier.height(12.dp))
+    Text("Runtime", fontWeight = FontWeight.Medium, fontSize = 13.sp)
+    InfoLine("Platform", DesktopRuntime.platformTag)
+    InfoLine("Data directory", DesktopRuntime.dataDir.absolutePath)
+    InfoLine("Core", DesktopRuntime.coreBinary()?.absolutePath ?: "not found")
+    InfoLine("NaiveProxy", DesktopRuntime.naiveBinary()?.absolutePath ?: "not found")
+    InfoLine("olcrtc", DesktopRuntime.olcrtcBinary()?.absolutePath ?: "not found")
+    Spacer(Modifier.height(16.dp))
 }
 
 @Composable
@@ -803,21 +897,6 @@ private fun InfoLine(label: String, value: String) {
             Text(value, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
         }
     }
-}
-
-@Composable
-private fun PortField(label: String, value: Int, onChange: (Int) -> Unit) {
-    var text by remember(value) { mutableStateOf(value.toString()) }
-    OutlinedTextField(
-        value = text,
-        onValueChange = { input ->
-            text = input.filter { it.isDigit() }.take(5)
-            text.toIntOrNull()?.takeIf { it in 1..65535 }?.let(onChange)
-        },
-        label = { Text(label) },
-        singleLine = true,
-        modifier = Modifier.width(150.dp),
-    )
 }
 
 // ---------------------------------------------------------------------- log
