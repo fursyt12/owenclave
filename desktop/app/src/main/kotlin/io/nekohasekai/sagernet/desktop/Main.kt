@@ -108,6 +108,13 @@ private fun runCli(args: Array<String>): Int? {
     if (args.contains("--selftest-tun-stub")) {
         return SelfTest.runTun(stub = true)
     }
+    if (args.contains("--print-settings")) {
+        // Print the stored values of the settings document so the renderer (and the
+        // parity verifier) can see current vs Android default side by side.
+        val store = ProfileStore().apply { load() }
+        print(SettingsCatalogParser.load().dump { key -> store.settings.value(key) })
+        return 0
+    }
     val printIndex = args.indexOf("--print-config")
     if (printIndex >= 0) {
         val input = args.getOrNull(printIndex + 1)

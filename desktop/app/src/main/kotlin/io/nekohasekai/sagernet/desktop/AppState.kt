@@ -93,6 +93,12 @@ class AppState(private val scope: CoroutineScope) {
         persist()
     }
 
+    /** Stores one Android global preference key (the Settings catalog). */
+    fun setPreference(key: String, value: String) {
+        settings = settings.withValue(key, value)
+        persist()
+    }
+
     fun resetHwid() {
         settings = settings.copy(hwidValue = java.util.UUID.randomUUID().toString().replace("-", ""))
         persist()

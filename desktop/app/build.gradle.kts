@@ -87,6 +87,45 @@ sourceSets["main"].resources.srcDir(runtimeResourcesDir)
 tasks.named("processResources") { dependsOn(prepareDesktopRuntime) }
 
 /*
+ * Settings parity: the desktop Settings tab is generated from the real Android
+ * preference XML instead of a hand written list. The XML plus every value
+ * resource it resolves (`@string/...` and `@array/...`) is copied into the
+ * application resources, so the desktop catalog parser reads exactly the same
+ * definitions the Android app ships.
+ *
+ * The task is deliberately a copy, never a rewrite: `app/` stays untouched and
+ * adding a preference on Android flows into the desktop catalog (see
+ * `AndroidPreferences.kt`) without touching desktop code.
+ *
+ * `preference.xml` exists twice in the Android tree: the base res/values copy and
+ * the res/values-v29 override. Modern Android (API 29+) uses the override, so the
+ * desktop catalog prefers it, exactly like the platform resource merger.
+ */
+val androidPreferencesDir = layout.buildDirectory.dir("android-preferences")
+
+val copyAndroidPreferences = tasks.register<Sync>("copyAndroidPreferences") {
+    description = "Copies the Android global preferences XML and its value resources into the desktop resources"
+    from(rootProject.file("app/src/main/res/xml/global_preferences.xml")) { into("android-preferences") }
+    from(rootProject.file("app/src/main/res/values/strings.xml")) { into("android-preferences") }
+    from(rootProject.file("app/src/main/res/values/arrays.xml")) { into("android-preferences") }
+    from(rootProject.file("app/src/main/res/values/locale.xml")) { into("android-preferences") }
+    from(rootProject.file("app/src/main/res/values/preference.xml")) { into("android-preferences") }
+    // API 29+ override of the same file; kept under a distinct name so both copies
+    // can be staged and the parser can apply the platform precedence.
+    from(rootProject.file("app/src/main/res/values-v29/preference.xml")) {
+        into("android-preferences")
+        rename { "preference-v29.xml" }
+    }
+    into(androidPreferencesDir)
+    doLast {
+        logger.lifecycle("Copied Android preference resources into ${androidPreferencesDir.get().asFile}")
+    }
+}
+
+sourceSets["main"].resources.srcDir(androidPreferencesDir)
+tasks.named("processResources") { dependsOn(copyAndroidPreferences) }
+
+/*
  * Portable build: the jpackage application image zipped as is, so it can be
  * unpacked and started without an installer. A `data` directory next to the
  * launcher makes the app keep profiles and settings inside the unpacked folder

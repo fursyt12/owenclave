@@ -3,7 +3,9 @@ package io.nekohasekai.sagernet.desktop
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
+import io.nekohasekai.sagernet.Key
 import io.nekohasekai.sagernet.LogLevel
+import io.nekohasekai.sagernet.RouteMode
 import java.io.File
 
 /** Desktop client settings. */
@@ -27,11 +29,119 @@ class DesktopSettings(
     /** TUN interface name on Linux, empty for the default. */
     var tunInterface: String = "",
     var tunMtu: Int = 1500,
+    /**
+     * Values of the Android global preferences, keyed by the constants in
+     * [io.nekohasekai.sagernet.Key]. The keys backed by a typed field above
+     * ([Key.SOCKS_PORT], [Key.HTTP_PORT], [Key.LOG_LEVEL], [Key.ROUTE_MODE],
+     * [Key.SEND_HWID], [Key.BYPASS_LAN], [Key.MTU]) are not duplicated here.
+     *
+     * Keys without a stored value fall back to the default declared in the
+     * Android `global_preferences.xml`, so the whole Android screen reaches the
+     * core config even when the user never opened it.
+     */
+    val preferences: MutableMap<String, String> = LinkedHashMap(),
 ) {
 
     companion object {
         const val ROUTE_GLOBAL = "global"
         const val ROUTE_DIRECT = "direct"
+
+        /** The Android `routeMode` "rule" value; the desktop rule list is always evaluated. */
+        const val ROUTE_RULE = "rule"
+
+        /**
+         * Desktop defaults that intentionally differ from the Android XML/defaults
+         * and have to win over them:
+         *  - `requireHttp`: the desktop client always offers the HTTP inbound
+         *    (its Settings text and ports have always assumed that), while the
+         *    Android default is SOCKS only.
+         *  - `profileTrafficStatistics`: the desktop client has no statistics
+         *    store, so the policy counters stay off unless the user turns them on.
+         */
+        private val DESKTOP_DEFAULTS = mapOf(
+            Key.REQUIRE_HTTP to "true",
+            Key.PROFILE_TRAFFIC_STATISTICS to "false",
+        )
+
+        /**
+         * Android `DataStore` defaults for the keys whose `global_preferences.xml`
+         * entry declares no `defaultValue`. Applying them explicitly keeps every
+         * build deterministic (the shim is a mutable singleton) instead of relying
+         * on whatever a previous build left behind.
+         */
+        private val ANDROID_DATASTORE_DEFAULTS = mapOf(
+            Key.SOCKS_PROXY_CHAIN_ENABLED to "false",
+            Key.SOCKS_PROXY_CHAIN_HOST to "",
+            Key.SOCKS_PROXY_CHAIN_PORT to "0",
+            Key.SOCKS_PROXY_CHAIN_USERNAME to "",
+            Key.SOCKS_PROXY_CHAIN_PASSWORD to "",
+            Key.ENABLE_UNLOCK_RU to "false",
+            Key.DIRECT_PROXY_MODE to "false",
+            Key.REALITY_DISABLE_X25519MLKEM768 to "false",
+            Key.HYSTERIA2_OMIT_MAX_DATAGRAM_FRAME_SIZE to "false",
+            Key.GRPC_SERVICE_NAME_COMPAT to "false",
+            Key.ENABLE_FRAGMENT to "false",
+            Key.FRAGMENT_METHOD to "0",
+            Key.ENABLE_FRAGMENT_FOR_DIRECT to "false",
+            Key.EDNS_CLIENT_IP to "",
+            Key.DIRECT_DNS to "tcp://1.1.1.1",
+            Key.BOOTSTRAP_DNS to "",
+            Key.DNS_HOSTS to "",
+            Key.ENABLE_FAKEDNS to "false",
+            Key.HTTP_USERNAME to "",
+            Key.HTTP_PASSWORD to "",
+            Key.ALLOW_ACCESS to "false",
+            Key.EXPERIMENTAL_FLAGS to "",
+        )
+
+        /** The seven preference keys backed by a typed desktop field, or null. */
+        private fun typedValue(settings: DesktopSettings, key: String): String? = when (key) {
+            Key.SOCKS_PORT -> settings.socksPort.toString()
+            Key.HTTP_PORT -> settings.httpPort.toString()
+            Key.LOG_LEVEL -> settings.logLevel.toString()
+            Key.ROUTE_MODE -> when (settings.routeMode) {
+                ROUTE_DIRECT -> RouteMode.DIRECT.toString()
+                ROUTE_RULE -> RouteMode.RULE.toString()
+                else -> RouteMode.GLOBAL.toString()
+            }
+            Key.SEND_HWID -> settings.sendHwid.toString()
+            Key.BYPASS_LAN -> settings.bypassPrivateNetworks.toString()
+            Key.MTU -> settings.tunMtu.toString()
+            else -> null
+        }
+    }
+
+    /**
+     * The value stored for [key], independent of whether a storable value exists:
+     * typed field, then explicit desktop default, then the Android XML default,
+     * then the Android `DataStore` default. Null means "never set anywhere".
+     */
+    fun storedOrDefault(key: String): String? =
+        typedValue(this, key)
+            ?: preferences[key]?.takeIf { it.isNotEmpty() }
+            ?: DESKTOP_DEFAULTS[key]
+            ?: SettingsCatalogParser.load().defaultValueOf(key)
+            ?: ANDROID_DATASTORE_DEFAULTS[key]
+
+    /** Current value of an Android preference key, for display and persistence. */
+    fun value(key: String): String = storedOrDefault(key).orEmpty()
+
+    /** Stores an Android preference key, routing the typed keys to their field. */
+    fun setValue(key: String, value: String) {
+        when (key) {
+            Key.SOCKS_PORT -> value.toIntOrNull()?.let { socksPort = it }
+            Key.HTTP_PORT -> value.toIntOrNull()?.let { httpPort = it }
+            Key.LOG_LEVEL -> value.toIntOrNull()?.let { logLevel = it }
+            Key.ROUTE_MODE -> routeMode = when (value.toIntOrNull()) {
+                RouteMode.DIRECT -> ROUTE_DIRECT
+                RouteMode.RULE -> ROUTE_RULE
+                else -> ROUTE_GLOBAL
+            }
+            Key.SEND_HWID -> sendHwid = value.toBooleanStrictOrNull() ?: false
+            Key.BYPASS_LAN -> bypassPrivateNetworks = value.toBooleanStrictOrNull() ?: true
+            Key.MTU -> value.toIntOrNull()?.let { tunMtu = it }
+            else -> preferences[key] = value
+        }
     }
 
     /** Settings are immutable for the UI: every change copies the whole object. */
@@ -48,10 +158,15 @@ class DesktopSettings(
         tunEnabled: Boolean = this.tunEnabled,
         tunInterface: String = this.tunInterface,
         tunMtu: Int = this.tunMtu,
+        preferences: Map<String, String> = LinkedHashMap(this.preferences),
     ) = DesktopSettings(
         socksPort, httpPort, routeMode, logLevel, selectedProfileId, bypassPrivateNetworks,
         sendHwid, hwidValue, fetchSubscriptionsThroughProxy, tunEnabled, tunInterface, tunMtu,
+        LinkedHashMap(preferences),
     )
+
+    /** Returns a copy with one Android preference key changed. */
+    fun withValue(key: String, value: String): DesktopSettings = copy().apply { setValue(key, value) }
 
 }
 
@@ -93,6 +208,10 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                 }
             }
             root.getAsJsonObject("settings")?.let { json ->
+                val preferences = LinkedHashMap<String, String>()
+                json.getAsJsonObject("preferences")?.entrySet()?.forEach { (key, value) ->
+                    if (value.isJsonPrimitive) preferences[key] = value.asString
+                }
                 settings = DesktopSettings(
                     socksPort = json.get("socksPort")?.asInt ?: 10808,
                     httpPort = json.get("httpPort")?.asInt ?: 10809,
@@ -106,6 +225,7 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                     tunEnabled = json.get("tunEnabled")?.asBoolean ?: false,
                     tunInterface = json.get("tunInterface")?.asString.orEmpty(),
                     tunMtu = json.get("tunMtu")?.asInt ?: 1500,
+                    preferences = preferences,
                 )
             }
         }.onFailure {
@@ -130,6 +250,9 @@ class ProfileStore(private val file: File = File(DesktopRuntime.dataDir, "deskto
                 addProperty("tunInterface", settings.tunInterface)
                 addProperty("tunMtu", settings.tunMtu)
                 settings.selectedProfileId?.let { addProperty("selectedProfileId", it) }
+                add("preferences", JsonObject().apply {
+                    settings.preferences.forEach { (key, value) -> addProperty(key, value) }
+                })
             })
             root.add("subscriptions", JsonArray().apply {
                 subscriptions.forEach { add(it.toJson()) }
