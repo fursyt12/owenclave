@@ -126,6 +126,8 @@ V2Ray/sing-box JSON are imported exactly like on Android.
   SOCKS listener, mirroring the Android plugin architecture; ShadowQUIC runs
   natively inside the desktop core
 - portable archive (unpack and run, self contained `data` directory) plus installers
+- the settings menu is generated from the Android preference XML, so it has the same
+  categories, titles and options as the mobile app
 - transparent TUN mode (all system traffic) built on tun2socks, and a pacman
   repository for Arch Linux
 

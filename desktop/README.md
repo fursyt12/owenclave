@@ -264,6 +264,33 @@ Building the package locally (needs `base-devel`):
 ./run desktop arch package    # writes desktop/arch/dist/*.pkg.tar.zst and owenclave.db
 ```
 
+## Settings
+
+The settings screen is not written twice: it is generated from the Android app's own
+preference definition. `desktop/app/build.gradle.kts` copies
+`app/src/main/res/xml/global_preferences.xml` plus `values/strings.xml` and
+`values/arrays.xml` into the application resources, and `SettingsCatalog.kt` parses
+them at runtime, so the desktop shows the same seven categories in the same order,
+with the same titles, summaries, defaults and widget kinds as Android - 86
+preferences today. Entries that make no sense on desktop (the VpnService service
+mode, per-app proxy, notifications, the quick settings tile, Tasker, ...) stay in
+their place but are disabled and state why.
+
+Values are persisted next to the profiles and pushed into the shared `DataStore`
+before every config build through the binding table in `SettingsBindings.kt`, so a
+setting the user changes changes the config the core receives. Two desktop specific
+defaults are listed in `DesktopSettings.DESKTOP_DEFAULTS` (`requireHttp` on,
+`profileTrafficStatistics` off) to keep the older desktop behaviour, everything else
+follows the Android defaults.
+
+* `--print-settings` prints the whole catalog (section, key, title, summary, widget,
+  default, current value, enabled/disabled and reason) without starting the UI, which
+  makes it easy to diff against the Android XML.
+* `SettingsParityTest` parses `global_preferences.xml` on its own and fails when a
+  preference is added on Android without reaching the desktop;
+  `SettingsConfigEffectTest` proves that changing a setting changes the generated
+  config.
+
 ## Supported protocols
 
 Desktop builds configs with the **shared Android generator**

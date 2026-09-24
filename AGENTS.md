@@ -36,6 +36,12 @@ nix develop
   `./gradlew :desktop:app:run --args="--selftest-protocols"` covers
   vless, vmess, trojan, anytls, shadowsocks, socks and http;
   `--selftest-vless` and `--selftest-protocol <name>` run a single one.
+- Desktop settings parity: the settings screen is generated from the Android
+  `app/src/main/res/xml/global_preferences.xml` (copied into the application
+  resources by a Gradle task) - `./gradlew :desktop:app:run --args="--print-settings"`
+  dumps it, and `SettingsParityTest`/`SettingsConfigEffectTest` keep it in sync,
+  including that a changed setting reaches the generated config.
+
 - `:desktop:app:test` also feeds every generated protocol config (including the
   client-only ones) to `owenclave-core test` when the host core binary is present.
 
