@@ -468,9 +468,10 @@ jobs:
           * settings parity: the catalog is parsed from the Android preference XML (seven
             categories, 86 preferences) and a changed setting has to change the generated
             config, so a binding that stores a value without applying it fails the build
-          * the settings page is exercised end to end: auto connect, night theme, HWID
-            reset, the insecure profile warning and the local DNS inbound with its port
-            all have desktop behaviour instead of being disabled; the Android service
+          * nine Android preferences that used to be disabled now have desktop
+            behaviour: auto connect, night theme, HWID reset, the insecure profile
+            warning, the server address line, the local DNS inbound with its port and
+            the IPv6 address plus split default routes on the TUN device; the Android service
             mode maps onto the desktop transparent mode and the VPN interface IPv6
             switch adds the IPv6 routes to the tunnel device
           * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
