@@ -500,6 +500,12 @@ jobs:
             with the Android titles, summaries and defaults; the entries that cannot work
             without a VpnService (service mode, per-app proxy, notifications, Tasker, ...)
             stay visible but disabled and say why.
+          * Service mode chooses between the transparent TUN device, the operating system
+            proxy (GNOME/KDE settings, macOS `networksetup`, Windows WinINet; the previous
+            values are backed up and restored) and the local SOCKS listener only. Per-app
+            routing is implemented on Linux (cgroup v2 plus nftables marks and policy
+            routing) and is explicitly unavailable on Windows and macOS, where it would
+            need a WFP callout driver or a NetworkExtension.
           * Protocol coverage matches the Android app: the desktop client generates its
             configuration with the very same generator Android uses, so Shadowsocks
             (incl. 2022 and SIP003 plugins), VMess, VLESS, Trojan, Hysteria2, TUIC,
