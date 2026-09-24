@@ -5,7 +5,9 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.LogLevel
 import io.nekohasekai.sagernet.RouteMode
+import io.nekohasekai.sagernet.TLS_FRAGMENTATION_METHOD
 import io.nekohasekai.sagernet.TunImplementation
 import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.database.ProxyEntity
@@ -132,41 +134,130 @@ object DesktopConfigBuilder {
     // ------------------------------------------------------------------ settings
 
     /**
-     * Pushes the desktop settings into the shared `DataStore` shim. Only the
-     * values `ConfigBuilder` actually reads are set; everything else keeps the
-     * desktop defaults documented in the shim.
+     * Pushes the desktop settings into the shared `DataStore` shim, in two
+     * passes so the order is explicit:
+     *
+     * 1. Every Android global preference whose [Binding] is a [DataStoreMember] is
+     *    applied from its persisted value (or its Android default). The member
+     *    names are the shim property names; [applyToDataStore] is the single
+     *    mapping point and throws for an unknown member.
+     * 2. The desktop-only overrides run afterwards. They deliberately replace
+     *    Android behaviour: there is no VpnService on desktop and the desktop
+     *    expresses "direct only" in [postProcess] while always evaluating its own
+     *    rule list.
      */
     private fun applySettings(settings: DesktopSettings) {
-        DataStore.socksPort = settings.socksPort
-        DataStore.socksUsername = ""
-        DataStore.socksPassword = ""
-        DataStore.requireSocks = true
-        DataStore.socksUDP = true
+        // 1. the Android global preferences
+        SettingsCatalogParser.load().entries.forEach { entry ->
+            val binding = entry.binding
+            if (binding is DataStoreMember) {
+                applyToDataStore(binding.member, settings.storedOrDefault(entry.key))
+            }
+        }
 
-        DataStore.httpPort = settings.httpPort
-        DataStore.httpUsername = ""
-        DataStore.httpPassword = ""
-        DataStore.requireHttp = true
-
-        // The desktop client has no transparent proxy inbound and no Android
-        // local-DNS socket; the TUN device is served by the SOCKS inbound.
-        DataStore.requireTransproxy = false
-        DataStore.requireDnsInbound = false
-
-        // Rules are always evaluated; ROUTE_DIRECT is expressed by turning the
-        // proxy outbound into a freedom outbound in postProcess().
-        DataStore.routeMode = RouteMode.RULE
-
-        DataStore.logLevel = settings.logLevel
-        DataStore.profileTrafficStatistics = false
-        DataStore.allowAccess = false
-
+        // 2. desktop-only overrides
         // MODE_PROXY (plus a non-SYSTEM TUN implementation) keeps ConfigBuilder
         // from emitting the Android VpnService plugin-protect arguments
         // (`--android_vpn` / `-V`) for SIP003 plugins.
         DataStore.serviceMode = Key.MODE_PROXY
         DataStore.tunImplementation = TunImplementation.GVISOR
+        // Rules are always evaluated; ROUTE_DIRECT is expressed by turning the
+        // proxy outbound into a freedom outbound in postProcess(). This keeps the
+        // desktop rule list working for every route mode.
+        DataStore.routeMode = RouteMode.RULE
+        // The desktop client has no transparent proxy inbound and no Android
+        // local-DNS socket; the TUN device is served by the SOCKS inbound.
+        DataStore.requireTransproxy = false
+        DataStore.requireDnsInbound = false
     }
+
+    /**
+     * Sets one member of the shared `DataStore` shim from its persisted string
+     * form. [member] is the Android property name, which for most keys equals the
+     * preference key; [SettingsBindings] documents the exceptions. Every
+     * [DataStoreMember] in the binding table needs a branch here, which the
+     * desktop settings test enforces.
+     *
+     * A null [value] resets the member to the Android `DataStore` default, so a
+     * build never inherits a value from a previous build.
+     */
+    internal fun applyToDataStore(member: String, value: String?) {
+        when (member) {
+            // routing
+            "domainStrategy" -> DataStore.domainStrategy = value ?: "AsIs"
+            "trafficSniffing" -> DataStore.trafficSniffing = value.toBoolean()
+            "destinationOverride" -> DataStore.destinationOverride = value.toBoolean()
+            "hijackDns" -> DataStore.hijackDns = value.toBoolean()
+            "outboundDomainStrategy" -> DataStore.outboundDomainStrategy = value ?: "AsIs"
+            "outboundDomainStrategyForDirect" -> DataStore.outboundDomainStrategyForDirect = value ?: "AsIs"
+            "outboundDomainStrategyForServer" -> DataStore.outboundDomainStrategyForServer = value ?: "AsIs"
+            "profileTrafficStatistics" -> DataStore.profileTrafficStatistics = value.toBoolean()
+            "allowAccess" -> DataStore.allowAccess = value.toBoolean()
+
+            // DNS
+            "remoteDns" -> DataStore.remoteDns = value ?: "tcp://1.1.1.1"
+            "remoteDnsQueryStrategy" -> DataStore.remoteDnsQueryStrategy = value ?: "UseIP"
+            "ednsClientIp" -> DataStore.ednsClientIp = value.orEmpty()
+            "useLocalDnsAsDirectDns" -> DataStore.useLocalDnsAsDirectDns = value.toBoolean()
+            "directDns" -> DataStore.directDns = value ?: "tcp://1.1.1.1"
+            "directDnsQueryStrategy" -> DataStore.directDnsQueryStrategy = value ?: "UseIP"
+            "useLocalDnsAsBootstrapDns" -> DataStore.useLocalDnsAsBootstrapDns = value.toBoolean()
+            "bootstrapDns" -> DataStore.bootstrapDns = value.orEmpty()
+            "hosts" -> DataStore.hosts = value.orEmpty()
+            "enableDnsRouting" -> DataStore.enableDnsRouting = value.toBoolean()
+            "enableFakeDns" -> DataStore.enableFakeDns = value.toBoolean()
+
+            // logging / test URL
+            "logLevel" -> DataStore.logLevel = value?.toIntOrNull() ?: LogLevel.INFO
+            "connectionTestURL" ->
+                DataStore.connectionTestURL = value ?: io.nekohasekai.sagernet.CONNECTION_TEST_URL
+
+            // fragmentation and protocol flags
+            "enableFragment" -> DataStore.enableFragment = value.toBoolean()
+            "enableFragmentForDirect" -> DataStore.enableFragmentForDirect = value.toBoolean()
+            "fragmentMethod" -> DataStore.fragmentMethod =
+                value?.toIntOrNull() ?: TLS_FRAGMENTATION_METHOD.TLS_RECORD_FRAGMENTATION
+            "interruptReusedConnections" -> DataStore.interruptReusedConnections = value.toBoolean()
+            "realityDisableX25519Mlkem768" -> DataStore.realityDisableX25519Mlkem768 = value.toBoolean()
+            "hysteria2OmitMaxDatagramFrameSize" -> DataStore.hysteria2OmitMaxDatagramFrameSize = value.toBoolean()
+            "grpcServiceNameCompat" -> DataStore.grpcServiceNameCompat = value.toBoolean()
+            "enableUnlockRu" -> DataStore.enableUnlockRu = value.toBoolean()
+            "directProxyMode" -> DataStore.directProxyMode = value.toBoolean()
+
+            // outbound SOCKS proxy chain
+            "socksProxyChainEnabled" -> DataStore.socksProxyChainEnabled = value.toBoolean()
+            "socksProxyChainHost" -> DataStore.socksProxyChainHost = value.orEmpty()
+            "socksProxyChainPort" -> DataStore.socksProxyChainPort = value?.toIntOrNull() ?: 0
+            "socksProxyChainUsername" -> DataStore.socksProxyChainUsername = value.orEmpty()
+            "socksProxyChainPassword" -> DataStore.socksProxyChainPassword = value.orEmpty()
+
+            // inbounds
+            "requireSocks" -> DataStore.requireSocks = value.toBoolean()
+            "socksPort" -> DataStore.socksPort = value?.toIntOrNull() ?: 2080
+            "socksUsername" -> DataStore.socksUsername = value.orEmpty()
+            "socksPassword" -> DataStore.socksPassword = value.orEmpty()
+            "socksUDP" -> DataStore.socksUDP = value.toBoolean()
+            "requireHttp" -> DataStore.requireHttp = value.toBoolean()
+            "httpPort" -> DataStore.httpPort = value?.toIntOrNull() ?: 9080
+            "httpUsername" -> DataStore.httpUsername = value.orEmpty()
+            "httpPassword" -> DataStore.httpPassword = value.orEmpty()
+
+            // experimental flags are a java.util.Properties document
+            "experimentalFlagsProperties" -> {
+                DataStore.experimentalFlagsProperties.clear()
+                value?.takeIf { it.isNotBlank() }?.let { text ->
+                    DataStore.experimentalFlagsProperties.load(java.io.StringReader(text))
+                }
+            }
+
+            else -> throw IllegalStateException(
+                "no DataStore mapping for shim member \"$member\": update DesktopConfigBuilder.applyToDataStore"
+            )
+        }
+    }
+
+    /** Android booleans are stored as text; anything but "true" is false. */
+    private fun String?.toBoolean(): Boolean = this.equals("true", ignoreCase = true)
 
     // --------------------------------------------------------------------- rules
 
