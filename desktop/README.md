@@ -267,9 +267,11 @@ Building the package locally (needs `base-devel`):
 ## Settings
 
 The settings screen is not written twice: it is generated from the Android app's own
-preference definition. `desktop/app/build.gradle.kts` copies
-`app/src/main/res/xml/global_preferences.xml` plus `values/strings.xml` and
-`values/arrays.xml` into the application resources, and `SettingsCatalog.kt` parses
+preference definition. The `copyAndroidPreferences` Gradle task copies
+`app/src/main/res/xml/global_preferences.xml` plus every value resource it resolves
+(`values/strings.xml`, `values/arrays.xml`, `values/locale.xml` and both copies of
+`values{,-v29}/preference.xml`, with the API 29 override applied like the platform
+resource merger) into the application resources, and `SettingsCatalog.kt` parses
 them at runtime, so the desktop shows the same seven categories in the same order,
 with the same titles, summaries, defaults and widget kinds as Android - 86
 preferences today. Entries that make no sense on desktop (the VpnService service
