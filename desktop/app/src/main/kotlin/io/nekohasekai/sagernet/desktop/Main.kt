@@ -105,6 +105,14 @@ private fun runCli(args: Array<String>): Int? {
     if (args.contains("--selftest-protocols")) {
         return ProtocolSelfTest.run()
     }
+    val subscriptionIndex = args.indexOf("--selftest-subscription")
+    if (subscriptionIndex >= 0) {
+        // An optional URL in the next position turns on the online check; another
+        // flag there means the self contained offline check only.
+        val target = args.getOrNull(subscriptionIndex + 1)
+            ?.takeIf { it.isNotBlank() && !it.startsWith("--") }
+        return SubscriptionSelfTest.run(target)
+    }
     if (args.contains("--selftest-vless")) {
         return ProtocolSelfTest.run("vless")
     }

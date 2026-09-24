@@ -9,6 +9,7 @@ import io.nekohasekai.sagernet.group.parseV2Ray5Outbound
 import io.nekohasekai.sagernet.group.parseV2RayOutbound
 import io.nekohasekai.sagernet.ktx.Logs
 import io.nekohasekai.sagernet.ktx.applyDefaultValues
+import io.nekohasekai.sagernet.ktx.decodeBase64
 import io.nekohasekai.sagernet.ktx.parseShareLinks
 import org.yaml.snakeyaml.Yaml
 import java.io.ByteArrayInputStream
@@ -162,6 +163,15 @@ object SubscriptionImporter {
 
         runCatching { parseYamlDocument(trimmed) }
             .onFailure { Logs.d("yaml parse failed: ${it.message}") }
+            .getOrNull()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { return it }
+
+        // Most subscription servers return the share link list base64 encoded; the
+        // Android `RawUpdater.parseRaw` decodes the whole document the same way. This
+        // runs last so a readable document is never misread as base64.
+        runCatching { parseShareLinks(text.decodeBase64()) }
+            .onFailure { Logs.d("base64 share link parse failed: ${it.message}") }
             .getOrNull()
             ?.takeIf { it.isNotEmpty() }
             ?.let { return it }
