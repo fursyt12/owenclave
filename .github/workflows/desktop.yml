@@ -465,6 +465,9 @@ jobs:
           * tunnel smoke test through the core bundled into the application image
           * protocol self tests that start the shipped core as a local server and tunnel a
             request through VLESS, VMess, Trojan, AnyTLS, Shadowsocks, SOCKS and HTTP
+          * settings parity: the catalog is parsed from the Android preference XML (seven
+            categories, 86 preferences) and a changed setting has to change the generated
+            config, so a binding that stores a value without applying it fails the build
           * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
           * transparent mode test: `tun2socks` creates a TUN device inside a network
             namespace, the client's traffic enters it and reaches a stub SOCKS server,
@@ -486,6 +489,11 @@ jobs:
             `wintun.dll` must sit next to the launcher. When the device cannot be
             created the connection log says which right or file is missing, and the
             application states the reason instead of failing silently.
+          * The settings menu is generated from the Android preference definition as well,
+            so the same seven categories and 86 preferences appear here, in the same order,
+            with the Android titles, summaries and defaults; the entries that cannot work
+            without a VpnService (service mode, per-app proxy, notifications, Tasker, ...)
+            stay visible but disabled and say why.
           * Protocol coverage matches the Android app: the desktop client generates its
             configuration with the very same generator Android uses, so Shadowsocks
             (incl. 2022 and SIP003 plugins), VMess, VLESS, Trojan, Hysteria2, TUIC,
