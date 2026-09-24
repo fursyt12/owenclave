@@ -152,7 +152,12 @@ private fun runCli(args: Array<String>): Int? {
 
 @Composable
 fun App(state: AppState) {
-    MaterialTheme(colorScheme = darkColorScheme()) {
+    // The theme colour is the Android `appTheme` preference: the desktop client
+    // uses the same row (see SettingsSection) as the Compose accent colour.
+    val baseScheme = darkColorScheme()
+    val accent = state.settings.value(io.nekohasekai.sagernet.Key.APP_THEME).toLongOrNull()?.toInt()
+    val scheme = if (accent == null) baseScheme else baseScheme.copy(primary = Color(accent))
+    MaterialTheme(colorScheme = scheme) {
         Surface(modifier = Modifier.fillMaxSize()) {
             Row(modifier = Modifier.fillMaxSize()) {
                 NavRail(state)
