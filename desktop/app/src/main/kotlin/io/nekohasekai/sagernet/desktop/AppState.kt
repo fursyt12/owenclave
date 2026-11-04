@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import io.nekohasekai.sagernet.Key
 import io.nekohasekai.sagernet.ktx.Logs
+import io.nekohasekai.sagernet.ktx.sink
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -62,7 +63,6 @@ class AppState(private val scope: CoroutineScope) {
             append(DesktopRuntime.platformTag)
             if (DesktopRuntime.coreBinary() == null) append(" | core missing")
             if (DesktopRuntime.naiveBinary() == null) append(" | naive plugin missing")
-            if (DesktopRuntime.olcrtcBinary() == null) append(" | olcrtc plugin missing")
         }
 
     private val runner = CoreRunner { line -> appendLog(line) }

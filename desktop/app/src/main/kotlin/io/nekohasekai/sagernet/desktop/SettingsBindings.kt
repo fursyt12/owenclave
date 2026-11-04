@@ -275,6 +275,8 @@ object SettingsBindings {
         "useIECUnit" to AndroidOnly("Android only: statistics formatting in the Android UI"),
         "queryAllPackagesAlternativeMethod" to AndroidOnly(NO_PACKAGE_MANAGER),
         "pprofServer" to StoredOnly("Android debug instance pprof listener; stored for parity"),
+        "goDebug" to StoredOnly("Go runtime GODEBUG setting; applied on startup"),
+        "environmentVariables" to StoredOnly("Go runtime environment variables; applied on startup"),
         "experimentalFlags" to DataStoreMember("experimentalFlagsProperties"),
     )
 

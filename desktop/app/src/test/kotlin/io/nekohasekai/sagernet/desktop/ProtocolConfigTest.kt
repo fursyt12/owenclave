@@ -8,9 +8,9 @@ import io.nekohasekai.sagernet.fmt.http.HttpBean
 import io.nekohasekai.sagernet.fmt.http3.Http3Bean
 import io.nekohasekai.sagernet.fmt.hysteria2.Hysteria2Bean
 import io.nekohasekai.sagernet.fmt.juicity.JuicityBean
+import io.nekohasekai.sagernet.fmt.masque.MASQUEBean
 import io.nekohasekai.sagernet.fmt.mieru.MieruBean
 import io.nekohasekai.sagernet.fmt.naive.NaiveBean
-import io.nekohasekai.sagernet.fmt.olcrtc.OLCRTCBean
 import io.nekohasekai.sagernet.fmt.shadowquic.ShadowQUICBean
 import io.nekohasekai.sagernet.fmt.shadowsocks.ShadowsocksBean
 import io.nekohasekai.sagernet.fmt.snell.SnellBean
@@ -209,6 +209,18 @@ class ProtocolConfigTest {
                 serverPort = 8080
             }
         },
+        ProtocolCase("masque", "masque") {
+            MASQUEBean().apply {
+                serverAddress = "1.2.3.4"
+                serverPort = 443
+                username = "user"
+                password = "secret"
+                http3 = true
+                security = "tls"
+                sni = "example.com"
+                allowInsecure = true
+            }
+        },
         // External engines: the core only sees a local SOCKS outbound while the
         // plugin process is started separately.
         ProtocolCase("naive", "socks", external = true) {
@@ -219,17 +231,6 @@ class ProtocolConfigTest {
                 username = "user"
                 password = "secret"
                 sni = "naive.example.com"
-            }
-        },
-        ProtocolCase("olcrtc", "socks", external = true) {
-            OLCRTCBean().apply {
-                serverAddress = "olcrtc.example.com"
-                serverPort = 443
-                authProvider = "jitsi"
-                roomId = "room"
-                encryptionKey = "key"
-                transport = "datachannel"
-                dnsServer = "1.1.1.1"
             }
         },
     )

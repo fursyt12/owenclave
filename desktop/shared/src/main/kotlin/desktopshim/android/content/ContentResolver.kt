@@ -1,12 +1,28 @@
 package android.content
 
-/**
- * Desktop compile-only stand-in for `android.content.ContentResolver`.
- *
- * It only exists so `app.contentResolver` (see
- * `desktopshim/.../ktx/App.kt`) has the same shape as on Android. No desktop
- * code calls a method on it: the one use in the shared `ConfigBuilder.kt` sits
- * behind the Android-only SSID/location branch, which never reaches
- * `Settings.Secure.getInt` because `Build.VERSION.SDK_INT >= P`.
- */
-class ContentResolver
+import android.net.Uri
+import android.os.Bundle
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+
+class ContentResolver {
+    companion object {
+        const val SCHEME_CONTENT = "content"
+    }
+
+    fun openInputStream(uri: Uri): InputStream? {
+        val file = uri.toFileOrNull() ?: return null
+        return if (file.isFile) FileInputStream(file) else null
+    }
+
+    fun openOutputStream(uri: Uri): OutputStream? {
+        val file = uri.toFileOrNull() ?: return null
+        file.parentFile?.mkdirs()
+        return FileOutputStream(file)
+    }
+
+    fun call(uri: Uri, method: String, arg: String?, extras: Bundle?): Bundle? = null
+}

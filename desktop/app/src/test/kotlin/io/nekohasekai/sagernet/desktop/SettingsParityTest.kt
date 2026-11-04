@@ -40,7 +40,7 @@ class SettingsParityTest {
         "HWID" to 2,
         "DNS settings" to 11,
         "Inbound settings" to 16,
-        "Misc settings" to 9,
+        "Misc settings" to 11,
     )
 
     /** The widget tags the desktop renderer knows; a new tag must be added here and in production. */
@@ -208,7 +208,7 @@ class SettingsParityTest {
 
         assertEquals(7, catalog.sections.size, "the Android screen has exactly 7 categories")
         assertEquals(expected.size, catalog.sections.size)
-        assertEquals(86, catalog.entries.size, "the Android screen has exactly 86 preferences")
+        assertEquals(88, catalog.entries.size, "the Android screen has exactly 88 preferences")
         assertEquals(expectedSectionSizes, catalog.sections.map { it.title to it.entries.size })
 
         expected.forEachIndexed { sectionIndex, expectedSection ->

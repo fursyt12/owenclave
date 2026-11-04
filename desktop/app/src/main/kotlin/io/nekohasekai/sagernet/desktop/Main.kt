@@ -70,18 +70,55 @@ import kotlin.system.exitProcess
 fun main(args: Array<String>) {
     runCli(args)?.let { code -> exitProcess(code) }
 
+    // Ensure the shared Android application singleton & libexclavecore JNI runtime are initialized.
+    io.nekohasekai.sagernet.SagerNet.application
+
+    val systemProxy = SystemProxy()
+    runCatching { systemProxy.restoreStale() }
+    io.nekohasekai.sagernet.bg.ProxyService.onStarted = {
+        val ds = io.nekohasekai.sagernet.database.DataStore
+        if (ds.serviceMode == Key.MODE_VPN || ds.appendHttpProxy) {
+            val bypass = ds.httpProxyException.split("\n", ",").map { it.trim() }.filter { it.isNotEmpty() }
+            runCatching {
+                systemProxy.apply(
+                    host = "127.0.0.1",
+                    httpPort = ds.httpPort,
+                    socksPort = ds.socksPort,
+                    bypass = bypass,
+                )
+            }
+        }
+    }
+    io.nekohasekai.sagernet.bg.ProxyService.onStopped = {
+        runCatching { systemProxy.restore() }
+    }
+    Runtime.getRuntime().addShutdownHook(Thread {
+        runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
+        runCatching { systemProxy.restore() }
+    })
+
+    val useLegacyDesktopUi = args.contains("--legacy-ui") ||
+        !System.getProperty("owenclave.section").isNullOrBlank()
+
     application {
         val scope = rememberCoroutineScope()
-        val state = remember { AppState(scope) }
+        val state = remember { if (useLegacyDesktopUi) AppState(scope) else null }
         Window(
             onCloseRequest = {
-                state.shutdown()
+                state?.shutdown()
+                runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
+                runCatching { systemProxy.restore() }
                 exitApplication()
             },
-            title = "Owenclave ${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME} desktop",
+            title = "Owenclave ${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME}",
             state = rememberWindowState(size = DpSize(1180.dp, 780.dp)),
         ) {
-            App(state)
+            if (state != null) {
+                App(state)
+            } else {
+                val mainActivity = remember { io.nekohasekai.sagernet.ui.compose.ComposeMainActivity() }
+                androidx.activity.DesktopActivityStack.Host(mainActivity)
+            }
         }
     }
 }
@@ -92,8 +129,8 @@ private fun runCli(args: Array<String>): Int? {
         println("Owenclave desktop ${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME} (${DesktopRuntime.platformTag})")
         println("data: ${DesktopRuntime.dataDir}")
         println("core: ${DesktopRuntime.coreBinary()?.absolutePath ?: "not found"}")
+        println("jni: ${DesktopRuntime.jniLibrary()?.absolutePath ?: "not found"}")
         println("naive: ${DesktopRuntime.naiveBinary()?.absolutePath ?: "not found"}")
-        println("olcrtc: ${DesktopRuntime.olcrtcBinary()?.absolutePath ?: "not found"}")
         return 0
     }
     if (args.contains("--selftest")) {
@@ -1075,8 +1112,8 @@ private fun DesktopOnlySection(state: AppState) {
     InfoLine("Platform", DesktopRuntime.platformTag)
     InfoLine("Data directory", DesktopRuntime.dataDir.absolutePath)
     InfoLine("Core", DesktopRuntime.coreBinary()?.absolutePath ?: "not found")
+    InfoLine("libexclavecore JNI", DesktopRuntime.jniLibrary()?.absolutePath ?: "not found")
     InfoLine("NaiveProxy", DesktopRuntime.naiveBinary()?.absolutePath ?: "not found")
-    InfoLine("olcrtc", DesktopRuntime.olcrtcBinary()?.absolutePath ?: "not found")
     Spacer(Modifier.height(16.dp))
 }
 

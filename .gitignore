@@ -9,7 +9,6 @@ local.properties
 /app/libs/
 /app/src/main/assets/owenclave-core/*.dat
 /app/src/main/assets/exclave-core/*.dat
-/app/src/main/jniLibs/*/libolcrtc.so
 /service_account_credentials.json
 jniLibs/
 go.work
@@ -33,3 +32,5 @@ release.keystore
 /desktop/tun2socks/cache/
 /desktop/arch/dist/
 /desktop/arch/build/
+/desktop/*/bin/
+/library/core/.gobind-work-*

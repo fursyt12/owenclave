@@ -44,10 +44,17 @@ object DesktopRuntime {
     fun coreBinary(): File? = cache.getOrPut("core") { locate("owenclave-core") }
 
     @Synchronized
-    fun naiveBinary(): File? = cache.getOrPut("naive") { locate("naive") }
+    fun jniLibrary(): File? = cache.getOrPut("gojni") {
+        val libName = when (os) {
+            "windows" -> "gojni.dll"
+            "darwin" -> "libgojni.dylib"
+            else -> "libgojni.so"
+        }
+        locateFile(libName)
+    }
 
     @Synchronized
-    fun olcrtcBinary(): File? = cache.getOrPut("olcrtc") { locate("olcrtc") }
+    fun naiveBinary(): File? = cache.getOrPut("naive") { locate("naive") }
 
     /** Userspace TUN pump used by the transparent mode. */
     @Synchronized
@@ -55,12 +62,13 @@ object DesktopRuntime {
 
     fun executableName(baseName: String): String = if (isWindows) "$baseName.exe" else baseName
 
-    private fun locate(baseName: String): File? {
-        val fileName = executableName(baseName)
+    private fun locate(baseName: String): File? = locateFile(executableName(baseName), baseName)
+
+    private fun locateFile(fileName: String, propKey: String = fileName): File? {
         val devRoot = System.getProperty("owenclave.devRoot")
         val candidates = ArrayList<File>()
 
-        System.getProperty("owenclave.$baseName")?.takeIf { it.isNotBlank() }?.let { candidates.add(File(it)) }
+        System.getProperty("owenclave.$propKey")?.takeIf { it.isNotBlank() }?.let { candidates.add(File(it)) }
         System.getProperty("compose.application.resources.dir")?.takeIf { it.isNotBlank() }?.let { resources ->
             candidates.add(File(resources, "bin/$fileName"))
             candidates.add(File(resources, fileName))
@@ -68,7 +76,6 @@ object DesktopRuntime {
         if (!devRoot.isNullOrBlank()) {
             candidates.add(File(devRoot, "desktop/core/dist/$platformTag/$fileName"))
             candidates.add(File(devRoot, "desktop/naive/dist/$platformTag/$fileName"))
-            candidates.add(File(devRoot, "desktop/olcrtc/dist/$platformTag/$fileName"))
             candidates.add(File(devRoot, "desktop/tun2socks/dist/$platformTag/$fileName"))
         }
         val workingDir = File(System.getProperty("user.dir", "."))

@@ -247,9 +247,11 @@ object DesktopConfigBuilder {
 
             // experimental flags are a java.util.Properties document
             "experimentalFlagsProperties" -> {
-                DataStore.experimentalFlagsProperties.clear()
-                value?.takeIf { it.isNotBlank() }?.let { text ->
-                    DataStore.experimentalFlagsProperties.load(java.io.StringReader(text))
+                DataStore.experimentalFlags = value.orEmpty()
+                DataStore.experimentalFlagsProperties = java.util.Properties().apply {
+                    value?.takeIf { it.isNotBlank() }?.let { text ->
+                        load(java.io.StringReader(text))
+                    }
                 }
             }
 
@@ -303,10 +305,7 @@ object DesktopConfigBuilder {
                 outbound = -1L,
             )
         }
-        SagerDatabase.rulesDao = object : RuleEntity.Dao() {
-            override fun enabledRules(enabled: Boolean): List<RuleEntity> =
-                entities.filter { it.enabled == enabled }.sortedBy { it.userOrder }
-        }
+        androidx.room.DesktopSagerDatabase.enabledRulesOverride = entities
     }
 
     // -------------------------------------------------------------- post process

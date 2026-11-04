@@ -136,6 +136,8 @@ class DesktopSettings(
             Key.ENABLE_TWPS2 to "false",
             Key.STUN_SERVERS to "",
             Key.PPROF_SERVER to "",
+            Key.GODEBUG to "",
+            Key.ENVIRONMENT_VARIABLES to "",
         )
 
         /** The preference keys backed by a typed desktop field, or null. */

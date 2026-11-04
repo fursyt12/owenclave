@@ -5,15 +5,18 @@ on:
       - dev*
     paths:
       - "desktop/**"
-      - "app/src/main/java/io/nekohasekai/sagernet/fmt/**"
-      - "app/src/main/java/io/nekohasekai/sagernet/group/**"
-      - "app/src/main/java/io/nekohasekai/sagernet/ktx/**"
+      - "app/src/main/**"
+      - "library/**"
+      - "packaging/**"
       - "buildSrc/**"
       - "bin/desktop/**"
       - "gradle/**"
+      - "version.properties"
       - ".github/workflows/desktop.yml"
     tags:
       - "desktop-v*"
+      - "v*"
+      - "0.*"
   workflow_dispatch:
     inputs:
       release:
@@ -57,7 +60,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v7
         with:
-          go-version: 1.27.0
+          go-version: 1.27.3
           cache-dependency-path: "library/core/go.sum"
       - name: Setup Java
         uses: actions/setup-java@v6
@@ -109,27 +112,12 @@ jobs:
       - name: Download tun2socks (transparent mode)
         shell: bash
         run: TARGETS="${{ matrix.target }}" bash bin/desktop/tun2socks/download.sh
-      - name: Build olcrtc plugin
-        shell: bash
-        env:
-          GOPROXY: "https://proxy.golang.org|https://goproxy.io|direct"
-        run: |
-          set -uo pipefail
-          for attempt in 1 2 3; do
-            if TARGETS="${{ matrix.target }}" bash bin/desktop/olcrtc/build.sh; then
-              exit 0
-            fi
-            echo "olcrtc build attempt $attempt failed, retrying in 20s"
-            sleep 20
-          done
-          echo "::error::olcrtc build failed after 3 attempts"
-          exit 1
       - name: Verify binaries
         shell: bash
         run: |
           tag="${{ matrix.target }}"
           tag="${tag//\//-}"
-          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag" "desktop/olcrtc/dist/$tag" "desktop/tun2socks/dist/$tag"
+          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag" "desktop/tun2socks/dist/$tag"
       - name: Gradle cache
         uses: actions/cache@v6
         with:
@@ -211,7 +199,7 @@ jobs:
           fi
           printf '%s\n' "$listing"
           missing=0
-          for name in owenclave-core naive olcrtc tun2socks; do
+          for name in owenclave-core naive tun2socks; do
             fileName="$name"
             if [ "$RUNNER_OS" = "Windows" ]; then fileName="$name.exe"; fi
             if ! printf '%s\n' "$listing" | grep -qx "bin/$fileName"; then
@@ -219,6 +207,16 @@ jobs:
               missing=1
             fi
           done
+          jniName="libgojni.so"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            jniName="gojni.dll"
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            jniName="libgojni.dylib"
+          fi
+          if ! printf '%s\n' "$listing" | grep -qx "bin/$jniName"; then
+            echo "::error::bin/$jniName is missing from the application image"
+            missing=1
+          fi
           if [ "$RUNNER_OS" = "Windows" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/wintun.dll'; then
             echo "::warning::bin/wintun.dll is missing: transparent mode on Windows needs it next to the launcher"
           fi
@@ -357,7 +355,6 @@ jobs:
           path: |
             desktop/core/dist/${{ matrix.tag }}
             desktop/naive/dist/${{ matrix.tag }}
-            desktop/olcrtc/dist/${{ matrix.tag }}
           if-no-files-found: warn
       # Runs last: it takes over the default route, so it must not be able to
       # jeopardise the artifact uploads. Needs administrator rights, which the
@@ -406,7 +403,7 @@ jobs:
   publish:
     name: Publish Release
     if: |
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/desktop-v')) ||
+      (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/desktop-v') || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/0.'))) ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'y' && github.event.inputs.tag != '')
     runs-on: ubuntu-latest
     needs: build
@@ -478,7 +475,7 @@ jobs:
           | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `owenclave___DESKTOP_VERSION___amd64-linux-x64.deb`, `owenclave-__DESKTOP_VERSION__-1.x86_64-linux-x64.rpm` |
 
           The portable archive is self contained: unpack it, start the launcher, and
-          profiles, settings plus the extracted `owenclave-core`, `naive`, `olcrtc` and
+          profiles, settings plus the extracted `owenclave-core`, `libgojni`, `naive` and
           `tun2socks` engines stay inside the unpacked folder as long as a `data`
           directory sits next to the launcher (remove it to fall back to the per user OS
           directory).
@@ -536,13 +533,13 @@ jobs:
             routing is implemented on Linux (cgroup v2 plus nftables marks and policy
             routing) and is explicitly unavailable on Windows and macOS, where it would
             need a WFP callout driver or a NetworkExtension.
-          * Protocol coverage matches the Android app: the desktop client generates its
-            configuration with the very same generator Android uses, so Shadowsocks
-            (incl. 2022 and SIP003 plugins), VMess, VLESS, Trojan, Hysteria2, TUIC,
-            Juicity, AnyTLS, Mieru, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP/3,
-            WireGuard and SOCKS/HTTP are all usable. NaiveProxy and OLCRTC run as
-            external engines, exactly like the plugins on Android. See
-            `desktop/README.md`.
+          * Protocol coverage matches the Android app 1-to-1: the desktop client compiles
+            the Android backend (`fmt`, `database`, `group`, `bg`) and Material 3 Expressive
+            Compose UI directly alongside the native `libexclavecore` Go JNI library, so
+            Shadowsocks (incl. 2022 and SIP003 plugins), VMess, VLESS, Trojan, Hysteria2,
+            TUIC, Juicity, AnyTLS, Mieru, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP/3,
+            MASQUE, WireGuard and SOCKS/HTTP are all usable. NaiveProxy runs as an
+            external engine, exactly like the plugin on Android. See `desktop/README.md`.
           NOTES
           sed -i "s/__VERSION__/${version}/g; s/__DESKTOP_VERSION__/${desktop_version}/g" notes.md
           echo "--- release notes ---"
@@ -553,14 +550,15 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "updating the existing release $TAG"
             gh release upload "$TAG" ./release/* --clobber
-            gh release edit "$TAG" --title "Owenclave desktop ${DESKTOP_VERSION}" --notes-file notes.md --latest=false
+            gh release edit "$TAG" --title "Owenclave desktop ${DESKTOP_VERSION} (${VERSION})" --notes-file notes.md --prerelease --latest=false
             # drop assets that belonged to an earlier layout of this release
             while IFS= read -r asset; do
+              case "$asset" in *.apk) continue ;; esac
               [ -f "release/$asset" ] || gh release delete-asset "$TAG" "$asset" --yes
             done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
           else
-            gh release create --latest=false "$TAG" \
-              --title "Owenclave desktop ${DESKTOP_VERSION}" \
+            gh release create --prerelease --latest=false "$TAG" \
+              --title "Owenclave desktop ${DESKTOP_VERSION} (${VERSION})" \
               --notes-file notes.md \
               ./release/*
           fi

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build the complete desktop client for the current platform:
-# the Go core, the NaiveProxy and olcrtc plugins and the packaged Compose
+# the Go core (JNI + CLI), the NaiveProxy plugin and the packaged Compose
 # application.
 #
 # Usage:
-#   ./run desktop build            # core + naive + olcrtc + portable zip + installer
+#   ./run desktop build            # core + naive + portable zip + installer
 #   ./run desktop build all        # cross platform binaries only (no packaging)
 set -euo pipefail
 
@@ -33,9 +33,7 @@ if [ "${1:-}" = "all" ]; then
     "$PROJECT/bin/desktop/naive/download.sh" all
   TARGETS="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64" \
     "$PROJECT/bin/desktop/tun2socks/download.sh" all
-  TARGETS="linux/amd64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64" \
-    "$PROJECT/bin/desktop/olcrtc/build.sh" all
-  echo "=== cross platform binaries are in desktop/core/dist, desktop/naive/dist, desktop/olcrtc/dist and desktop/tun2socks/dist ==="
+  echo "=== cross platform binaries are in desktop/core/dist, desktop/naive/dist and desktop/tun2socks/dist ==="
   echo "=== packaging only works for the host OS: ./gradlew :desktop:app:packagePortable ==="
   exit 0
 fi
@@ -46,9 +44,8 @@ echo ">>> desktop target: $TARGET"
 TARGETS="$TARGET" "$PROJECT/bin/desktop/core/build.sh"
 TARGETS="$TARGET" "$PROJECT/bin/desktop/naive/download.sh"
 TARGETS="$TARGET" "$PROJECT/bin/desktop/tun2socks/download.sh"
-TARGETS="$TARGET" "$PROJECT/bin/desktop/olcrtc/build.sh"
 
-./gradlew :desktop:app:packagePortable --console=plain
+./gradlew :desktop:app:packagePortable :desktop:app:packageWindowsPortable --console=plain
 
 if [ "$TARGET" = "linux/amd64" ] && command -v makepkg >/dev/null 2>&1; then
   echo ">>> building the Arch package and repository"

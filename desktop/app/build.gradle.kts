@@ -49,29 +49,30 @@ val hostArch = System.getProperty("os.arch").lowercase().let {
 }
 val platformTag = "$hostOs-$hostArch"
 val coreBinaryName = if (hostOs == "windows") "owenclave-core.exe" else "owenclave-core"
+val jniLibraryName = when (hostOs) {
+    "windows" -> "gojni.dll"
+    "darwin" -> "libgojni.dylib"
+    else -> "libgojni.so"
+}
 val naiveBinaryName = if (hostOs == "windows") "naive.exe" else "naive"
-val olcrtcBinaryName = if (hostOs == "windows") "olcrtc.exe" else "olcrtc"
 val tun2socksBinaryName = if (hostOs == "windows") "tun2socks.exe" else "tun2socks"
 
 val coreDistDir = rootProject.layout.projectDirectory.dir("desktop/core/dist/$platformTag")
 val naiveDistDir = rootProject.layout.projectDirectory.dir("desktop/naive/dist/$platformTag")
-val olcrtcDistDir = rootProject.layout.projectDirectory.dir("desktop/olcrtc/dist/$platformTag")
 val tun2socksDistDir = rootProject.layout.projectDirectory.dir("desktop/tun2socks/dist/$platformTag")
 
 /** Directory that gets bundled into the application jar as `/bin/<binary>`. */
 val runtimeResourcesDir = layout.buildDirectory.dir("desktop-resources")
 
 val prepareDesktopRuntime = tasks.register<Sync>("prepareDesktopRuntime") {
-    description = "Stages the core, NaiveProxy, olcrtc and tun2socks binaries for the current platform"
+    description = "Stages the core, libgojni, NaiveProxy and tun2socks binaries for the current platform"
     into(runtimeResourcesDir.map { it.dir("bin") })
     from(coreDistDir) {
         include(coreBinaryName)
+        include(jniLibraryName)
     }
     from(naiveDistDir) {
         include(naiveBinaryName)
-    }
-    from(olcrtcDistDir) {
-        include(olcrtcBinaryName)
     }
     from(tun2socksDistDir) {
         include(tun2socksBinaryName)
@@ -80,6 +81,19 @@ val prepareDesktopRuntime = tasks.register<Sync>("prepareDesktopRuntime") {
     }
     doLast {
         logger.lifecycle("Staged desktop runtime for $platformTag in ${runtimeResourcesDir.get().asFile}")
+    }
+}
+
+val sharedAndroidUiSrc = rootProject.file("app/src/main/java")
+
+sourceSets {
+    named("main") {
+        kotlin {
+            setSrcDirs(listOf("src/main/kotlin", sharedAndroidUiSrc))
+            include("desktopshim/**")
+            include("io/nekohasekai/sagernet/desktop/**")
+            include("io/nekohasekai/sagernet/ui/compose/**")
+        }
     }
 }
 
@@ -172,6 +186,119 @@ val packagePortable = tasks.register<Zip>("packagePortable") {
     }
 }
 
+val windowsSkikoRuntime by configurations.creating
+
+val windowsPortableStaging = layout.buildDirectory.dir("portable-windows-amd64")
+
+val prepareWindowsPortable = tasks.register("prepareWindowsPortable") {
+    description = "Stages a cross-platform Windows (windows-amd64) portable distribution"
+    dependsOn("jar", configurations.named("runtimeClasspath"), windowsSkikoRuntime)
+    val winCoreDir = rootProject.layout.projectDirectory.dir("desktop/core/dist/windows-amd64")
+    val winNaiveDir = rootProject.layout.projectDirectory.dir("desktop/naive/dist/windows-amd64")
+    val winTun2socksDir = rootProject.layout.projectDirectory.dir("desktop/tun2socks/dist/windows-amd64")
+    val runtimeClasspath = configurations.named("runtimeClasspath")
+    val appJarTask = tasks.named<org.gradle.jvm.tasks.Jar>("jar")
+
+    doLast {
+        val stagingRoot = windowsPortableStaging.get().asFile
+        if (stagingRoot.exists()) stagingRoot.deleteRecursively()
+        val appRoot = File(stagingRoot, "Owenclave").apply { mkdirs() }
+        val binDir = File(appRoot, "bin").apply { mkdirs() }
+        val libDir = File(appRoot, "app").apply { mkdirs() }
+        File(appRoot, "data").mkdirs()
+
+        listOf(
+            winCoreDir.asFile.resolve("owenclave-core.exe"),
+            winCoreDir.asFile.resolve("gojni.dll"),
+            winNaiveDir.asFile.resolve("naive.exe"),
+            winTun2socksDir.asFile.resolve("tun2socks.exe"),
+            winTun2socksDir.asFile.resolve("wintun.dll"),
+        ).forEach { src ->
+            if (src.isFile) {
+                src.copyTo(File(binDir, src.name), overwrite = true)
+            }
+        }
+
+        val jarFile = appJarTask.get().archiveFile.get().asFile
+        jarFile.copyTo(File(libDir, jarFile.name), overwrite = true)
+        runtimeClasspath.get().files.forEach { dep ->
+            if (dep.isFile && !dep.name.startsWith("skiko-awt-runtime-linux-")) {
+                dep.copyTo(File(libDir, dep.name), overwrite = true)
+            }
+        }
+        windowsSkikoRuntime.files.forEach { dep ->
+            if (dep.isFile) {
+                dep.copyTo(File(libDir, dep.name), overwrite = true)
+            }
+        }
+
+        val batContent = buildString {
+            append("@echo off\r\n")
+            append("setlocal\r\n")
+            append("set \"APP_HOME=%~dp0\"\r\n")
+            append("if exist \"%APP_HOME%..\\app\" set \"APP_HOME=%~dp0..\\\\\"\r\n")
+            append("cd /d \"%APP_HOME%\"\r\n")
+            append("if exist \"%APP_HOME%runtime\\bin\\java.exe\" (\r\n")
+            append("  \"%APP_HOME%runtime\\bin\\java.exe\" -Dowenclave.gojni.path=\"%APP_HOME%bin\\gojni.dll\" -cp \"%APP_HOME%app\\*\" io.nekohasekai.sagernet.desktop.MainKt %*\r\n")
+            append(") else (\r\n")
+            append("  java -Dowenclave.gojni.path=\"%APP_HOME%bin\\gojni.dll\" -cp \"%APP_HOME%app\\*\" io.nekohasekai.sagernet.desktop.MainKt %*\r\n")
+            append(")\r\n")
+        }
+        File(appRoot, "Owenclave.bat").writeText(batContent)
+        File(binDir, "Owenclave.bat").writeText(batContent)
+
+        val launcherSrc = rootProject.file("packaging/windows/launcher.c")
+        val rootExe = File(appRoot, "Owenclave.exe")
+        val binExe = File(binDir, "Owenclave.exe")
+        if (launcherSrc.isFile) {
+            val gccProc = ProcessBuilder(
+                "x86_64-w64-mingw32-gcc",
+                "-O2",
+                "-municode",
+                "-s",
+                launcherSrc.absolutePath,
+                "-o",
+                rootExe.absolutePath,
+            ).inheritIO().start()
+            check(gccProc.waitFor() == 0) { "Failed to compile Owenclave.exe with x86_64-w64-mingw32-gcc" }
+            rootExe.copyTo(binExe, overwrite = true)
+            rootExe.copyTo(File(appRoot, "owenclave.exe"), overwrite = true)
+            rootExe.copyTo(File(binDir, "owenclave.exe"), overwrite = true)
+        }
+
+        val userHome = System.getProperty("user.home")
+        val winJmodsDir = File(userHome, ".gradle/jdks/windows-x64-21.0.7_6/jdk-21.0.7+6/jmods")
+        val hostJlink = File(userHome, ".gradle/jdks/eclipse_adoptium-21-amd64-linux.2/bin/jlink")
+        val runtimeOut = File(appRoot, "runtime")
+        if (winJmodsDir.isDirectory && hostJlink.isFile) {
+            val jlinkProc = ProcessBuilder(
+                hostJlink.absolutePath,
+                "--module-path",
+                winJmodsDir.absolutePath,
+                "--add-modules",
+                "java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http,jdk.crypto.ec",
+                "--strip-debug",
+                "--no-man-pages",
+                "--no-header-files",
+                "--output",
+                runtimeOut.absolutePath,
+            ).inheritIO().start()
+            check(jlinkProc.waitFor() == 0) { "Failed to create Windows runtime image via jlink" }
+        }
+    }
+}
+
+val packageWindowsPortable = tasks.register<Zip>("packageWindowsPortable") {
+    description = "Builds the cross-packaged Windows (windows-amd64) portable archive"
+    dependsOn(prepareWindowsPortable)
+    from(windowsPortableStaging)
+    archiveFileName.set("owenclave-desktop-$desktopVersion-windows-amd64-portable.zip")
+    destinationDirectory.set(layout.buildDirectory.dir("compose/binaries/main/portable"))
+    doLast {
+        logger.lifecycle("Windows portable archive: ${archiveFile.get().asFile}")
+    }
+}
+
 kotlin {
     jvmToolchain(21)
 }
@@ -180,9 +307,12 @@ dependencies {
     implementation(project(":desktop:shared"))
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)
+    @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
+    implementation(compose.materialIconsExtended)
     implementation(libs.kotlinx.coroutines.swing)
     // Clash YAML subscriptions are imported with the same parser as on Android
     implementation(libs.snakeyaml)
+    windowsSkikoRuntime("org.jetbrains.skiko:skiko-awt-runtime-windows-x64:0.150.1")
 
     testImplementation(kotlin("test"))
 }
