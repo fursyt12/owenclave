@@ -54,13 +54,13 @@ asset_for() {
 
 sha_for() {
   case "$1" in
-    linux/amd64)   echo "0c4f506ce66a7881892fd6932b542c53fc06ac2351987756096c61e753c687bf" ;;
-    linux/arm64)   echo "f28046ae6adb3f9ca13b410f5bba0c4229994860626a83090c2bba0dc85fda13" ;;
-    darwin/amd64)  echo "92e7fe5f3cfca5e0cca49798e5c435a5bd7ef05b543c0aa614a5623ad39a50d4" ;;
-    darwin/arm64)  echo "315f946fa91a65a30b25b69bba88836a117838f58b616c6a58c970c9ff1d9bbf" ;;
-    windows/amd64) echo "d09e35f9fde6206a775a1b930d7d8252053bee1408ee1c910b5681346c68d1a1" ;;
-    windows/arm64) echo "d31098b248c41ea54921101f362ce074d59ceb92f9bd29a9e5fca7284b030e22" ;;
-    windows/386)   echo "8059c126fd98a117d89d9d5b54a07756fe944c3257013866c302b9999c02c530" ;;
+    linux/amd64)   echo "80214dfea1767f6ecf63a3a79dc9f48b203460f51abc609357fff48dd5844c7d" ;;
+    linux/arm64)   echo "8f4d917fa39a5d8cf1c17fc12ffd99ba84c015b62b43461d09cc074ca4114d8d" ;;
+    darwin/amd64)  echo "a3904193bd8d099eb034366c19a019f22573171aeece34e8d0206a92f0b8141d" ;;
+    darwin/arm64)  echo "8b330140e0fed15fae71732cefee16f052325c30352ae3e5638a1e9f9d54d542" ;;
+    windows/amd64) echo "36d14c117ed052c8d04d10a30db083423ad4e423c012c2ef2ca7286ec06afbbc" ;;
+    windows/arm64) echo "68a7378ce6414df325f8d9d38fd8792906d63a601ae0b2f1c76d263bd917af5d" ;;
+    windows/386)   echo "335d31bd2ffdb905f2ad7974390cddeb9a11ccafee76993facd12cf7b210e3f0" ;;
     *) return 1 ;;
   esac
 }

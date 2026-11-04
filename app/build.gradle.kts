@@ -13,16 +13,21 @@ android {
     namespace = "io.nekohasekai.sagernet"
 
     signingConfigs {
-     maybeCreate("release").apply {
-         storeFile = file(System.getenv("KEYSTORE_PATH") ?: "../owenclave.jks")
-         storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "owenclave"
-         keyAlias = System.getenv("KEY_ALIAS") ?: "owenclave"
-         keyPassword = System.getenv("KEY_PASSWORD") ?: "owenclave"
-      }
+        maybeCreate("release").apply {
+            val path = System.getenv("KEYSTORE_PATH")?.takeIf { it.isNotBlank() } ?: "../owenclave.jks"
+            storeFile = file(path)
+            storePassword = System.getenv("KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() } ?: "owenclave"
+            keyAlias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "owenclave"
+            keyPassword = System.getenv("KEY_PASSWORD")?.takeIf { it.isNotBlank() } ?: "owenclave"
+        }
     }
 }
 
-android.buildTypes["release"].signingConfig = android.signingConfigs["release"]
+if (android.signingConfigs["release"].storeFile?.isFile == true) {
+    android.buildTypes["release"].signingConfig = android.signingConfigs["release"]
+} else {
+    android.buildTypes["release"].signingConfig = android.signingConfigs.getByName("debug")
+}
 
 android.testOptions {
     unitTests.isReturnDefaultValues = true

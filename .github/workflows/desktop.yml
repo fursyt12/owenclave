@@ -98,12 +98,15 @@ jobs:
         run: |
           set -uo pipefail
           for attempt in 1 2 3; do
-            if TARGETS="${{ matrix.target }}" bash bin/desktop/core/build.sh; then
+            if TARGETS="${{ matrix.target }}" bash bin/desktop/core/build.sh > /tmp/core-build.log 2>&1; then
+              cat /tmp/core-build.log
               exit 0
             fi
+            cat /tmp/core-build.log
             echo "core build attempt $attempt failed, retrying in 20s"
             sleep 20
           done
+          tail -25 /tmp/core-build.log | while IFS= read -r line; do echo "::error::core-build $line"; done
           echo "::error::core build failed after 3 attempts"
           exit 1
       - name: Download NaiveProxy
