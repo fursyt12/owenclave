@@ -49,7 +49,7 @@ jobs:
             artifact: macos-x64
             tag: darwin-amd64
           - name: macOS arm64
-            os: macos-14
+            os: macos-latest
             target: darwin/arm64
             artifact: macos-arm64
             tag: darwin-arm64

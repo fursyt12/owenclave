@@ -154,12 +154,15 @@ class DesktopPrivilegedTunTest {
                 authTimeoutMs = 5_000L,
             )
 
+            val socksUser = "socks-secret-user-alpha"
+            val socksPass = "socks-secret-pass-bravo"
+
             tun.start(
                 PrivilegedTunParams(
                     owenclavePid = 4242L,
                     socksPort = 2080,
-                    socksUsername = "u1",
-                    socksPassword = "p1",
+                    socksUsername = socksUser,
+                    socksPassword = socksPass,
                     localDnsPort = 6450,
                     mtu = 1500,
                     enableIpv6 = false,
@@ -176,11 +179,11 @@ class DesktopPrivilegedTunTest {
             assertTrue(cmd.containsAll(listOf("--pid", "4242", "--socks-port", "2080", "--dns-port", "6450")))
             assertTrue(cmd.containsAll(listOf("--bypass-ip", "198.51.100.10")))
             // Credentials must NEVER be leaked via command-line arguments:
-            assertFalse(cmd.any { it.contains("u1") || it.contains("p1") })
+            assertFalse(cmd.any { it.contains(socksUser) || it.contains(socksPass) }, "Credentials leaked in cmd: $cmd")
 
             val expectedAuth = "AUTH " +
-                Base64.getEncoder().encodeToString("u1".toByteArray()) + " " +
-                Base64.getEncoder().encodeToString("p1".toByteArray())
+                Base64.getEncoder().encodeToString(socksUser.toByteArray()) + " " +
+                Base64.getEncoder().encodeToString(socksPass.toByteArray())
             assertTrue(fakeProc!!.receivedLines.contains(expectedAuth))
 
             // Simulate profile switch (SagerNet.reloadService): same ports/MTU, new server IP.
@@ -188,8 +191,8 @@ class DesktopPrivilegedTunTest {
                 PrivilegedTunParams(
                     owenclavePid = 4242L,
                     socksPort = 2080,
-                    socksUsername = "u1",
-                    socksPassword = "p1",
+                    socksUsername = socksUser,
+                    socksPassword = socksPass,
                     localDnsPort = 6450,
                     mtu = 1500,
                     enableIpv6 = false,
