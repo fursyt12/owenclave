@@ -21,10 +21,14 @@ sha256sums=('SKIP')
 package() {
   install -dm755 "$pkgdir/opt/owenclave"
   cp -a "$srcdir/opt/owenclave/." "$pkgdir/opt/owenclave/"
+  chmod 755 "$pkgdir/opt/owenclave/bin/owenclave-tun-helper"
+  [ -f "$pkgdir/opt/owenclave/bin/tun2socks" ] && chmod 755 "$pkgdir/opt/owenclave/bin/tun2socks"
 
   install -dm755 "$pkgdir/usr/bin"
   ln -sf /opt/owenclave/bin/Owenclave "$pkgdir/usr/bin/owenclave"
 
   install -Dm644 "$srcdir/owenclave.desktop" "$pkgdir/usr/share/applications/owenclave.desktop"
   install -Dm644 "$srcdir/owenclave.png" "$pkgdir/usr/share/pixmaps/owenclave.png"
+  install -Dm644 "$srcdir/org.owenewans.owenclave.policy" \
+    "$pkgdir/usr/share/polkit-1/actions/org.owenewans.owenclave.policy"
 }

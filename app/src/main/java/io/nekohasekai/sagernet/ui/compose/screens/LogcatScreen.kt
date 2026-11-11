@@ -43,12 +43,17 @@ fun LogcatScreen(
 
     LaunchedEffect(refreshKey) {
         logText = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val androidLogcat = try {
-                val process = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "500"))
-                val out = process.inputStream.bufferedReader().readText()
-                val exit = process.waitFor()
-                if (exit == 0) out else null
-            } catch (_: Exception) {
+            val systemLogcatBin = java.io.File("/system/bin/logcat")
+            val androidLogcat = if (systemLogcatBin.canExecute()) {
+                try {
+                    val process = Runtime.getRuntime().exec(arrayOf(systemLogcatBin.path, "-d", "-t", "500"))
+                    val out = process.inputStream.bufferedReader().readText()
+                    val exit = process.waitFor()
+                    if (exit == 0) out else null
+                } catch (_: Exception) {
+                    null
+                }
+            } else {
                 null
             }
             if (androidLogcat != null) {
@@ -88,9 +93,12 @@ fun LogcatScreen(
                         Icon(Icons.Filled.Send, contentDescription = "Share")
                     }
                     IconButton(onClick = {
-                        try {
-                            Runtime.getRuntime().exec(arrayOf("logcat", "-c"))
-                        } catch (_: Exception) {}
+                        val systemLogcatBin = java.io.File("/system/bin/logcat")
+                        if (systemLogcatBin.canExecute()) {
+                            try {
+                                Runtime.getRuntime().exec(arrayOf(systemLogcatBin.path, "-c"))
+                            } catch (_: Exception) {}
+                        }
                         runCatching {
                             val logFile = java.io.File(context.filesDir, "logcat.log")
                             if (logFile.isFile) logFile.writeText("")

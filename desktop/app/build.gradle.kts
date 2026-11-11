@@ -79,6 +79,9 @@ val prepareDesktopRuntime = tasks.register<Sync>("prepareDesktopRuntime") {
         // only present on Windows, and only when wintun.net was reachable
         include("wintun.dll")
     }
+    if (hostOs == "linux") {
+        from(rootProject.file("packaging/linux/owenclave-tun-helper"))
+    }
     doLast {
         logger.lifecycle("Staged desktop runtime for $platformTag in ${runtimeResourcesDir.get().asFile}")
     }
@@ -484,6 +487,25 @@ tasks.configureEach {
     }
     if (name.startsWith("package") || name.startsWith("createDistributable")) {
         dependsOn(prepareDesktopRuntime)
+    }
+    if (hostOs == "linux" && name == "createDistributable") {
+        val helperScript = rootProject.file("packaging/linux/owenclave-tun-helper")
+        val tun2socksBin = tun2socksDistDir.asFile.resolve(tun2socksBinaryName)
+        doLast {
+            val binDir = appImageDir.get().asFile.resolve("Owenclave/bin")
+            if (binDir.isDirectory) {
+                if (helperScript.isFile) {
+                    val dst = File(binDir, "owenclave-tun-helper")
+                    helperScript.copyTo(dst, overwrite = true)
+                    dst.setExecutable(true, false)
+                }
+                if (tun2socksBin.isFile) {
+                    val dst = File(binDir, tun2socksBin.name)
+                    tun2socksBin.copyTo(dst, overwrite = true)
+                    dst.setExecutable(true, false)
+                }
+            }
+        }
     }
 }
 

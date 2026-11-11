@@ -332,6 +332,9 @@ class ComposeMainActivity : ComponentActivity(), SagerConnection.Callback {
     override fun stateChanged(state: BaseService.State, profileName: String?, msg: String?) {
         serviceState.value = state
         serviceMessage.value = msg
+        if (!msg.isNullOrBlank()) {
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun trafficUpdated(profileId: Long, stats: TrafficStats, isCurrent: Boolean) {

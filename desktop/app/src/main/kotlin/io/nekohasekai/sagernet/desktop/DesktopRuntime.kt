@@ -60,6 +60,21 @@ object DesktopRuntime {
     @Synchronized
     fun tun2socksBinary(): File? = cache.getOrPut("tun2socks") { locate("tun2socks") }
 
+    /** Privileged Linux TUN & policy-routing helper invoked via Polkit (`pkexec`). */
+    @Synchronized
+    fun tunHelperScript(): File? = cache.getOrPut("tunHelper") {
+        val installed = File("/opt/owenclave/bin/owenclave-tun-helper")
+        if (installed.isFile && installed.canExecute()) return@getOrPut installed
+        System.getProperty("owenclave.devRoot")?.takeIf { it.isNotBlank() }?.let { devRoot ->
+            val devScript = File(devRoot, "packaging/linux/owenclave-tun-helper")
+            if (devScript.isFile) {
+                devScript.setExecutable(true, false)
+                return@getOrPut devScript
+            }
+        }
+        extractBundled("owenclave-tun-helper")
+    }
+
     /**
      * Directory containing `geoip.dat` and `geosite.dat` for `V2RAY_LOCATION_ASSET`.
      * Extracts the bundled Android assets into `dataDir/runtime` when running from
@@ -122,6 +137,9 @@ object DesktopRuntime {
             candidates.add(File(devRoot, "desktop/core/dist/$platformTag/$fileName"))
             candidates.add(File(devRoot, "desktop/naive/dist/$platformTag/$fileName"))
             candidates.add(File(devRoot, "desktop/tun2socks/dist/$platformTag/$fileName"))
+        }
+        if (!isWindows) {
+            candidates.add(File("/opt/owenclave/bin/$fileName"))
         }
         val workingDir = File(System.getProperty("user.dir", "."))
         candidates.add(File(workingDir, "bin/$fileName"))

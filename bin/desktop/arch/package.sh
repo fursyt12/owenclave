@@ -44,8 +44,18 @@ if [ ! -x "$WORK/opt/owenclave/bin/Owenclave" ]; then
   exit 1
 fi
 
-# 2. desktop entry and icon, taken from the image when possible
+install -m755 "$PROJECT/packaging/linux/owenclave-tun-helper" "$WORK/opt/owenclave/bin/owenclave-tun-helper"
+case "$PKGARCH" in
+  aarch64) TUN2SOCKS_ARCH="linux-arm64" ;;
+  *) TUN2SOCKS_ARCH="linux-amd64" ;;
+esac
+if [ -f "$PROJECT/desktop/tun2socks/dist/$TUN2SOCKS_ARCH/tun2socks" ]; then
+  install -m755 "$PROJECT/desktop/tun2socks/dist/$TUN2SOCKS_ARCH/tun2socks" "$WORK/opt/owenclave/bin/tun2socks"
+fi
+
+# 2. desktop entry, polkit policy and icon, taken from the image when possible
 cp "$PROJECT/packaging/arch/owenclave.desktop" "$WORK/owenclave.desktop"
+cp "$PROJECT/packaging/arch/org.owenewans.owenclave.policy" "$WORK/org.owenewans.owenclave.policy"
 if [ -f "$APP_IMAGE/lib/Owenclave.png" ]; then
   cp "$APP_IMAGE/lib/Owenclave.png" "$WORK/owenclave.png"
 elif [ -f "$PROJECT/app/src/main/ic_launcher-playstore.png" ]; then
@@ -56,7 +66,8 @@ else
 fi
 
 # 3. source tarball expected by the PKGBUILD
-tar -czf "$WORK/owenclave-desktop-$PKGVER.tar.gz" -C "$WORK" opt owenclave.desktop owenclave.png --owner=0 --group=0
+tar -czf "$WORK/owenclave-desktop-$PKGVER.tar.gz" -C "$WORK" \
+  opt owenclave.desktop owenclave.png org.owenewans.owenclave.policy --owner=0 --group=0
 
 sed -e "s/@PKGVER@/$PKGVER/g" \
     -e "s/@PKGDESC@/Owenclave desktop proxy client $PKGVER/" \

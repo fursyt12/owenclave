@@ -111,10 +111,29 @@ fun main(args: Array<String>) {
     io.nekohasekai.sagernet.SagerNet.application
 
     val systemProxy = SystemProxy()
+    val privilegedTun = DesktopPrivilegedTun()
     runCatching { systemProxy.restoreStale() }
-    io.nekohasekai.sagernet.bg.ProxyService.onStarted = {
+    io.nekohasekai.sagernet.bg.ProxyService.onStarted = { service ->
         val ds = io.nekohasekai.sagernet.database.DataStore
-        if (ds.serviceMode == Key.MODE_VPN || ds.appendHttpProxy) {
+        if (ds.serviceMode == Key.MODE_VPN) {
+            val bypassIps = DesktopPrivilegedTun.resolveBypassServerIps(service.data.proxy)
+            privilegedTun.start(
+                PrivilegedTunParams(
+                    socksPort = ds.socksPort,
+                    socksUsername = ds.socksUsername,
+                    socksPassword = ds.socksPassword,
+                    localDnsPort = service.activeDnsPort,
+                    mtu = ds.mtu,
+                    enableIpv6 = ds.enableVPNInterfaceIPv6Address,
+                    bypassLan = ds.bypassLan,
+                    bypassServerIps = bypassIps,
+                )
+            )
+        } else {
+            runCatching { privilegedTun.stop() }
+        }
+
+        if (ds.requireHttp && ds.appendHttpProxy && ds.httpUsername.isEmpty() && ds.httpPassword.isEmpty()) {
             val bypass = ds.httpProxyException.split("\n", ",").map { it.trim() }.filter { it.isNotEmpty() }
             runCatching {
                 systemProxy.apply(
@@ -123,14 +142,18 @@ fun main(args: Array<String>) {
                     socksPort = ds.socksPort,
                     bypass = bypass,
                 )
-            }
+            }.onFailure { io.nekohasekai.sagernet.ktx.Logs.w(it) }
+        } else {
+            runCatching { systemProxy.restore() }
         }
     }
     io.nekohasekai.sagernet.bg.ProxyService.onStopped = {
+        runCatching { privilegedTun.stop() }
         runCatching { systemProxy.restore() }
     }
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { instanceHandle?.close() }
+        runCatching { privilegedTun.stop() }
         runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
         runCatching { systemProxy.restore() }
     })
@@ -148,6 +171,7 @@ fun main(args: Array<String>) {
                 onIncomingDeepLinks = null
                 runCatching { instanceHandle?.close() }
                 state?.shutdown()
+                runCatching { privilegedTun.stop() }
                 runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
                 runCatching { systemProxy.restore() }
                 exitApplication()

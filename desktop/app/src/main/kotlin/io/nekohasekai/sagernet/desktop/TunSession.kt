@@ -4,7 +4,7 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /** Raised when the transparent mode cannot be brought up. */
-class TunException(message: String, cause: Throwable? = null) : Exception(message, cause)
+open class TunException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
  * Transparent (TUN) mode for the desktop client.

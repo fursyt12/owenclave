@@ -17,14 +17,68 @@ object Log {
     private val ringBuffer = ArrayDeque<String>(2048)
     private val listeners = CopyOnWriteArrayList<(String) -> Unit>()
     private val logFile by lazy {
-        File(DesktopEnv.dataDir, "logcat.log").apply {
-            parentFile?.mkdirs()
-        }
+        rotateSessionLogFile(DesktopEnv.dataDir)
     }
     private val dateFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
     @Volatile
     var externalSink: ((String) -> Unit)? = null
+
+    /**
+     * Rotates a non-empty `logcat.log` from the previous run to `logcat.prev.log`
+     * and starts a fresh `logcat.log` for the current session so stale crashes or
+     * errors from earlier sessions do not accumulate indefinitely in the Logcat tab.
+     */
+    @JvmStatic
+    fun rotateSessionLogFile(dir: File): File {
+        dir.mkdirs()
+        val current = File(dir, "logcat.log")
+        val previous = File(dir, "logcat.prev.log")
+        runCatching {
+            if (current.isFile && current.length() > 0L) {
+                previous.delete()
+                if (!current.renameTo(previous)) {
+                    current.copyTo(previous, overwrite = true)
+                }
+            }
+            current.writeText("")
+        }
+        return current
+    }
+
+    /**
+     * Child plugins launched by `GuardedProcessPool` (such as Chromium-based
+     * `naive` and `tun2socks`) write informational and warning lines to `stderr`.
+     * Inspects structured severity markers when no `Throwable` is attached so
+     * normal connection logs are not mislabeled as `E/`.
+     */
+    @JvmStatic
+    fun classifyStderrLevel(msg: String?): Char {
+        if (msg.isNullOrEmpty()) return 'E'
+        if (CHROMIUM_INFO_REGEX.containsMatchIn(msg) ||
+            msg.contains("level=info", ignoreCase = true) ||
+            msg.contains(" [INFO] ")
+        ) {
+            return 'I'
+        }
+        if (CHROMIUM_WARN_REGEX.containsMatchIn(msg) ||
+            msg.contains("level=warn", ignoreCase = true) ||
+            msg.contains(" [WARN] ")
+        ) {
+            return 'W'
+        }
+        if (CHROMIUM_VERBOSE_REGEX.containsMatchIn(msg) ||
+            msg.contains("level=debug", ignoreCase = true) ||
+            msg.contains(" [DEBG] ")
+        ) {
+            return 'D'
+        }
+        return 'E'
+    }
+
+    private val CHROMIUM_INFO_REGEX = Regex("^\\[\\d+/\\d+\\.\\d+:INFO:")
+    private val CHROMIUM_WARN_REGEX = Regex("^\\[\\d+/\\d+\\.\\d+:WARNING:")
+    private val CHROMIUM_VERBOSE_REGEX = Regex("^\\[\\d+/\\d+\\.\\d+:VERBOSE\\d*:")
 
     fun getRecentLines(): List<String> = synchronized(ringBuffer) { ringBuffer.toList() }
 
@@ -73,11 +127,11 @@ object Log {
     @JvmStatic fun w(tag: String?, msg: String?): Int = emit('W', tag, msg)
     @JvmStatic fun w(tag: String?, msg: String?, tr: Throwable?): Int = emit('W', tag, msg, tr)
     @JvmStatic fun w(tag: String?, tr: Throwable?): Int = emit('W', tag, tr?.message, tr)
-    @JvmStatic fun e(tag: String?, msg: String?): Int = emit('E', tag, msg)
-    @JvmStatic fun e(tag: String?, msg: String?, tr: Throwable?): Int = emit('E', tag, msg, tr)
+    @JvmStatic fun e(tag: String?, msg: String?): Int = emit(classifyStderrLevel(msg), tag, msg)
+    @JvmStatic fun e(tag: String?, msg: String?, tr: Throwable?): Int =
+        emit(if (tr == null) classifyStderrLevel(msg) else 'E', tag, msg, tr)
 }
 
 class TypedValue {
     var resourceId: Int = 0
 }
-
