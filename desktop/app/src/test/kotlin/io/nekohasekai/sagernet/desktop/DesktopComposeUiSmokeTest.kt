@@ -3,8 +3,8 @@ package io.nekohasekai.sagernet.desktop
 import androidx.activity.DesktopActivityStack
 import androidx.compose.ui.ImageComposeScene
 import androidx.compose.ui.awt.ComposeWindow
-import androidx.compose.ui.use
 import io.nekohasekai.sagernet.SagerNet
+import io.nekohasekai.sagernet.database.DataStore
 import io.nekohasekai.sagernet.database.ProxyEntity
 import io.nekohasekai.sagernet.ui.compose.ComposeMainActivity
 import io.nekohasekai.sagernet.ui.compose.NavDestination
@@ -16,107 +16,144 @@ import java.awt.GraphicsEnvironment
 import javax.swing.SwingUtilities
 import kotlin.test.Test
 import kotlin.test.assertTrue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 
 class DesktopComposeUiSmokeTest {
+
+    private fun teardownStack() {
+        while (DesktopActivityStack.stack.isNotEmpty()) {
+            val activity = DesktopActivityStack.stack.removeLast()
+            runCatching { activity.onPause() }
+            runCatching { activity.onStop() }
+            runCatching { activity.onDestroy() }
+        }
+    }
 
     @Test
     fun `renders ComposeMainActivity across all navigation destinations and UniversalProfileSettingsScreen`() {
         SagerNet.application
-        DesktopActivityStack.stack.clear()
+        DataStore.appAutoUpdate = false
 
-        ImageComposeScene(width = 1180, height = 780).use { scene ->
-            val mainActivity = ComposeMainActivity()
-            scene.setContent {
-                DesktopActivityStack.Host(mainActivity)
-            }
-            val initialImg = scene.render(0L)
-            assertTrue(initialImg.width == 1180 && initialImg.height == 780)
+        runBlocking(Dispatchers.Main) {
+            teardownStack()
 
-            var frameNano = 16_000_000L
-            for (dest in NavDestination.entries) {
-                PendingDeepLink.pendingDestination.value = dest
-                repeat(3) {
-                    scene.render(frameNano)
-                    frameNano += 16_000_000L
+            val mainScene = ImageComposeScene(width = 1180, height = 780, coroutineContext = Dispatchers.Main)
+            try {
+                val mainActivity = ComposeMainActivity()
+                mainScene.setContent {
+                    DesktopActivityStack.Host(mainActivity)
                 }
-            }
+                val initialImg = mainScene.render(0L)
+                assertTrue(initialImg.width == 1180 && initialImg.height == 780)
+                yield()
 
-            // Exercise deep link routing to GroupScreen + quick-add dialog + Toast overlay
-            val subIntent = android.content.Intent(
-                android.content.Intent.ACTION_VIEW,
-                android.net.Uri.parse("owenclave://add-subscription?url=https%3A%2F%2Fexample.com%2Fapi%2Fsub&hwid=1"),
-            )
-            mainActivity.onNewIntent(subIntent)
-            android.widget.Toast.makeText(mainActivity, "Deep link received", android.widget.Toast.LENGTH_SHORT).show()
-            repeat(4) {
-                scene.render(frameNano)
-                frameNano += 16_000_000L
-            }
-            PendingDeepLink.pendingSubscriptionAdd.value = null
-            PendingDeepLink.pendingDestination.value = null
-        }
-
-        // Also verify compact phone width (3-tab pill mode) renders cleanly
-        DesktopActivityStack.stack.clear()
-        ImageComposeScene(width = 412, height = 892).use { scene ->
-            val mainActivity = ComposeMainActivity()
-            scene.setContent {
-                DesktopActivityStack.Host(mainActivity)
-            }
-            val compactImg = scene.render(0L)
-            assertTrue(compactImg.width == 412 && compactImg.height == 892)
-        }
-
-        val allTypes = listOf(
-            ProxyEntity.TYPE_SOCKS to ProfileFieldState(),
-            ProxyEntity.TYPE_HTTP to ProfileFieldState(),
-            ProxyEntity.TYPE_HTTP to ProfileFieldState(security = "tls"),
-            ProxyEntity.TYPE_SS to ProfileFieldState(),
-            ProxyEntity.TYPE_SSR to ProfileFieldState(),
-            ProxyEntity.TYPE_VMESS to ProfileFieldState(),
-            ProxyEntity.TYPE_VLESS to ProfileFieldState(security = "reality"),
-            ProxyEntity.TYPE_TROJAN to ProfileFieldState(security = "tls"),
-            ProxyEntity.TYPE_NAIVE to ProfileFieldState(),
-            ProxyEntity.TYPE_HYSTERIA2 to ProfileFieldState(),
-            ProxyEntity.TYPE_SSH to ProfileFieldState(),
-            ProxyEntity.TYPE_WG to ProfileFieldState(),
-            ProxyEntity.TYPE_MIERU to ProfileFieldState(),
-            ProxyEntity.TYPE_TUIC5 to ProfileFieldState(),
-            ProxyEntity.TYPE_JUICITY to ProfileFieldState(),
-            ProxyEntity.TYPE_HTTP3 to ProfileFieldState(),
-            ProxyEntity.TYPE_ANYTLS to ProfileFieldState(),
-            ProxyEntity.TYPE_SHADOWQUIC to ProfileFieldState(),
-            ProxyEntity.TYPE_TRUSTTUNNEL to ProfileFieldState(),
-            ProxyEntity.TYPE_SNELL to ProfileFieldState(),
-            ProxyEntity.TYPE_MASQUE to ProfileFieldState(),
-            ProxyEntity.TYPE_CHAIN to ProfileFieldState(),
-            ProxyEntity.TYPE_CONFIG to ProfileFieldState(),
-            ProxyEntity.TYPE_BALANCER to ProfileFieldState(),
-        )
-
-        for ((type, initial) in allTypes) {
-            ImageComposeScene(width = 1000, height = 1600).use { scene ->
-                scene.setContent {
-                    OwenclaveTheme(themeId = 0, nightTheme = 1) {
-                        UniversalProfileSettingsScreen(
-                            profileType = type,
-                            initialState = initial,
-                            onBack = {},
-                            onSave = {},
-                        )
+                var frameNano = 250_000_000L
+                for (dest in NavDestination.entries) {
+                    PendingDeepLink.pendingDestination.value = dest
+                    repeat(3) {
+                        mainScene.render(frameNano)
+                        frameNano += 250_000_000L
+                        yield()
                     }
                 }
-                val img = scene.render(0L)
-                assertTrue(img.width == 1000)
+
+                // Exercise deep link routing to GroupScreen + quick-add dialog + Toast overlay
+                val subIntent = android.content.Intent(
+                    android.content.Intent.ACTION_VIEW,
+                    android.net.Uri.parse("owenclave://add-subscription?url=https%3A%2F%2Fexample.com%2Fapi%2Fsub&hwid=1"),
+                )
+                mainActivity.onNewIntent(subIntent)
+                android.widget.Toast.makeText(mainActivity, "Deep link received", android.widget.Toast.LENGTH_SHORT).show()
+                repeat(4) {
+                    mainScene.render(frameNano)
+                    frameNano += 250_000_000L
+                    yield()
+                }
+                PendingDeepLink.pendingSubscriptionAdd.value = null
+                PendingDeepLink.pendingDestination.value = null
+            } finally {
+                teardownStack()
+                yield()
+                mainScene.close()
+            }
+
+            // Also verify compact phone width (3-tab pill mode) renders cleanly
+            val compactScene = ImageComposeScene(width = 412, height = 892, coroutineContext = Dispatchers.Main)
+            try {
+                val mainActivity = ComposeMainActivity()
+                compactScene.setContent {
+                    DesktopActivityStack.Host(mainActivity)
+                }
+                val compactImg = compactScene.render(0L)
+                assertTrue(compactImg.width == 412 && compactImg.height == 892)
+                yield()
+            } finally {
+                teardownStack()
+                yield()
+                compactScene.close()
+            }
+
+            val allTypes = listOf(
+                ProxyEntity.TYPE_SOCKS to ProfileFieldState(),
+                ProxyEntity.TYPE_HTTP to ProfileFieldState(),
+                ProxyEntity.TYPE_HTTP to ProfileFieldState(security = "tls"),
+                ProxyEntity.TYPE_SS to ProfileFieldState(),
+                ProxyEntity.TYPE_SSR to ProfileFieldState(),
+                ProxyEntity.TYPE_VMESS to ProfileFieldState(),
+                ProxyEntity.TYPE_VLESS to ProfileFieldState(security = "reality"),
+                ProxyEntity.TYPE_TROJAN to ProfileFieldState(security = "tls"),
+                ProxyEntity.TYPE_NAIVE to ProfileFieldState(),
+                ProxyEntity.TYPE_HYSTERIA2 to ProfileFieldState(),
+                ProxyEntity.TYPE_SSH to ProfileFieldState(),
+                ProxyEntity.TYPE_WG to ProfileFieldState(),
+                ProxyEntity.TYPE_MIERU to ProfileFieldState(),
+                ProxyEntity.TYPE_TUIC5 to ProfileFieldState(),
+                ProxyEntity.TYPE_JUICITY to ProfileFieldState(),
+                ProxyEntity.TYPE_HTTP3 to ProfileFieldState(),
+                ProxyEntity.TYPE_ANYTLS to ProfileFieldState(),
+                ProxyEntity.TYPE_SHADOWQUIC to ProfileFieldState(),
+                ProxyEntity.TYPE_TRUSTTUNNEL to ProfileFieldState(),
+                ProxyEntity.TYPE_SNELL to ProfileFieldState(),
+                ProxyEntity.TYPE_MASQUE to ProfileFieldState(),
+                ProxyEntity.TYPE_CHAIN to ProfileFieldState(),
+                ProxyEntity.TYPE_CONFIG to ProfileFieldState(),
+                ProxyEntity.TYPE_BALANCER to ProfileFieldState(),
+            )
+
+            for ((type, initial) in allTypes) {
+                val editorScene = ImageComposeScene(width = 1000, height = 1600, coroutineContext = Dispatchers.Main)
+                try {
+                    editorScene.setContent {
+                        OwenclaveTheme(themeId = 0, nightTheme = 1) {
+                            UniversalProfileSettingsScreen(
+                                profileType = type,
+                                initialState = initial,
+                                onBack = {},
+                                onSave = {},
+                            )
+                        }
+                    }
+                    val img = editorScene.render(0L)
+                    assertTrue(img.width == 1000)
+                    yield()
+                } finally {
+                    yield()
+                    editorScene.close()
+                }
             }
         }
 
-        if (!GraphicsEnvironment.isHeadless()) {
+        val canOpenNativeWindow = !GraphicsEnvironment.isHeadless() &&
+            System.getenv("CI").isNullOrBlank() &&
+            System.getProperty("owenclave.ci").isNullOrBlank()
+        if (canOpenNativeWindow) {
             var windowError: Throwable? = null
             SwingUtilities.invokeAndWait {
                 var window: ComposeWindow? = null
                 try {
-                    DesktopActivityStack.stack.clear()
+                    teardownStack()
                     window = ComposeWindow()
                     window.setSize(1180, 780)
                     val mainActivity = ComposeMainActivity()
@@ -126,6 +163,7 @@ class DesktopComposeUiSmokeTest {
                 } catch (t: Throwable) {
                     windowError = t
                 } finally {
+                    teardownStack()
                     runCatching { window?.dispose() }
                 }
             }

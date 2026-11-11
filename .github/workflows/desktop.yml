@@ -26,6 +26,10 @@ on:
         description: 'Release Tag'
         required: false
 
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -70,6 +74,11 @@ jobs:
       - name: Install WiX (Windows MSI)
         if: runner.os == 'Windows'
         run: choco install wixtoolset --no-progress -y
+      - name: Install Skiko runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libfontconfig1
       - name: Warm Go module cache
         shell: bash
         env:
@@ -218,6 +227,10 @@ jobs:
           fi
           if ! printf '%s\n' "$listing" | grep -qx "bin/$jniName"; then
             echo "::error::bin/$jniName is missing from the application image"
+            missing=1
+          fi
+          if [ "$RUNNER_OS" = "Linux" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/owenclave-tun-helper'; then
+            echo "::error::bin/owenclave-tun-helper is missing from the Linux application image"
             missing=1
           fi
           if [ "$RUNNER_OS" = "Windows" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/wintun.dll'; then
@@ -418,6 +431,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Download Artifacts
         uses: actions/download-artifact@v8
         with:
@@ -426,15 +441,16 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            echo "TAG=${GITHUB_REF_NAME}" >>"$GITHUB_ENV"
+            TAG="${GITHUB_REF_NAME}"
           else
-            echo "TAG=${{ github.event.inputs.tag }}" >>"$GITHUB_ENV"
+            TAG="${{ github.event.inputs.tag }}"
           fi
+          echo "TAG=${TAG}" >>"$GITHUB_ENV"
           version="$(grep -E '^VERSION_NAME=' version.properties | cut -d= -f2 | tr -d '[:space:]')"
           desktop_version="$(printf '%s' "$version" | sed -E 's/^0+(\.)/1\1/')"
           echo "VERSION=${version}" >>"$GITHUB_ENV"
           echo "DESKTOP_VERSION=${desktop_version}" >>"$GITHUB_ENV"
-          rm -rf release notes.md
+          rm -rf release notes.md base-notes.md
           mkdir -p release
           # Installer names do not contain the platform, so the macOS dmg of both
           # architectures would overwrite each other: suffix them with the matrix tag
@@ -461,110 +477,122 @@ jobs:
           ls -la arch 2>/dev/null || true
           ls -la release
           test "$count" -gt 0
+
+          previous="$(git tag --list 'v[0-9]*' '[0-9]*' --sort=-creatordate | grep -Fxv "$TAG" | head -n1 || true)"
+          repo="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          if [ -n "$previous" ]; then
+            link="${repo}/compare/${previous}...${TAG}"
+          else
+            link="${repo}/commits/${TAG}"
+          fi
+          if [ -f "docs/releases/${version}.md" ]; then
+            cat "docs/releases/${version}.md" > base-notes.md
+            printf '\n' >> base-notes.md
+          else
+            : > base-notes.md
+          fi
+          printf '**Full Changelog**: %s\n' "$link" >> base-notes.md
+
           cat > notes.md <<'NOTES'
-          Desktop client for macOS, Windows and Linux. It reuses the Android protocol
-          layer and runs the same Go engine as a child process, so profiles, share
-          links, Clash YAML and V2Ray/sing-box JSON behave exactly like on Android.
+          <!-- desktop-notes -->
+          ## Desktop Client (`__DESKTOP_VERSION__`)
 
-          Built from the Android app version `__VERSION__`; desktop packages use the
-          version `__DESKTOP_VERSION__`.
+          Desktop client for Linux, macOS and Windows built from Android version
+          `__VERSION__` (desktop package version `__DESKTOP_VERSION__`). It shares the
+          Android Material 3 Expressive 7-tab Compose UI, protocol layer and Go engine
+          (`owenclave-core` + `libgojni` + `naive` + `tun2socks`), so profiles, share
+          links (`owenclave://`, `owenkey://`, `happ://`, `vless://`, ...), Clash YAML
+          and V2Ray/sing-box JSON behave identically to Android.
 
-          ## Downloads
+          ### Downloads
 
-          | Platform | Portable (unpack and run) | Installer |
+          | Platform | Portable (unpack and run) | Installer / Package |
           | --- | --- | --- |
           | Windows x64 | `owenclave-desktop-__DESKTOP_VERSION__-windows-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-windows-x64.msi` |
           | macOS arm64 | `owenclave-desktop-__DESKTOP_VERSION__-darwin-arm64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-macos-arm64.dmg` |
           | macOS x64 | `owenclave-desktop-__DESKTOP_VERSION__-darwin-amd64-portable.zip` | `Owenclave-__DESKTOP_VERSION__-macos-x64.dmg` |
-          | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `owenclave___DESKTOP_VERSION___amd64-linux-x64.deb`, `owenclave-__DESKTOP_VERSION__-1.x86_64-linux-x64.rpm` |
+          | Linux x64 | `owenclave-desktop-__DESKTOP_VERSION__-linux-amd64-portable.zip` | `owenclave___DESKTOP_VERSION___amd64-linux-x64.deb`, `owenclave-__DESKTOP_VERSION__-1.x86_64-linux-x64.rpm`, `owenclave-desktop-__DESKTOP_VERSION__-1-x86_64.pkg.tar.zst` |
 
-          The portable archive is self contained: unpack it, start the launcher, and
-          profiles, settings plus the extracted `owenclave-core`, `libgojni`, `naive` and
-          `tun2socks` engines stay inside the unpacked folder as long as a `data`
-          directory sits next to the launcher (remove it to fall back to the per user OS
-          directory).
+          ### Notes
 
-          ## Verified on every build
-
-          * unit tests of the shared subscription importers and the desktop config builder
-          * every generated protocol config is fed to `owenclave-core test`, including the
-            client only protocols, so a protocol the engine cannot parse fails the build
-          * tunnel smoke test through the core bundled into the application image
-          * protocol self tests that start the shipped core as a local server and tunnel a
-            request through VLESS, VMess, Trojan, AnyTLS, Shadowsocks, SOCKS and HTTP
-          * subscription self test: the bundled application downloads a subscription -
-            plain and base64 encoded - through the real importer and parses it, which is
-            what catches a runtime missing java.net.http or an importer that only knows
-            one encoding
-          * settings parity: the catalog is parsed from the Android preference XML (seven
-            categories, 86 preferences) and a changed setting has to change the generated
-            config, so a binding that stores a value without applying it fails the build
-          * nine Android preferences that used to be disabled now have desktop
-            behaviour: auto connect, night theme, HWID reset, the insecure profile
-            warning, the server address line, the local DNS inbound with its port and
-            the IPv6 address plus split default routes on the TUN device; the Android service
-            mode maps onto the desktop transparent mode and the VPN interface IPv6
-            switch adds the IPv6 routes to the tunnel device
-          * NaiveProxy plugin test that starts the real `naive` binary and lets the core dial in
-          * transparent mode test: `tun2socks` creates a TUN device inside a network
-            namespace, the client's traffic enters it and reaches a stub SOCKS server,
-            followed by a real run that takes over the default route on each system
-            (informational: the second one is skipped when the runner refuses
-            administrator rights, and it never blocks the build)
-
-          Every push builds and tests all four targets: Linux x64, Windows x64,
-          macOS arm64 and macOS x64.
-
-          ## Notes
-
-          * The macOS bundles are not signed with an Apple certificate, so Gatekeeper
-            asks once: right click then Open, or `xattr -dr com.apple.quarantine <app>`.
-          * Desktop package versions use the scheme `1.a.b` for the Android app version
-            `0.a.b`, because jpackage refuses an app version whose first component is zero
-            on macOS.
-          * Transparent mode (TUN) needs root, or administrator on Windows, where
-            `wintun.dll` must sit next to the launcher. When the device cannot be
-            created the connection log says which right or file is missing, and the
-            application states the reason instead of failing silently.
-          * The settings menu is generated from the Android preference definition as well,
-            so the same seven categories and 86 preferences appear here, in the same order,
-            with the Android titles, summaries and defaults; the entries that cannot work
-            without a VpnService (service mode, per-app proxy, notifications, Tasker, ...)
-            stay visible but disabled and say why.
-          * Service mode chooses between the transparent TUN device, the operating system
-            proxy (GNOME/KDE settings, macOS `networksetup`, Windows WinINet; the previous
-            values are backed up and restored) and the local SOCKS listener only. Per-app
-            routing is implemented on Linux (cgroup v2 plus nftables marks and policy
-            routing) and is explicitly unavailable on Windows and macOS, where it would
-            need a WFP callout driver or a NetworkExtension.
-          * Protocol coverage matches the Android app 1-to-1: the desktop client compiles
-            the Android backend (`fmt`, `database`, `group`, `bg`) and Material 3 Expressive
-            Compose UI directly alongside the native `libexclavecore` Go JNI library, so
-            Shadowsocks (incl. 2022 and SIP003 plugins), VMess, VLESS, Trojan, Hysteria2,
-            TUIC, Juicity, AnyTLS, Mieru, Snell, SSH, ShadowQUIC, TrustTunnel, HTTP/3,
-            MASQUE, WireGuard and SOCKS/HTTP are all usable. NaiveProxy runs as an
-            external engine, exactly like the plugin on Android. See `desktop/README.md`.
+          * **Arch Linux repository**: install and keep updated with `pacman -Syu`:
+            `sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/__REPO__/dev/packaging/arch/setup-repo.sh)"`
+          * **Service modes**: supports **VPN (TUN)** (prompts via Polkit `pkexec` / graphical askpass on Linux, or Administrator on Windows/macOS), **System Proxy** (GNOME/KDE, macOS `networksetup`, Windows WinINet with automatic restore), and **Proxy Only** (local SOCKS/HTTP listeners).
+          * **macOS Gatekeeper**: unsigned `.dmg` bundles ask once on first launch — right-click then Open, or run `xattr -dr com.apple.quarantine /Applications/Owenclave.app`.
+          * **Version scheme**: desktop installers use `1.a.b` for Android version `0.a.b` because `jpackage` rejects a leading `0` major version on macOS.
+          <!-- /desktop-notes -->
           NOTES
-          sed -i "s/__VERSION__/${version}/g; s/__DESKTOP_VERSION__/${desktop_version}/g" notes.md
-          echo "--- release notes ---"
+          sed -i "s|__VERSION__|${version}|g; s|__DESKTOP_VERSION__|${desktop_version}|g; s|__REPO__|${GITHUB_REPOSITORY}|g" notes.md
+          echo "--- desktop release notes ---"
           cat notes.md
       - name: Publish or update the release
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          is_prerelease="false"
+          release_title="Owenclave ${TAG}"
+          case "$TAG" in
+            desktop-v*)
+              is_prerelease="true"
+              release_title="Owenclave desktop ${DESKTOP_VERSION} (${VERSION})"
+              ;;
+            *-*)
+              is_prerelease="true"
+              ;;
+          esac
+
+          build_combined_notes() {
+            local existing_body
+            existing_body="$(gh release view "$TAG" --json body --jq '.body' 2>/dev/null || true)"
+            python3 - "$existing_body" <<'PY'
+          import re, sys
+          existing = sys.argv[1]
+          with open("notes.md", "r", encoding="utf-8") as f:
+              desktop_block = f.read().strip()
+          with open("base-notes.md", "r", encoding="utf-8") as f:
+              fallback_base = f.read().strip()
+          cleaned = re.sub(r"<!-- desktop-notes -->.*?<!-- /desktop-notes -->", "", existing, flags=re.S).strip()
+          base = cleaned if cleaned else fallback_base
+          out = f"{base}\n\n{desktop_block}\n" if base else f"{desktop_block}\n"
+          with open("combined-notes.md", "w", encoding="utf-8") as f:
+              f.write(out)
+          PY
+          }
+
+          publish_existing() {
             echo "updating the existing release $TAG"
+            build_combined_notes
             gh release upload "$TAG" ./release/* --clobber
-            gh release edit "$TAG" --title "Owenclave desktop ${DESKTOP_VERSION} (${VERSION})" --notes-file notes.md --prerelease --latest=false
-            # drop assets that belonged to an earlier layout of this release
+            if [ "$is_prerelease" = "true" ]; then
+              gh release edit "$TAG" --title "$release_title" --notes-file combined-notes.md --prerelease --latest=false
+            else
+              gh release edit "$TAG" --title "$release_title" --notes-file combined-notes.md --prerelease=false
+            fi
+            # drop desktop assets that belonged to an earlier layout of this release while preserving Android APKs
             while IFS= read -r asset; do
-              case "$asset" in *.apk) continue ;; esac
+              case "$asset" in *.apk|*.aab|*.sha256) continue ;; esac
               [ -f "release/$asset" ] || gh release delete-asset "$TAG" "$asset" --yes
             done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          }
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            publish_existing
           else
-            gh release create --prerelease --latest=false "$TAG" \
-              --title "Owenclave desktop ${DESKTOP_VERSION} (${VERSION})" \
-              --notes-file notes.md \
-              ./release/*
+            build_combined_notes
+            if [ "$is_prerelease" = "true" ]; then
+              if ! gh release create --prerelease --latest=false "$TAG" \
+                --title "$release_title" \
+                --notes-file combined-notes.md \
+                ./release/*; then
+                publish_existing
+              fi
+            else
+              if ! gh release create "$TAG" \
+                --title "$release_title" \
+                --notes-file combined-notes.md \
+                ./release/*; then
+                publish_existing
+              fi
+            fi
           fi
           gh release view "$TAG"
 

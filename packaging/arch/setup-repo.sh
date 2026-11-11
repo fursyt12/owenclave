@@ -84,5 +84,5 @@ if [ "$DO_INSTALL" = "1" ]; then
   pacman -Sy --noconfirm "$REPO_NAME"-desktop
   echo ""
   echo "installed. start it from the menu or with: owenclave"
-  echo "TUN/transparent mode needs root: sudo owenclave"
+  echo "VPN (TUN) mode prompts for privileges via Polkit (pkexec) when connecting"
 fi

@@ -288,3 +288,12 @@ dependencies {
     api(libs.zxing.core)
     api(libs.sqlite.jdbc)
 }
+
+tasks.withType<Test>().configureEach {
+    val isolatedTestDataDir = layout.buildDirectory.dir("tmp/test-data").get().asFile
+    doFirst {
+        isolatedTestDataDir.deleteRecursively()
+        isolatedTestDataDir.mkdirs()
+    }
+    systemProperty("owenclave.dataDir", isolatedTestDataDir.absolutePath)
+}

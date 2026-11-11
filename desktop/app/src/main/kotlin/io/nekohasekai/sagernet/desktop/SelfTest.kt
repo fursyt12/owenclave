@@ -416,52 +416,78 @@ object SelfTest {
     }
 
     fun runGui(): Int {
+        fun teardownStack() {
+            while (androidx.activity.DesktopActivityStack.stack.isNotEmpty()) {
+                val activity = androidx.activity.DesktopActivityStack.stack.removeLast()
+                runCatching { activity.onPause() }
+                runCatching { activity.onStop() }
+                runCatching { activity.onDestroy() }
+            }
+        }
+
         return try {
             io.nekohasekai.sagernet.SagerNet.application
-            androidx.activity.DesktopActivityStack.stack.clear()
+            io.nekohasekai.sagernet.database.DataStore.appAutoUpdate = false
 
-            for ((w, h) in listOf(1180 to 780, 412 to 892)) {
-                val scene = androidx.compose.ui.ImageComposeScene(width = w, height = h)
-                try {
-                    androidx.activity.DesktopActivityStack.stack.clear()
-                    val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
-                    scene.setContent {
-                        androidx.activity.DesktopActivityStack.Host(mainActivity)
-                    }
-                    val initial = scene.render(0L)
-                    check(initial.width == w && initial.height == h)
-                    var frameNano = 16_000_000L
-                    for (dest in io.nekohasekai.sagernet.ui.compose.NavDestination.entries) {
-                        io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = dest
-                        repeat(3) {
-                            scene.render(frameNano)
-                            frameNano += 16_000_000L
-                        }
-                        println("[selftest-gui] rendered ${dest.name} (${w}x${h})")
-                    }
-                    // Verify owenclave:// deep link -> GroupScreen subscription dialog
-                    val deepIntent = android.content.Intent(
-                        android.content.Intent.ACTION_VIEW,
-                        android.net.Uri.parse("owenclave://add-subscription?url=https%3A%2F%2Fexample.com%2Fsub&hwid=1"),
+            kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.Main) {
+                teardownStack()
+
+                for ((w, h) in listOf(1180 to 780, 412 to 892)) {
+                    val scene = androidx.compose.ui.ImageComposeScene(
+                        width = w,
+                        height = h,
+                        coroutineContext = kotlinx.coroutines.Dispatchers.Main,
                     )
-                    mainActivity.onNewIntent(deepIntent)
-                    repeat(4) {
-                        scene.render(frameNano)
-                        frameNano += 16_000_000L
+                    try {
+                        teardownStack()
+                        val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
+                        scene.setContent {
+                            androidx.activity.DesktopActivityStack.Host(mainActivity)
+                        }
+                        val initial = scene.render(0L)
+                        check(initial.width == w && initial.height == h)
+                        kotlinx.coroutines.yield()
+
+                        var frameNano = 250_000_000L
+                        for (dest in io.nekohasekai.sagernet.ui.compose.NavDestination.entries) {
+                            io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = dest
+                            repeat(3) {
+                                scene.render(frameNano)
+                                frameNano += 250_000_000L
+                                kotlinx.coroutines.yield()
+                            }
+                            println("[selftest-gui] rendered ${dest.name} (${w}x${h})")
+                        }
+                        // Verify owenclave:// deep link -> GroupScreen subscription dialog
+                        val deepIntent = android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse("owenclave://add-subscription?url=https%3A%2F%2Fexample.com%2Fsub&hwid=1"),
+                        )
+                        mainActivity.onNewIntent(deepIntent)
+                        repeat(4) {
+                            scene.render(frameNano)
+                            frameNano += 250_000_000L
+                            kotlinx.coroutines.yield()
+                        }
+                        io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingSubscriptionAdd.value = null
+                        io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = null
+                    } finally {
+                        teardownStack()
+                        kotlinx.coroutines.yield()
+                        scene.close()
                     }
-                    io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingSubscriptionAdd.value = null
-                    io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = null
-                } finally {
-                    scene.close()
                 }
             }
 
-            if (!java.awt.GraphicsEnvironment.isHeadless()) {
+            val canOpenNativeWindow = !java.awt.GraphicsEnvironment.isHeadless() &&
+                System.getenv("CI").isNullOrBlank() &&
+                System.getProperty("owenclave.ci").isNullOrBlank()
+            if (canOpenNativeWindow) {
                 var windowError: Throwable? = null
                 javax.swing.SwingUtilities.invokeAndWait {
                     var window: androidx.compose.ui.awt.ComposeWindow? = null
                     try {
-                        androidx.activity.DesktopActivityStack.stack.clear()
+                        teardownStack()
                         window = androidx.compose.ui.awt.ComposeWindow()
                         window.setSize(1180, 780)
                         val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
@@ -472,6 +498,7 @@ object SelfTest {
                     } catch (t: Throwable) {
                         windowError = t
                     } finally {
+                        teardownStack()
                         runCatching { window?.dispose() }
                     }
                 }
