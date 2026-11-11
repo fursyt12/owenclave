@@ -153,15 +153,17 @@ class CoreRunner(
         DesktopRuntime.assetDir()?.let { assets ->
             pb.environment()["V2RAY_LOCATION_ASSET"] = assets.absolutePath
         }
+        val startupLines = java.util.Collections.synchronizedList(ArrayList<String>())
         val process = pb.start()
         coreProcess = process
-        pumpOutput("core", process)
+        pumpOutput("core", process, startupLines)
 
         // The core is ready when the local SOCKS inbound accepts connections.
         try {
-            awaitPort(settings.socksPort, process, timeoutMillis = 20_000, what = "core")
+            awaitPort(settings.socksPort, process, timeoutMillis = 20_000, what = "core", startupLines = startupLines)
         } catch (e: Exception) {
             process.destroyForcibly()
+            runCatching { process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) }
             coreProcess = null
             throw e
         }
@@ -213,7 +215,10 @@ class CoreRunner(
         coreProcess?.let { process ->
             log("stopping core")
             process.destroy()
-            if (!process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly()
+            if (!process.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                runCatching { process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) }
+            }
         }
         coreProcess = null
     }
@@ -247,19 +252,35 @@ class CoreRunner(
 
     data class HttpResult(val code: Int, val body: String)
 
-    private fun pumpOutput(tag: String, process: Process) {
+    private fun pumpOutput(tag: String, process: Process, capture: MutableList<String>? = null) {
         Thread {
             runCatching {
-                process.inputStream.bufferedReader().forEachLine { line -> log("[$tag] $line") }
+                process.inputStream.bufferedReader().forEachLine { line ->
+                    if (capture != null && capture.size < 20) {
+                        capture.add(line)
+                    }
+                    log("[$tag] $line")
+                }
             }
         }.apply { isDaemon = true }.start()
     }
 
-    private fun awaitPort(port: Int, process: Process, timeoutMillis: Long, what: String) {
+    private fun awaitPort(
+        port: Int,
+        process: Process,
+        timeoutMillis: Long,
+        what: String,
+        startupLines: List<String> = emptyList(),
+    ) {
         val deadline = System.currentTimeMillis() + timeoutMillis
         while (System.currentTimeMillis() < deadline) {
             if (!process.isAlive) {
-                throw UnsupportedProfileException("$what terminated during startup (exit code ${process.exitValue()})")
+                Thread.sleep(50)
+                val detail = synchronized(startupLines) {
+                    startupLines.takeLast(6).joinToString(" | ")
+                }
+                val suffix = if (detail.isNotBlank()) ": $detail" else ""
+                throw UnsupportedProfileException("$what terminated during startup (exit code ${process.exitValue()})$suffix")
             }
             runCatching {
                 Socket().use { socket ->
@@ -274,7 +295,43 @@ class CoreRunner(
 
     companion object {
 
-        fun freePort(): Int = ServerSocket(0).use { it.localPort }
+        private val recentPorts = java.util.ArrayDeque<Int>(64)
+
+        @Synchronized
+        fun freePort(): Int {
+            val loopback = java.net.InetAddress.getByName("127.0.0.1")
+            repeat(32) {
+                val candidate = runCatching {
+                    ServerSocket().use { s ->
+                        s.reuseAddress = false
+                        s.bind(InetSocketAddress(loopback, 0), 1)
+                        s.localPort
+                    }
+                }.getOrDefault(0)
+                if (candidate <= 0 || recentPorts.contains(candidate)) return@repeat
+                val allFree = runCatching {
+                    ServerSocket().use { s ->
+                        s.reuseAddress = false
+                        s.bind(InetSocketAddress(candidate), 1)
+                    }
+                    java.net.DatagramSocket(null).use { u ->
+                        u.reuseAddress = false
+                        u.bind(InetSocketAddress(loopback, candidate))
+                    }
+                    java.net.DatagramSocket(null).use { u ->
+                        u.reuseAddress = false
+                        u.bind(InetSocketAddress(candidate))
+                    }
+                    true
+                }.getOrDefault(false)
+                if (allFree) {
+                    if (recentPorts.size >= 64) recentPorts.removeFirst()
+                    recentPorts.addLast(candidate)
+                    return candidate
+                }
+            }
+            return ServerSocket(0).use { it.localPort }
+        }
 
     }
 

@@ -214,23 +214,36 @@ class WebControllerServerTest {
                 .start()
             SelfTest.awaitPort(upstreamPort)
 
-            val mixedPort = CoreRunner.freePort()
             val secret = "s3cr3t-token-test"
-            val daemonCfg = DaemonConfig(
-                configFile = null,
-                dataDir = tmpDir,
-                mixedPort = mixedPort,
-                allowLan = false,
-                bindAddress = "127.0.0.1",
-                mode = "global",
-                logLevel = "warning",
-                externalController = "127.0.0.1:0",
-                secret = secret,
-                autoUpdateMinutes = 0,
-            )
-
-            engine = DaemonEngine(daemonCfg).also { it.start() }
-            web = WebControllerServer(engine).also { it.start() }
+            var mixedPort = CoreRunner.freePort()
+            var lastStartErr: Exception? = null
+            for (attempt in 1..3) {
+                val daemonCfg = DaemonConfig(
+                    configFile = null,
+                    dataDir = tmpDir,
+                    mixedPort = mixedPort,
+                    allowLan = false,
+                    bindAddress = "127.0.0.1",
+                    mode = "global",
+                    logLevel = "warning",
+                    externalController = "127.0.0.1:0",
+                    secret = secret,
+                    autoUpdateMinutes = 0,
+                )
+                val candidate = DaemonEngine(daemonCfg)
+                try {
+                    candidate.start()
+                    engine = candidate
+                    lastStartErr = null
+                    break
+                } catch (e: Exception) {
+                    runCatching { candidate.stop() }
+                    lastStartErr = e
+                    mixedPort = CoreRunner.freePort()
+                }
+            }
+            lastStartErr?.let { throw it }
+            web = WebControllerServer(engine!!).also { it.start() }
             val port = web.boundPort
             assertTrue(port > 0)
 
@@ -347,7 +360,12 @@ class WebControllerServerTest {
         } finally {
             runCatching { web?.stop() }
             runCatching { engine?.stop() }
-            runCatching { upstreamProcess?.destroyForcibly() }
+            runCatching {
+                upstreamProcess?.let { p ->
+                    p.destroyForcibly()
+                    p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)
+                }
+            }
             targetHttp.stop()
             tmpDir.deleteRecursively()
         }
