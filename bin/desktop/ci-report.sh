@@ -21,7 +21,8 @@ report_gradle_failure() {
   echo "::error::$label failed"
   [ -f "$log" ] || return 0
   grep -aE "What went wrong|Execution failed|Caused by|^> |FAILURE|error:|Error:|Exception" "$log" \
-    | head -12 | while IFS= read -r line; do
+    | grep -avE "^> (Task |Configure project )" \
+    | head -8 | while IFS= read -r line; do
       echo "::error::${line//$'\r'/}"
     done
 }
@@ -50,12 +51,20 @@ dump_jpackage_args() {
 }
 
 # Surfaces JUnit XML failures, JVM hs_err crash logs, and log tails as annotations.
+# Note: GitHub Actions caps ::error:: annotations at 10 per step, so multiline
+# payloads are URL-encoded (%0A) into single annotations to avoid truncation.
 report_test_failures() {
   local label="$1" log="$2"
-  report_gradle_failure "$label" "$log"
   if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY' || true
-import glob, xml.etree.ElementTree as ET
+    python3 - "$label" "$log" <<'PY' || true
+import glob, os, sys, xml.etree.ElementTree as ET
+
+label, log_path = sys.argv[1], sys.argv[2]
+
+def esc(text: str) -> str:
+    return text.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+
+emitted = 0
 for path in sorted(glob.glob("desktop/*/build/test-results/test/*.xml")):
     try:
         root = ET.parse(path).getroot()
@@ -64,26 +73,30 @@ for path in sorted(glob.glob("desktop/*/build/test-results/test/*.xml")):
     for tc in root.findall("testcase"):
         for tag in ("failure", "error"):
             el = tc.find(tag)
-            if el is not None:
+            if el is not None and emitted < 5:
                 cls = tc.attrib.get("classname", "")
                 name = tc.attrib.get("name", "")
-                msg = (el.attrib.get("message") or "").replace("\r", "").replace("\n", " ")
-                print(f"::error::[JUnit {cls}.{name}] {msg}")
-                body = (el.text or "").replace("\r", "").splitlines()
-                for line in body[:12]:
-                    print(f"::error::  {line}")
+                msg = (el.attrib.get("message") or "").strip()
+                body = "\n".join((el.text or "").splitlines()[:20])
+                sys.stdout.write(f"::error::[JUnit {cls}.{name}] {esc(msg + chr(10) + body)[:3500]}\n")
+                emitted += 1
+
+for hs in sorted(glob.glob("**/hs_err_pid*.log", recursive=True))[:2]:
+    try:
+        with open(hs, "r", errors="replace") as f:
+            head = "".join(f.readlines()[:35])
+        sys.stdout.write(f"::error::[hs_err {hs}] {esc(head)[:3500]}\n")
+    except Exception:
+        pass
+
+if os.path.isfile(log_path):
+    with open(log_path, "r", errors="replace") as f:
+        lines = [ln.rstrip("\r\n") for ln in f if not ln.startswith("> Task ") and not ln.startswith("> Configure project ")]
+    interesting = [ln for ln in lines if any(k in ln for k in ("FAILED", "Exception", "Error", "Caused by", "What went wrong", "non-zero exit value", "Process "))]
+    summary = "\n".join((interesting[-25:] + ["--- tail ---"] + lines[-25:]))
+    sys.stdout.write(f"::error::[{label}] {esc(summary)[:3800]}\n")
 PY
+    return 0
   fi
-  local hs
-  for hs in hs_err_pid*.log desktop/*/hs_err_pid*.log; do
-    [ -f "$hs" ] || continue
-    while IFS= read -r line; do
-      echo "::error::[hs_err] ${line//$'\r'/}"
-    done < <(head -35 "$hs")
-  done
-  if [ -f "$log" ]; then
-    while IFS= read -r line; do
-      echo "::error::[tail] ${line//$'\r'/}"
-    done < <(tail -20 "$log")
-  fi
+  report_gradle_failure "$label" "$log"
 }
