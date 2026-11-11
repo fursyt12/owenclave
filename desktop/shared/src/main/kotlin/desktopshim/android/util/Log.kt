@@ -25,6 +25,14 @@ object Log {
     var externalSink: ((String) -> Unit)? = null
 
     /**
+     * Eagerly initializes and rotates `logcat.log` for the primary desktop session
+     * so opening the Logcat screen immediately after startup shows a clean current
+     * session instead of reading an unrotated file from disk.
+     */
+    @JvmStatic
+    fun initSession(): File = logFile
+
+    /**
      * Rotates a non-empty `logcat.log` from the previous run to `logcat.prev.log`
      * and starts a fresh `logcat.log` for the current session so stale crashes or
      * errors from earlier sessions do not accumulate indefinitely in the Logcat tab.

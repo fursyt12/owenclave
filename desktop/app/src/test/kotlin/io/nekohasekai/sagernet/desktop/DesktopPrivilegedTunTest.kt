@@ -353,6 +353,11 @@ class DesktopPrivilegedTunTest {
                 Log.e("naive", "[1111/112349.123456:INFO:socks5_server_socket.cc(90)] Connection 1 established")
                 assertTrue(captured.any { it.contains("I/naive:") }, "Expected INFO stderr line to be emitted as I/naive:")
                 assertFalse(captured.any { it.contains("E/naive:") }, "Expected INFO stderr line not to be emitted as E/naive:")
+                val sessionFile = Log.initSession()
+                assertTrue(
+                    sessionFile.absolutePath.contains("test-data"),
+                    "Unit test logs must write to isolated test-data dir, got: ${sessionFile.absolutePath}",
+                )
             } finally {
                 Log.removeListener(listener)
             }
@@ -361,3 +366,4 @@ class DesktopPrivilegedTunTest {
         }
     }
 }
+

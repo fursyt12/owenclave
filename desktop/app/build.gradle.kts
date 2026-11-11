@@ -509,4 +509,13 @@ tasks.configureEach {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    val isolatedTestDataDir = layout.buildDirectory.dir("tmp/test-data").get().asFile
+    doFirst {
+        isolatedTestDataDir.deleteRecursively()
+        isolatedTestDataDir.mkdirs()
+    }
+    systemProperty("owenclave.dataDir", isolatedTestDataDir.absolutePath)
+}
+
 tasks.named("build") { dependsOn(prepareDesktopRuntime) }

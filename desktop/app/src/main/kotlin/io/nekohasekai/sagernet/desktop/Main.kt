@@ -89,6 +89,7 @@ fun main(args: Array<String>) {
         exitProcess(0)
     }
     val instanceHandle = (acquireResult as? SingleInstanceManager.AcquireResult.Primary)?.handle
+    android.util.Log.initSession()
 
     runCatching {
         if (java.awt.Desktop.isDesktopSupported()) {
@@ -233,6 +234,13 @@ private fun loadDesktopAppIcon(): Painter? {
 
 /** Headless entry points used for verification and packaging checks. */
 private fun runCli(args: Array<String>): Int? {
+    if (args.any { it.startsWith("--selftest") } && System.getProperty("owenclave.dataDir").isNullOrBlank()) {
+        val tempDataDir = java.nio.file.Files.createTempDirectory("owenclave-selftest-").toFile()
+        System.setProperty("owenclave.dataDir", tempDataDir.absolutePath)
+        Runtime.getRuntime().addShutdownHook(Thread {
+            runCatching { tempDataDir.deleteRecursively() }
+        })
+    }
     if (args.contains("--version")) {
         println("Owenclave desktop ${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME} (${DesktopRuntime.platformTag})")
         println("data: ${DesktopRuntime.dataDir}")
