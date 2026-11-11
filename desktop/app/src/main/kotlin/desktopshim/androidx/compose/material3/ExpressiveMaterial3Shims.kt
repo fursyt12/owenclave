@@ -1,6 +1,8 @@
 package androidx.compose.material3
 
 import android.content.Context
+import androidx.compose.animation.core.FiniteAnimationSpec
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
@@ -31,9 +33,40 @@ import androidx.graphics.shapes.toPath
 annotation class ExperimentalMaterial3ExpressiveApi
 
 interface MotionScheme {
+    fun <T> defaultSpatialSpec(): FiniteAnimationSpec<T>
+    fun <T> fastSpatialSpec(): FiniteAnimationSpec<T>
+    fun <T> slowSpatialSpec(): FiniteAnimationSpec<T>
+    fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T>
+    fun <T> fastEffectsSpec(): FiniteAnimationSpec<T>
+    fun <T> slowEffectsSpec(): FiniteAnimationSpec<T>
+
     companion object {
-        fun expressive(): MotionScheme = object : MotionScheme {}
-        fun standard(): MotionScheme = object : MotionScheme {}
+        private val StandardImpl = object : MotionScheme {
+            override fun <T> defaultSpatialSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 0.9f, stiffness = 700f)
+            override fun <T> fastSpatialSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 0.9f, stiffness = 1400f)
+            override fun <T> slowSpatialSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 0.9f, stiffness = 300f)
+            override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 1.0f, stiffness = 1600f)
+            override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 1.0f, stiffness = 3800f)
+            override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 1.0f, stiffness = 800f)
+        }
+
+        private val ExpressiveImpl = object : MotionScheme {
+            override fun <T> defaultSpatialSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 0.8f, stiffness = 380f)
+            override fun <T> fastSpatialSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 0.6f, stiffness = 800f)
+            override fun <T> slowSpatialSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 0.8f, stiffness = 200f)
+            override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 1.0f, stiffness = 1600f)
+            override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 1.0f, stiffness = 3800f)
+            override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = spring(dampingRatio = 1.0f, stiffness = 800f)
+        }
+
+        fun standard(): MotionScheme = StandardImpl
+        fun expressive(): MotionScheme = ExpressiveImpl
+
+        @JvmName("standard\$material3")
+        fun standardInternal(): MotionScheme = StandardImpl
+
+        @JvmName("expressive\$material3")
+        fun expressiveInternal(): MotionScheme = ExpressiveImpl
     }
 }
 
@@ -281,15 +314,3 @@ fun ToggleButton(
         )
     }
 }
-
-enum class ExposedDropdownMenuAnchorType {
-    PrimaryNotEditable,
-    PrimaryEditable,
-    SecondaryEditable,
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-fun Modifier.menuAnchor(
-    type: ExposedDropdownMenuAnchorType,
-    enabled: Boolean = true,
-): Modifier = this

@@ -52,6 +52,7 @@ val sharedExcludes = listOf(
     "io/nekohasekai/sagernet/ktx/Utils.kt",
     // Android View/CameraX/ConnectivityManager utils
     "io/nekohasekai/sagernet/utils/ColorUtils.kt",
+    "io/nekohasekai/sagernet/utils/CrashHandler.kt",
     "io/nekohasekai/sagernet/utils/DefaultNetworkListener.kt",
     "io/nekohasekai/sagernet/utils/ZxingQRCodeAnalyzer.kt",
 )

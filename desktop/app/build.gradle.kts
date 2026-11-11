@@ -284,7 +284,7 @@ val prepareWindowsPortable = tasks.register("prepareWindowsPortable") {
                 "--module-path",
                 winJmodsDir.absolutePath,
                 "--add-modules",
-                "java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http,jdk.crypto.ec,jdk.httpserver",
+                "java.base,java.datatransfer,java.xml,java.prefs,java.desktop,java.logging,java.net.http,jdk.crypto.ec,jdk.httpserver,java.sql,java.naming,jdk.unsupported",
                 "--strip-debug",
                 "--no-man-pages",
                 "--no-header-files",
@@ -362,6 +362,8 @@ dependencies {
     implementation(compose.material3)
     @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
     implementation(compose.materialIconsExtended)
+    implementation("androidx.lifecycle:lifecycle-runtime-desktop:2.11.0")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-desktop:2.11.0")
     implementation(libs.kotlinx.coroutines.swing)
     // Clash YAML subscriptions are imported with the same parser as on Android
     implementation(libs.snakeyaml)
@@ -400,7 +402,14 @@ compose.desktop {
             // HttpClient to download subscriptions, so without this the packaged
             // application dies with NoClassDefFoundError as soon as a subscription is
             // fetched - a path that no self test exercised, which is why it shipped.
-            modules("java.net.http", "jdk.crypto.ec", "jdk.httpserver")
+            modules(
+                "java.net.http",
+                "jdk.crypto.ec",
+                "jdk.httpserver",
+                "java.sql",
+                "java.naming",
+                "jdk.unsupported",
+            )
 
             linux {
                 packageName = "owenclave"

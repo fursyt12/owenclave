@@ -139,6 +139,9 @@ private fun runCli(args: Array<String>): Int? {
     if (args.contains("--selftest")) {
         return SelfTest.run()
     }
+    if (args.contains("--selftest-gui")) {
+        return SelfTest.runGui()
+    }
     if (args.contains("--selftest-naive")) {
         return SelfTest.runNaive()
     }

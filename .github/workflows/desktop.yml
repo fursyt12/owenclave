@@ -227,11 +227,11 @@ jobs:
           # NoClassDefFoundError the first time a subscription is fetched
           runtime="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type d -name runtime | head -1)"
           if [ -n "$runtime" ] && [ -f "$runtime/release" ]; then
-            found="$(grep -o 'java.net.http\|jdk.crypto.ec' "$runtime/release" | sort -u | tr '\n' ' ')"
+            found="$(grep -o 'java.net.http\|jdk.crypto.ec\|java.sql\|jdk.unsupported' "$runtime/release" | sort -u | tr '\n' ' ')"
             echo "::notice::jlink runtime modules: $found"
-            for module in java.net.http jdk.crypto.ec; do
+            for module in java.net.http jdk.crypto.ec java.sql jdk.unsupported; do
               if ! grep -q "$module" "$runtime/release"; then
-                echo "::error::the bundled runtime is missing $module, so subscriptions or TLS would fail at runtime"
+                echo "::error::the bundled runtime is missing $module, so subscriptions, DB or TLS would fail at runtime"
                 missing=1
               fi
             done
@@ -251,6 +251,7 @@ jobs:
           echo "launcher: $launcher"
           "$launcher" --version
           "$launcher" --selftest
+          "$launcher" --selftest-gui
       - name: Protocol self tests (bundled core, every protocol family)
         shell: bash
         run: |

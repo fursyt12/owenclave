@@ -415,6 +415,62 @@ object SelfTest {
 
     }
 
+    fun runGui(): Int {
+        return try {
+            io.nekohasekai.sagernet.SagerNet.application
+            androidx.activity.DesktopActivityStack.stack.clear()
+
+            val scene = androidx.compose.ui.ImageComposeScene(width = 1180, height = 780)
+            try {
+                val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
+                scene.setContent {
+                    androidx.activity.DesktopActivityStack.Host(mainActivity)
+                }
+                val initial = scene.render(0L)
+                check(initial.width == 1180 && initial.height == 780)
+                var frameNano = 16_000_000L
+                for (dest in io.nekohasekai.sagernet.ui.compose.NavDestination.entries) {
+                    io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = dest
+                    repeat(3) {
+                        scene.render(frameNano)
+                        frameNano += 16_000_000L
+                    }
+                    println("[selftest-gui] rendered ${dest.name}")
+                }
+            } finally {
+                scene.close()
+            }
+
+            if (!java.awt.GraphicsEnvironment.isHeadless()) {
+                var windowError: Throwable? = null
+                javax.swing.SwingUtilities.invokeAndWait {
+                    var window: androidx.compose.ui.awt.ComposeWindow? = null
+                    try {
+                        androidx.activity.DesktopActivityStack.stack.clear()
+                        window = androidx.compose.ui.awt.ComposeWindow()
+                        window.setSize(1180, 780)
+                        val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
+                        window.setContent {
+                            androidx.activity.DesktopActivityStack.Host(mainActivity)
+                        }
+                        println("[selftest-gui] ComposeWindow initialized")
+                    } catch (t: Throwable) {
+                        windowError = t
+                    } finally {
+                        runCatching { window?.dispose() }
+                    }
+                }
+                windowError?.let { throw it }
+            }
+            println("[selftest-gui] PASSED")
+            0
+        } catch (t: Throwable) {
+            System.err.println("[selftest-gui] FAILED: ${t.message}")
+            t.printStackTrace()
+            1
+        }
+    }
+
     private fun java.io.InputStream.readFully(buffer: ByteArray) {
         var offset = 0
         while (offset < buffer.size) {
