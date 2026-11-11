@@ -339,7 +339,7 @@ class DesktopPrivilegedTun(
             "START\n"
         }
 
-        Thread({
+        val stderrThread = Thread({
             runCatching {
                 BufferedReader(InputStreamReader(process.errorStream, StandardCharsets.UTF_8)).useLines { lines ->
                     lines.forEach { line ->
@@ -348,7 +348,10 @@ class DesktopPrivilegedTun(
                     }
                 }
             }
-        }, "owenclave-tun-stderr").apply { isDaemon = true }.start()
+        }, "owenclave-tun-stderr").apply {
+            isDaemon = true
+            start()
+        }
 
         Thread({
             runCatching {
@@ -395,6 +398,7 @@ class DesktopPrivilegedTun(
         } else {
             process.exitValue()
         }
+        runCatching { stderrThread.join(1_500L) }
         val combinedErr = synchronized(stderrLines) { stderrLines.joinToString("; ") }
 
         if (combinedErr.contains("No authentication agent found", ignoreCase = true)) {
@@ -562,11 +566,14 @@ class DesktopPrivilegedTun(
 
         val proc = launcher.start(command)
         val errHolder = AtomicReference("")
-        Thread({
+        val errThread = Thread({
             runCatching {
                 errHolder.set(proc.errorStream.bufferedReader().use { it.readText() }.trim())
             }
-        }, "owenclave-tun-macos").apply { isDaemon = true }.start()
+        }, "owenclave-tun-macos").apply {
+            isDaemon = true
+            start()
+        }
 
         val deadline = System.currentTimeMillis() + authTimeoutMs
         while (System.currentTimeMillis() < deadline) {
@@ -585,6 +592,7 @@ class DesktopPrivilegedTun(
             }
             if (!proc.isAlive && proc.exitValue() != 0) {
                 keepalive.delete()
+                runCatching { errThread.join(1_500L) }
                 val err = errHolder.get()
                 if (err.contains("User canceled", ignoreCase = true) || err.contains("-128")) {
                     throw TunAuthorizationException("VPN authorization was cancelled")

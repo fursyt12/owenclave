@@ -199,7 +199,10 @@ class DesktopPrivilegedTunTest {
             )
             // Must NOT spawn a second pkexec prompt!
             assertEquals(1, spawnedCommands.size)
-            Thread.sleep(50)
+            val deadline = System.currentTimeMillis() + 2_000L
+            while (!fakeProc!!.receivedLines.contains("ATTACH_CHILDREN") && System.currentTimeMillis() < deadline) {
+                Thread.sleep(15)
+            }
             assertTrue(fakeProc!!.receivedLines.contains("ADD_BYPASS 203.0.113.25"))
             assertTrue(fakeProc!!.receivedLines.contains("ATTACH_CHILDREN"))
 

@@ -248,6 +248,25 @@ private fun loadDesktopAppIcon(): Painter? {
 
 /** Headless entry points used for verification and packaging checks. */
 private fun runCli(args: Array<String>): Int? {
+    val isCliFlag = args.any {
+        it == "--version" ||
+            it == "--daemon" ||
+            it == "--server" ||
+            it == "--print-settings" ||
+            it == "--print-config" ||
+            it.startsWith("--selftest")
+    }
+    if (isCliFlag) {
+        val forceHeadless = !args.contains("--selftest-gui") ||
+            !System.getenv("CI").isNullOrBlank() ||
+            !System.getProperty("owenclave.ci").isNullOrBlank()
+        if (forceHeadless && System.getProperty("java.awt.headless").isNullOrBlank()) {
+            System.setProperty("java.awt.headless", "true")
+        }
+        if (System.getProperty("apple.awt.UIElement").isNullOrBlank()) {
+            System.setProperty("apple.awt.UIElement", "true")
+        }
+    }
     if (args.any { it.startsWith("--selftest") } && System.getProperty("owenclave.dataDir").isNullOrBlank()) {
         val tempDataDir = java.nio.file.Files.createTempDirectory("owenclave-selftest-").toFile()
         System.setProperty("owenclave.dataDir", tempDataDir.absolutePath)

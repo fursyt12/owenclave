@@ -149,7 +149,15 @@ jobs:
           ls -la desktop/arch/dist
       - name: Unit tests (importers + config builder)
         shell: bash
-        run: ./gradlew :desktop:app:test :desktop:shared:test --console=plain
+        run: |
+          set -uo pipefail
+          source bin/desktop/ci-report.sh
+          if ! ./gradlew :desktop:app:test :desktop:shared:test --console=plain > /tmp/unit-tests.log 2>&1; then
+            cat /tmp/unit-tests.log
+            report_test_failures "Unit tests" /tmp/unit-tests.log
+            exit 1
+          fi
+          cat /tmp/unit-tests.log
       - name: macOS jpackage probe
         if: runner.os == 'macOS'
         shell: bash
@@ -258,13 +266,19 @@ jobs:
       - name: Packaged self test (bundled core tunnel)
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          source bin/desktop/ci-report.sh
           if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
           launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
           echo "launcher: $launcher"
-          "$launcher" --version
-          "$launcher" --selftest
-          "$launcher" --selftest-gui
+          for flag in --version --selftest --selftest-gui; do
+            if ! "$launcher" "$flag" > "/tmp/selftest${flag}.log" 2>&1; then
+              cat "/tmp/selftest${flag}.log"
+              report_test_failures "Packaged self test ($flag)" "/tmp/selftest${flag}.log"
+              exit 1
+            fi
+            cat "/tmp/selftest${flag}.log"
+          done
       - name: Protocol self tests (bundled core, every protocol family)
         shell: bash
         run: |

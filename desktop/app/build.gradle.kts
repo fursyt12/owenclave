@@ -510,6 +510,9 @@ tasks.configureEach {
 }
 
 tasks.withType<Test>().configureEach {
+    maxHeapSize = "2g"
+    systemProperty("java.awt.headless", "true")
+    systemProperty("apple.awt.UIElement", "true")
     val isolatedTestDataDir = layout.buildDirectory.dir("tmp/test-data").get().asFile
     doFirst {
         isolatedTestDataDir.deleteRecursively()

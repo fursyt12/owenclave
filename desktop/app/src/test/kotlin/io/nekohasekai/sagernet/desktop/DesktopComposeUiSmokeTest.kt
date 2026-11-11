@@ -1,6 +1,10 @@
 package io.nekohasekai.sagernet.desktop
 
 import androidx.activity.DesktopActivityStack
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.ImageComposeScene
 import androidx.compose.ui.awt.ComposeWindow
 import io.nekohasekai.sagernet.SagerNet
@@ -45,15 +49,16 @@ class DesktopComposeUiSmokeTest {
                 mainScene.setContent {
                     DesktopActivityStack.Host(mainActivity)
                 }
-                val initialImg = mainScene.render(0L)
-                assertTrue(initialImg.width == 1180 && initialImg.height == 780)
+                mainScene.render(0L).use { initialImg ->
+                    assertTrue(initialImg.width == 1180 && initialImg.height == 780)
+                }
                 yield()
 
                 var frameNano = 250_000_000L
                 for (dest in NavDestination.entries) {
                     PendingDeepLink.pendingDestination.value = dest
                     repeat(3) {
-                        mainScene.render(frameNano)
+                        mainScene.render(frameNano).close()
                         frameNano += 250_000_000L
                         yield()
                     }
@@ -67,7 +72,7 @@ class DesktopComposeUiSmokeTest {
                 mainActivity.onNewIntent(subIntent)
                 android.widget.Toast.makeText(mainActivity, "Deep link received", android.widget.Toast.LENGTH_SHORT).show()
                 repeat(4) {
-                    mainScene.render(frameNano)
+                    mainScene.render(frameNano).close()
                     frameNano += 250_000_000L
                     yield()
                 }
@@ -86,8 +91,9 @@ class DesktopComposeUiSmokeTest {
                 compactScene.setContent {
                     DesktopActivityStack.Host(mainActivity)
                 }
-                val compactImg = compactScene.render(0L)
-                assertTrue(compactImg.width == 412 && compactImg.height == 892)
+                compactScene.render(0L).use { compactImg ->
+                    assertTrue(compactImg.width == 412 && compactImg.height == 892)
+                }
                 yield()
             } finally {
                 teardownStack()
@@ -122,11 +128,13 @@ class DesktopComposeUiSmokeTest {
                 ProxyEntity.TYPE_BALANCER to ProfileFieldState(),
             )
 
-            for ((type, initial) in allTypes) {
-                val editorScene = ImageComposeScene(width = 1000, height = 1600, coroutineContext = Dispatchers.Main)
-                try {
-                    editorScene.setContent {
-                        OwenclaveTheme(themeId = 0, nightTheme = 1) {
+            val editorScene = ImageComposeScene(width = 1000, height = 1600, coroutineContext = Dispatchers.Main)
+            try {
+                var activeIndex by mutableIntStateOf(0)
+                editorScene.setContent {
+                    val (type, initial) = allTypes[activeIndex]
+                    OwenclaveTheme(themeId = 0, nightTheme = 1) {
+                        key(activeIndex) {
                             UniversalProfileSettingsScreen(
                                 profileType = type,
                                 initialState = initial,
@@ -135,13 +143,19 @@ class DesktopComposeUiSmokeTest {
                             )
                         }
                     }
-                    val img = editorScene.render(0L)
-                    assertTrue(img.width == 1000)
-                    yield()
-                } finally {
-                    yield()
-                    editorScene.close()
                 }
+                var editorFrameNano = 0L
+                for (index in allTypes.indices) {
+                    activeIndex = index
+                    editorScene.render(editorFrameNano).use { img ->
+                        assertTrue(img.width == 1000)
+                    }
+                    editorFrameNano += 250_000_000L
+                    yield()
+                }
+            } finally {
+                yield()
+                editorScene.close()
             }
         }
 

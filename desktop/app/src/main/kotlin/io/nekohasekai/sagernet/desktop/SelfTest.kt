@@ -444,15 +444,16 @@ object SelfTest {
                         scene.setContent {
                             androidx.activity.DesktopActivityStack.Host(mainActivity)
                         }
-                        val initial = scene.render(0L)
-                        check(initial.width == w && initial.height == h)
+                        scene.render(0L).use { initial ->
+                            check(initial.width == w && initial.height == h)
+                        }
                         kotlinx.coroutines.yield()
 
                         var frameNano = 250_000_000L
                         for (dest in io.nekohasekai.sagernet.ui.compose.NavDestination.entries) {
                             io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = dest
                             repeat(3) {
-                                scene.render(frameNano)
+                                scene.render(frameNano).close()
                                 frameNano += 250_000_000L
                                 kotlinx.coroutines.yield()
                             }
@@ -465,7 +466,7 @@ object SelfTest {
                         )
                         mainActivity.onNewIntent(deepIntent)
                         repeat(4) {
-                            scene.render(frameNano)
+                            scene.render(frameNano).close()
                             frameNano += 250_000_000L
                             kotlinx.coroutines.yield()
                         }
