@@ -286,6 +286,7 @@ object MihomoYamlSupport {
         cacheDir: File,
         configBaseDir: File? = null,
         socksPort: Int? = null,
+        profilesByName: Map<String, Profile> = emptyMap(),
         log: (String) -> Unit = {},
     ): List<RoutingRule> {
         if (rawRules.isEmpty()) return emptyList()
@@ -298,6 +299,17 @@ object MihomoYamlSupport {
                 resolveProviderMatchers(spec, cacheDir, configBaseDir, socksPort, log)
             }
         }
+        fun effectiveTargetTag(targetName: String): String? {
+            val target = resolveRuleTarget(targetName, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns)
+                ?: return null
+            if (target == RuleTarget.PROXY && profilesByName.isNotEmpty()) {
+                val resolvedProfile = resolveSelectedProfile(targetName, profilesByName, groupsByName, groupSelections)
+                if (resolvedProfile != null) {
+                    return "profile:${resolvedProfile.id}"
+                }
+            }
+            return target.tag
+        }
         val compiled = ArrayList<RoutingRule>()
 
         for ((index, line) in rawRules.withIndex()) {
@@ -305,11 +317,7 @@ object MihomoYamlSupport {
                 parseAndRule(
                     line,
                     index,
-                    groupsByName,
-                    groupSelections,
-                    virtualDirect,
-                    virtualReject,
-                    virtualDns,
+                    ::effectiveTargetTag,
                     ::providerMatchersFor,
                 )?.let { compiled += it }
                 continue
@@ -320,15 +328,15 @@ object MihomoYamlSupport {
             val type = parts[0].uppercase()
 
             if (type == "MATCH" || type == "FINAL") {
-                val target = resolveRuleTarget(parts[1], groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns)
-                    ?: continue
-                // Default outbound is already proxy in Rule mode; emit explicit catch-all only if DIRECT or BLOCK.
-                if (target != RuleTarget.PROXY) {
+                val targetTag = effectiveTargetTag(parts[1]) ?: continue
+                // Default outbound is already active profile in Rule mode; emit explicit catch-all
+                // when DIRECT, BLOCK, or a specific non-default profile is targeted.
+                if (targetTag != RuleTarget.PROXY.tag) {
                     compiled += RoutingRule(
                         id = "mihomo-match-$index",
                         name = "[Mihomo] MATCH -> ${parts[1]}",
                         network = "tcp,udp",
-                        target = target.tag,
+                        target = targetTag,
                     )
                 }
                 continue
@@ -337,12 +345,11 @@ object MihomoYamlSupport {
             if (parts.size < 3) continue
             val value = parts[1]
             val targetName = parts[2]
-            val target = resolveRuleTarget(targetName, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns)
-                ?: continue
+            val targetTag = effectiveTargetTag(targetName) ?: continue
 
             when (type) {
                 "DOMAIN" -> translateDomainEntry(value, "domain")?.let { d ->
-                    compiled += RoutingRule(id = "mihomo-$index", name = "[Mihomo] $type,$value", domains = d, target = target.tag)
+                    compiled += RoutingRule(id = "mihomo-$index", name = "[Mihomo] $type,$value", domains = d, target = targetTag)
                 }
                 "DOMAIN-SUFFIX" -> {
                     val clean = value.trimStart('.')
@@ -351,7 +358,7 @@ object MihomoYamlSupport {
                             id = "mihomo-$index",
                             name = "[Mihomo] $type,$value",
                             domains = "domain:$clean",
-                            target = target.tag,
+                            target = targetTag,
                         )
                     }
                 }
@@ -360,7 +367,7 @@ object MihomoYamlSupport {
                         id = "mihomo-$index",
                         name = "[Mihomo] $type,$value",
                         domains = "keyword:$value",
-                        target = target.tag,
+                        target = targetTag,
                     )
                 }
                 "DOMAIN-REGEX" -> if (value.isNotEmpty()) {
@@ -368,7 +375,7 @@ object MihomoYamlSupport {
                         id = "mihomo-$index",
                         name = "[Mihomo] $type,$value",
                         domains = "regexp:$value",
-                        target = target.tag,
+                        target = targetTag,
                     )
                 }
                 "GEOSITE" -> normalizeGeosite(value)?.let { gs ->
@@ -376,7 +383,7 @@ object MihomoYamlSupport {
                         id = "mihomo-$index",
                         name = "[Mihomo] GEOSITE,$value",
                         domains = gs,
-                        target = target.tag,
+                        target = targetTag,
                     )
                 }
                 "IP-CIDR", "IP-CIDR6" -> if (value.isNotEmpty()) {
@@ -384,7 +391,7 @@ object MihomoYamlSupport {
                         id = "mihomo-$index",
                         name = "[Mihomo] $type,$value",
                         ip = value,
-                        target = target.tag,
+                        target = targetTag,
                     )
                 }
                 "GEOIP" -> {
@@ -394,7 +401,7 @@ object MihomoYamlSupport {
                             id = "mihomo-$index",
                             name = "[Mihomo] GEOIP,$value",
                             ip = ips.joinToString("\n"),
-                            target = target.tag,
+                            target = targetTag,
                         )
                     }
                 }
@@ -403,7 +410,7 @@ object MihomoYamlSupport {
                         id = "mihomo-$index",
                         name = "[Mihomo] DST-PORT,$value",
                         port = p,
-                        target = target.tag,
+                        target = targetTag,
                     )
                 }
                 "NETWORK" -> {
@@ -413,7 +420,7 @@ object MihomoYamlSupport {
                             id = "mihomo-$index",
                             name = "[Mihomo] NETWORK,$value",
                             network = net,
-                            target = target.tag,
+                            target = targetTag,
                         )
                     }
                 }
@@ -424,7 +431,7 @@ object MihomoYamlSupport {
                             id = "mihomo-$index-d",
                             name = "[Mihomo] RULE-SET,$value (domains)",
                             domains = matchers.domains.joinToString("\n"),
-                            target = target.tag,
+                            target = targetTag,
                         )
                     }
                     if (matchers.ips.isNotEmpty()) {
@@ -432,7 +439,7 @@ object MihomoYamlSupport {
                             id = "mihomo-$index-ip",
                             name = "[Mihomo] RULE-SET,$value (ip)",
                             ip = matchers.ips.joinToString("\n"),
-                            target = target.tag,
+                            target = targetTag,
                         )
                     }
                     matchers.classicalRules.forEachIndexed { subIdx, subRule ->
@@ -444,7 +451,7 @@ object MihomoYamlSupport {
                             port = subRule.port,
                             network = subRule.network,
                             protocol = subRule.protocol,
-                            target = target.tag,
+                            target = targetTag,
                         )
                     }
                 }
@@ -533,10 +540,7 @@ object MihomoYamlSupport {
                         parseAndRule(
                             line = "$entry,PROXY",
                             index = classical.size,
-                            groupsByName = emptyMap(),
-                            groupSelections = emptyMap(),
-                            virtualDirect = emptySet(),
-                            virtualReject = emptySet(),
+                            effectiveTargetTag = { RuleTarget.PROXY.tag },
                         )?.let { classical += it }
                         continue
                     }
@@ -688,18 +692,13 @@ object MihomoYamlSupport {
     private fun parseAndRule(
         line: String,
         index: Int,
-        groupsByName: Map<String, ProxyGroupSpec>,
-        groupSelections: Map<String, String>,
-        virtualDirect: Set<String>,
-        virtualReject: Set<String>,
-        virtualDns: Set<String> = emptySet(),
+        effectiveTargetTag: (String) -> String?,
         providerLookup: (String) -> ProviderMatchers? = { null },
     ): RoutingRule? {
         val lastComma = line.lastIndexOf(',')
         if (lastComma <= 4) return null
         val targetName = line.substring(lastComma + 1).trim()
-        val target = resolveRuleTarget(targetName, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns)
-            ?: return null
+        val targetTag = effectiveTargetTag(targetName) ?: return null
         val body = line.substring(4, lastComma).trim()
         if (!body.startsWith("(") || !body.endsWith(")")) return null
 
@@ -752,7 +751,7 @@ object MihomoYamlSupport {
             ip = ips.joinToString("\n"),
             port = port,
             network = network,
-            target = target.tag,
+            target = targetTag,
         )
         return rule.takeIf { it.hasMatchers }
     }

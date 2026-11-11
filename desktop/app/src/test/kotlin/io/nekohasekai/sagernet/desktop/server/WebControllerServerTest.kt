@@ -353,4 +353,120 @@ class WebControllerServerTest {
         }
     }
 
+    @Test
+    fun `default owenclave UA and naive-extra clash yaml support multi-outbound routing`() {
+        val tmpDir = Files.createTempDirectory("owenclave-naive-extra-test").toFile()
+        try {
+            val defaultCfg = DaemonConfig.load(
+                args = arrayOf("--data-dir", tmpDir.absolutePath),
+                env = emptyMap(),
+            )
+            assertTrue(
+                defaultCfg.subscriptionUserAgent.matches(Regex("^Owenclave/.*$", RegexOption.IGNORE_CASE)),
+                "Expected default UA to start with Owenclave/, got: ${defaultCfg.subscriptionUserAgent}",
+            )
+
+            val yaml = """
+                proxies:
+                  - name: Direct-RU
+                    type: direct
+                  - name: NL-Hy2
+                    type: hysteria2
+                    server: nl.example.com
+                    port: 443
+                    password: secret
+                    sni: nl.example.com
+                  - name: naive-extra-0
+                    type: naive
+                    server: frank.example.com
+                    port: 443
+                    proto: https
+                    username: demo_user
+                    password: demo_password
+                proxy-groups:
+                  - name: Blocked
+                    type: select
+                    proxies:
+                      - Any-Available
+                      - Direct-RU
+                      - NL-Hy2
+                  - name: YouTube
+                    type: select
+                    proxies:
+                      - NL-Hy2
+                      - naive-extra-0
+                  - name: PROXY
+                    type: select
+                    proxies:
+                      - Blocked
+                      - NL-Hy2
+                      - naive-extra-0
+                  - name: Any-Available
+                    type: fallback
+                    proxies:
+                      - NL-Hy2
+                      - naive-extra-0
+                rules:
+                  - GEOSITE,youtube,YouTube
+                  - DOMAIN-SUFFIX,openai.com,Blocked
+                  - MATCH,PROXY
+            """.trimIndent()
+
+            val doc = MihomoYamlSupport.parseDocument(yaml)
+            assertNotNull(doc)
+            assertEquals(listOf("NL-Hy2", "naive-extra-0"), doc.profiles.map { it.displayName })
+            val naiveProfile = doc.profiles.first { it.displayName == "naive-extra-0" }
+            assertEquals("Naive", naiveProfile.protocolName)
+
+            val profilesByName = doc.profiles.associateBy { it.displayName }
+            val groupsByName = doc.groups.associateBy { it.name }
+            // Switch nested group Any-Available -> naive-extra-0 while YouTube stays on NL-Hy2
+            val selections = mapOf("Any-Available" to "naive-extra-0", "YouTube" to "NL-Hy2")
+
+            val rootProfile = MihomoYamlSupport.resolveSelectedProfile("PROXY", profilesByName, groupsByName, selections)
+            assertNotNull(rootProfile)
+            assertEquals("naive-extra-0", rootProfile.displayName)
+
+            val compiled = MihomoYamlSupport.compileRules(
+                rawRules = doc.rawRules,
+                ruleProviders = doc.ruleProviders,
+                groupsByName = groupsByName,
+                groupSelections = selections,
+                virtualDirect = doc.virtualDirectNames,
+                virtualReject = doc.virtualRejectNames,
+                virtualDns = doc.virtualDnsNames,
+                cacheDir = File(tmpDir, "rules"),
+                profilesByName = profilesByName,
+            )
+            val ytRule = compiled.first { it.name.contains("GEOSITE,youtube") }
+            val nlProfile = doc.profiles.first { it.displayName == "NL-Hy2" }
+            assertEquals("profile:${nlProfile.id}", ytRule.target)
+
+            // Build core config with naive-extra-0 as primary and NL-Hy2 as extra profile:
+            // NaiveProxy must appear in ExternalPlugins AND core JSON must pass `owenclave-core test`!
+            val built = DesktopConfigBuilder.build(
+                profile = naiveProfile,
+                settings = DesktopSettings(socksPort = 22080, httpPort = 29080),
+                rules = compiled,
+                extraProfiles = doc.profiles,
+            )
+            assertEquals(1, built.plugins.size, "Expected NaiveProxy external plugin to be scheduled")
+            assertTrue(built.json.contains("hysteria2"), "Expected secondary Hysteria2 outbound in core JSON")
+
+            val coreBin = DesktopRuntime.coreBinary()
+            if (coreBin != null) {
+                val cfgFile = File(tmpDir, "core-multi.json").apply { writeText(built.json) }
+                val pb = ProcessBuilder(coreBin.absolutePath, "test", "-c", cfgFile.absolutePath)
+                    .redirectErrorStream(true)
+                DesktopRuntime.assetDir()?.let { pb.environment()["V2RAY_LOCATION_ASSET"] = it.absolutePath }
+                val proc = pb.start()
+                val output = proc.inputStream.bufferedReader().readText()
+                assertTrue(proc.waitFor(15, TimeUnit.SECONDS))
+                assertEquals(0, proc.exitValue(), "core test failed:\n$output")
+            }
+        } finally {
+            tmpDir.deleteRecursively()
+        }
+    }
+
 }

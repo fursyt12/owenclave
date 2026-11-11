@@ -32,7 +32,7 @@ data class DaemonConfig(
     var ipv6: Boolean = true,
     val externalController: String = "0.0.0.0:9090",
     val secret: String = "",
-    val subscriptionUserAgent: String = "Mihomo/1.19 Owenclave/${BuildConfig.VERSION_NAME}",
+    val subscriptionUserAgent: String = "Owenclave/${BuildConfig.VERSION_NAME}",
     val autoUpdateMinutes: Int = 60,
     val seedSubscriptions: List<DaemonSubscriptionSeed> = emptyList(),
     val rawConfigText: String? = null,
@@ -159,7 +159,7 @@ data class DaemonConfig(
 
             val defaultUa = env["SUBSCRIPTION_USER_AGENT"]?.takeIf { it.isNotBlank() }
                 ?: yamlStr("global-ua", "subscription-user-agent")
-                ?: "Mihomo/1.19 Owenclave/${BuildConfig.VERSION_NAME}"
+                ?: "Owenclave/${BuildConfig.VERSION_NAME}"
 
             val autoUpdateMinutes = env["AUTO_UPDATE_MINUTES"]?.toIntOrNull()
                 ?: yamlInt("auto-update-minutes")

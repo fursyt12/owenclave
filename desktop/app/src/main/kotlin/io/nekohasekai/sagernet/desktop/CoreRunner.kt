@@ -53,6 +53,7 @@ class CoreRunner(
         rules: List<RoutingRule> = emptyList(),
         bindInterfaceOverride: String? = null,
         serverInbounds: ServerInboundOptions? = null,
+        extraProfiles: List<Profile> = emptyList(),
     ) {
         stop()
         this.settings = settings
@@ -60,7 +61,14 @@ class CoreRunner(
 
         val tunInterface = if (settings.tunEnabled) TunSession.primaryInterface() else null
         val outboundInterface = bindInterfaceOverride?.takeIf { it.isNotBlank() } ?: tunInterface
-        val config = DesktopConfigBuilder.build(profile, settings, rules, outboundInterface, serverInbounds)
+        val config = DesktopConfigBuilder.build(
+            profile,
+            settings,
+            rules,
+            outboundInterface,
+            serverInbounds,
+            extraProfiles,
+        )
 
         // External engines have to be listening before the core tries to dial
         // into their local SOCKS inbound.

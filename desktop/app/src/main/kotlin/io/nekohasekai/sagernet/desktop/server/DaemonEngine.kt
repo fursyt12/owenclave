@@ -388,15 +388,25 @@ class DaemonEngine(val config: DaemonConfig) {
                 }
             }
         } else {
-            // If this is the main proxy group or points to a concrete profile, update active profile too
-            val resolved = MihomoYamlSupport.resolveSelectedProfile(
+            // Re-resolve the root selector group (walking nested groups like
+            // PROXY -> 🚫 Недоступные сайты -> 🎲 Любой доступный сервер -> naive-extra-0)
+            // so switching any group in the active chain updates the default active profile too.
+            val rootGroupName = views.firstOrNull { it.name.equals("PROXY", ignoreCase = true) }?.name
+                ?: views.firstOrNull { it.name != "GLOBAL" }?.name
+                ?: groupName
+            val resolvedRoot = MihomoYamlSupport.resolveSelectedProfile(
+                rootGroupName,
+                profilesByName,
+                merged.groupsByName,
+                groupSelections,
+            ) ?: MihomoYamlSupport.resolveSelectedProfile(
                 choice,
                 profilesByName,
                 merged.groupsByName,
                 groupSelections,
             )
-            if (resolved != null && (groupName.equals("PROXY", ignoreCase = true) || group === views.firstOrNull { it.name != "GLOBAL" })) {
-                selectedProfileId = resolved.id
+            if (resolvedRoot != null) {
+                selectedProfileId = resolvedRoot.id
             }
         }
         persistStateLocked()
@@ -686,6 +696,7 @@ class DaemonEngine(val config: DaemonConfig) {
             bindAddress = config.effectiveListenAddress(),
             tproxyPort = requestedTproxy,
         )
+        val allProfiles = allProfilesLocked()
         val outIface = config.interfaceName.takeIf { it.isNotBlank() }
 
         try {
@@ -695,6 +706,7 @@ class DaemonEngine(val config: DaemonConfig) {
                 rules = compiledRules,
                 bindInterfaceOverride = outIface,
                 serverInbounds = inbounds,
+                extraProfiles = allProfiles,
             )
             recordLog(
                 "info",
@@ -718,6 +730,7 @@ class DaemonEngine(val config: DaemonConfig) {
                     rules = compiledRules,
                     bindInterfaceOverride = outIface,
                     serverInbounds = inbounds.copy(tproxyPort = null),
+                    extraProfiles = allProfiles,
                 )
             } else {
                 recordLog("error", "failed to start core: ${e.message}")
@@ -777,6 +790,7 @@ class DaemonEngine(val config: DaemonConfig) {
         userRules.filter { it.enabled && it.hasMatchers }.forEach { rules += it }
         val merged = mergedMihomoContextLocked()
         if (merged.rawRules.isNotEmpty()) {
+            val profilesByName = allProfilesLocked().associateBy { it.displayName }
             rules += MihomoYamlSupport.compileRules(
                 rawRules = merged.rawRules,
                 ruleProviders = merged.ruleProviders,
@@ -788,6 +802,7 @@ class DaemonEngine(val config: DaemonConfig) {
                 cacheDir = ruleCacheDir,
                 configBaseDir = config.configFile?.parentFile,
                 socksPort = null,
+                profilesByName = profilesByName,
                 log = { msg -> recordLog("info", msg) },
             )
         }

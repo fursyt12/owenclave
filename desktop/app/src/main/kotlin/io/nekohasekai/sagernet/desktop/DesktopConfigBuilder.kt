@@ -108,6 +108,7 @@ object DesktopConfigBuilder {
         rules: List<RoutingRule> = emptyList(),
         bindInterface: String? = null,
         serverInbounds: ServerInboundOptions? = null,
+        extraProfiles: List<Profile> = emptyList(),
     ): CoreConfig {
         val bean = profile.bean
         if (bean == null) {
@@ -121,9 +122,11 @@ object DesktopConfigBuilder {
         if (!supports(bean)) throw UnsupportedProfileException(unsupportedReason(bean))
 
         applySettings(settings)
-        installRules(rules, settings.bypassPrivateNetworks)
+        val primaryId = entityIdOf(profile.id)
+        val extraEntityIds = registerExtraProfiles(profile.id, primaryId, extraProfiles)
+        installRules(rules, settings.bypassPrivateNetworks, profile.id, extraEntityIds)
 
-        val entity = ProxyEntity(id = profile.id.hashCode().toLong(), groupId = 0L).putBean(bean)
+        val entity = ProxyEntity(id = primaryId, groupId = 0L).putBean(bean)
         val result = buildV2RayConfig(entity)
 
         val direct = settings.routeMode == DesktopSettings.ROUTE_DIRECT
@@ -144,11 +147,39 @@ object DesktopConfigBuilder {
                 result.config,
                 settings,
                 bindInterface,
-                result.outboundTagsCurrent.toSet(),
+                (result.outboundTagsCurrent + result.outboundTags).toSet(),
                 serverInbounds,
             ),
             plugins,
         )
+    }
+
+    internal fun entityIdOf(profileId: String): Long =
+        (profileId.hashCode().toLong() and 0x7FFF_FFFFL) + 100L
+
+    private fun registerExtraProfiles(
+        primaryProfileId: String,
+        primaryEntityId: Long,
+        extraProfiles: List<Profile>,
+    ): Map<String, Long> {
+        if (extraProfiles.isEmpty()) return emptyMap()
+        val ids = LinkedHashMap<String, Long>()
+        val used = HashSet<Long>().apply { add(primaryEntityId) }
+        val entities = ArrayList<ProxyEntity>()
+        for (extra in extraProfiles) {
+            if (extra.id == primaryProfileId) continue
+            val extraBean = extra.bean ?: continue
+            var candidate = entityIdOf(extra.id)
+            while (!used.add(candidate)) {
+                candidate++
+            }
+            ids[extra.id] = candidate
+            entities += ProxyEntity(id = candidate, groupId = 0L).putBean(extraBean)
+        }
+        if (entities.isNotEmpty()) {
+            SagerDatabase.proxyDao.updateProxy(entities)
+        }
+        return ids
     }
 
     // ------------------------------------------------------------------ settings
@@ -295,9 +326,23 @@ object DesktopConfigBuilder {
      * and the private-network bypass is appended last exactly like the old
      * desktop builder did.
      */
-    private fun installRules(rules: List<RoutingRule>, bypassPrivateNetworks: Boolean) {
+    private fun installRules(
+        rules: List<RoutingRule>,
+        bypassPrivateNetworks: Boolean,
+        primaryProfileId: String = "",
+        extraEntityIds: Map<String, Long> = emptyMap(),
+    ) {
         val entities = ArrayList<RuleEntity>()
         rules.forEachIndexed { index, rule ->
+            val resolvedOutbound = when {
+                rule.target == RuleTarget.DIRECT.tag -> -1L
+                rule.target == RuleTarget.BLOCK.tag -> -2L
+                rule.target.startsWith("profile:") -> {
+                    val targetProfileId = rule.target.removePrefix("profile:")
+                    if (targetProfileId == primaryProfileId) 0L else (extraEntityIds[targetProfileId] ?: 0L)
+                }
+                else -> 0L
+            }
             entities += RuleEntity(
                 id = index.toLong() + 1,
                 name = rule.name,
@@ -308,11 +353,7 @@ object DesktopConfigBuilder {
                 port = rule.port,
                 network = rule.network,
                 protocol = rule.protocol,
-                outbound = when (rule.target) {
-                    RuleTarget.DIRECT.tag -> -1L
-                    RuleTarget.BLOCK.tag -> -2L
-                    else -> 0L
-                },
+                outbound = resolvedOutbound,
             )
         }
         if (bypassPrivateNetworks) {
