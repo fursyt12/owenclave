@@ -195,7 +195,8 @@ switch or the per-subscription switch is on.
 
 ### Differences compared to Android
 
-* the default desktop window runs the shared Android Compose screens (`ComposeMainActivity` and `UniversalProfileSettingsScreen`) directly; pass `--legacy-ui` for the compact five-tab desktop layout;
+* the default desktop window runs the shared Android Compose screens (`ComposeMainActivity` and `UniversalProfileSettingsScreen`) directly with all seven bottom navigation tabs (`Configuration`, `Groups`, `Settings`, `Route`, `Logcat`, `Traffic`, `Tools`) visible side-by-side on desktop widths; pass `--legacy-ui` for the compact five-tab desktop layout;
+* `owenclave://`, `owenkey://`, `happ://` and proxy share-link URIs (`vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://`, `naive+https://`, ...) are registered with the OS on Linux (`xdg-mime` / `.desktop`), Windows (`HKCU\Software\Classes`) and macOS (`CFBundleURLTypes` + `OpenURIHandler`) and forwarded over a loopback single-instance socket to an already-open Owenclave window;
 * rules have no Android package-UID or Wi-Fi SSID matching; Linux per-app routing is a
   separate cgroup v2 include list (see [Per-app routing](#per-app-routing-linux));
 * camera QR scanning is Android-only (use clipboard/file/share-link import on desktop).

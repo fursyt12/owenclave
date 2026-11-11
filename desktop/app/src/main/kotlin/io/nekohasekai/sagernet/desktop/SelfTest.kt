@@ -420,25 +420,40 @@ object SelfTest {
             io.nekohasekai.sagernet.SagerNet.application
             androidx.activity.DesktopActivityStack.stack.clear()
 
-            val scene = androidx.compose.ui.ImageComposeScene(width = 1180, height = 780)
-            try {
-                val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
-                scene.setContent {
-                    androidx.activity.DesktopActivityStack.Host(mainActivity)
-                }
-                val initial = scene.render(0L)
-                check(initial.width == 1180 && initial.height == 780)
-                var frameNano = 16_000_000L
-                for (dest in io.nekohasekai.sagernet.ui.compose.NavDestination.entries) {
-                    io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = dest
-                    repeat(3) {
+            for ((w, h) in listOf(1180 to 780, 412 to 892)) {
+                val scene = androidx.compose.ui.ImageComposeScene(width = w, height = h)
+                try {
+                    androidx.activity.DesktopActivityStack.stack.clear()
+                    val mainActivity = io.nekohasekai.sagernet.ui.compose.ComposeMainActivity()
+                    scene.setContent {
+                        androidx.activity.DesktopActivityStack.Host(mainActivity)
+                    }
+                    val initial = scene.render(0L)
+                    check(initial.width == w && initial.height == h)
+                    var frameNano = 16_000_000L
+                    for (dest in io.nekohasekai.sagernet.ui.compose.NavDestination.entries) {
+                        io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = dest
+                        repeat(3) {
+                            scene.render(frameNano)
+                            frameNano += 16_000_000L
+                        }
+                        println("[selftest-gui] rendered ${dest.name} (${w}x${h})")
+                    }
+                    // Verify owenclave:// deep link -> GroupScreen subscription dialog
+                    val deepIntent = android.content.Intent(
+                        android.content.Intent.ACTION_VIEW,
+                        android.net.Uri.parse("owenclave://add-subscription?url=https%3A%2F%2Fexample.com%2Fsub&hwid=1"),
+                    )
+                    mainActivity.onNewIntent(deepIntent)
+                    repeat(4) {
                         scene.render(frameNano)
                         frameNano += 16_000_000L
                     }
-                    println("[selftest-gui] rendered ${dest.name}")
+                    io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingSubscriptionAdd.value = null
+                    io.nekohasekai.sagernet.ui.compose.PendingDeepLink.pendingDestination.value = null
+                } finally {
+                    scene.close()
                 }
-            } finally {
-                scene.close()
             }
 
             if (!java.awt.GraphicsEnvironment.isHeadless()) {

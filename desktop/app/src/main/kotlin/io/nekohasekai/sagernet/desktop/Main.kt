@@ -48,6 +48,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -69,6 +72,40 @@ import kotlin.system.exitProcess
 
 fun main(args: Array<String>) {
     runCli(args)?.let { code -> exitProcess(code) }
+
+    val initialDeepLinks = DeepLinks.extractDeepLinks(args)
+    val pendingDeepLinks = java.util.concurrent.ConcurrentLinkedQueue<String>(initialDeepLinks)
+    var onIncomingDeepLinks: (() -> Unit)? = null
+
+    val acquireResult = SingleInstanceManager.acquireOrForward(
+        dataDir = DesktopRuntime.dataDir,
+        uris = initialDeepLinks,
+        onActivate = { remoteUris ->
+            remoteUris.forEach { pendingDeepLinks.add(it) }
+            onIncomingDeepLinks?.invoke()
+        },
+    )
+    if (acquireResult is SingleInstanceManager.AcquireResult.ForwardedToPrimary) {
+        exitProcess(0)
+    }
+    val instanceHandle = (acquireResult as? SingleInstanceManager.AcquireResult.Primary)?.handle
+
+    runCatching {
+        if (java.awt.Desktop.isDesktopSupported()) {
+            val awtDesktop = java.awt.Desktop.getDesktop()
+            if (awtDesktop.isSupported(java.awt.Desktop.Action.APP_OPEN_URI)) {
+                awtDesktop.setOpenURIHandler { event ->
+                    val uriStr = event.uri?.toString()?.trim()
+                    if (!uriStr.isNullOrEmpty()) {
+                        pendingDeepLinks.add(uriStr)
+                        onIncomingDeepLinks?.invoke()
+                    }
+                }
+            }
+        }
+    }
+
+    UrlSchemeRegistrar.ensureRegisteredAsync()
 
     // Ensure the shared Android application singleton & libexclavecore JNI runtime are initialized.
     io.nekohasekai.sagernet.SagerNet.application
@@ -93,6 +130,7 @@ fun main(args: Array<String>) {
         runCatching { systemProxy.restore() }
     }
     Runtime.getRuntime().addShutdownHook(Thread {
+        runCatching { instanceHandle?.close() }
         runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
         runCatching { systemProxy.restore() }
     })
@@ -103,24 +141,70 @@ fun main(args: Array<String>) {
     application {
         val scope = rememberCoroutineScope()
         val state = remember { if (useLegacyDesktopUi) AppState(scope) else null }
+        val windowState = rememberWindowState(size = DpSize(1180.dp, 780.dp))
+        val appIcon = remember { loadDesktopAppIcon() }
         Window(
             onCloseRequest = {
+                onIncomingDeepLinks = null
+                runCatching { instanceHandle?.close() }
                 state?.shutdown()
                 runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
                 runCatching { systemProxy.restore() }
                 exitApplication()
             },
             title = "Owenclave ${io.nekohasekai.sagernet.BuildConfig.VERSION_NAME}",
-            state = rememberWindowState(size = DpSize(1180.dp, 780.dp)),
+            icon = appIcon,
+            state = windowState,
         ) {
+            LaunchedEffect(window) {
+                window.minimumSize = java.awt.Dimension(420, 560)
+            }
             if (state != null) {
                 App(state)
             } else {
                 val mainActivity = remember { io.nekohasekai.sagernet.ui.compose.ComposeMainActivity() }
                 androidx.activity.DesktopActivityStack.Host(mainActivity)
+                LaunchedEffect(mainActivity, window) {
+                    fun drainDeepLinks(bringToFront: Boolean) {
+                        if (bringToFront) {
+                            windowState.isMinimized = false
+                            window.isVisible = true
+                            window.toFront()
+                            window.requestFocus()
+                        }
+                        while (true) {
+                            val uri = pendingDeepLinks.poll() ?: break
+                            val viewIntent = android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse(uri),
+                            ).apply {
+                                component = android.content.ComponentName(
+                                    mainActivity,
+                                    io.nekohasekai.sagernet.ui.compose.ComposeMainActivity::class.java,
+                                )
+                            }
+                            androidx.activity.DesktopActivityStack.startActivityFromIntent(viewIntent)
+                        }
+                    }
+                    drainDeepLinks(bringToFront = false)
+                    onIncomingDeepLinks = {
+                        javax.swing.SwingUtilities.invokeLater {
+                            drainDeepLinks(bringToFront = true)
+                        }
+                    }
+                }
             }
         }
     }
+}
+
+private fun loadDesktopAppIcon(): Painter? {
+    return runCatching {
+        val stream = DesktopRuntime::class.java.getResourceAsStream("/owenclave-icon.png")
+            ?: return null
+        val bytes = stream.use { it.readBytes() }
+        BitmapPainter(org.jetbrains.skia.Image.makeFromEncoded(bytes).toComposeImageBitmap())
+    }.getOrNull()
 }
 
 /** Headless entry points used for verification and packaging checks. */

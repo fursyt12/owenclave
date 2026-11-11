@@ -130,6 +130,9 @@ val copyAndroidPreferences = tasks.register<Sync>("copyAndroidPreferences") {
         into("android-preferences")
         rename { "preference-v29.xml" }
     }
+    from(rootProject.file("app/src/main/ic_launcher-playstore.png")) {
+        rename { "owenclave-icon.png" }
+    }
     into(androidPreferencesDir)
     doLast {
         logger.lifecycle("Copied Android preference resources into ${androidPreferencesDir.get().asFile}")
@@ -377,6 +380,7 @@ tasks.test {
     // Tests resolve the development core/plugin binaries straight from the
     // repository, and validate generated configs with `owenclave-core test`.
     systemProperty("owenclave.devRoot", rootProject.projectDir.absolutePath)
+    systemProperty("owenclave.skipSchemeRegister", "true")
     // Opt-in host tests (they really set the system proxy):
     //   ./gradlew :desktop:app:test --tests '*SystemProxyE2eTest*' \
     //     -Dowenclave.e2e.systemProxy=true
@@ -416,11 +420,49 @@ compose.desktop {
                 debMaintainer = "owenewans"
                 menuGroup = "Network"
                 appCategory = "Network"
+                shortcut = true
+                iconFile.set(rootProject.file("app/src/main/ic_launcher-playstore.png"))
             }
             macOS {
                 bundleID = "org.owenewans.owenclave.desktop"
                 packageName = "Owenclave"
                 dockName = "Owenclave"
+                infoPlist {
+                    extraKeysRawXml = """
+                        <key>CFBundleURLTypes</key>
+                        <array>
+                          <dict>
+                            <key>CFBundleURLName</key>
+                            <string>org.owenewans.owenclave.url</string>
+                            <key>CFBundleURLSchemes</key>
+                            <array>
+                              <string>owenclave</string>
+                              <string>owenkey</string>
+                              <string>happ</string>
+                              <string>clash</string>
+                              <string>sn</string>
+                              <string>exclave</string>
+                              <string>vless</string>
+                              <string>vmess</string>
+                              <string>trojan</string>
+                              <string>ss</string>
+                              <string>ssr</string>
+                              <string>hysteria2</string>
+                              <string>hy2</string>
+                              <string>tuic</string>
+                              <string>juicity</string>
+                              <string>anytls</string>
+                              <string>shadowquic</string>
+                              <string>sq</string>
+                              <string>wireguard</string>
+                              <string>wg</string>
+                              <string>socks</string>
+                              <string>socks5</string>
+                            </array>
+                          </dict>
+                        </array>
+                    """.trimIndent()
+                }
             }
             windows {
                 menuGroup = "Owenclave"

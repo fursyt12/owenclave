@@ -46,7 +46,13 @@ int wmain(int argc, wchar_t *argv[]) {
 
     SetCurrentDirectoryW(appHome);
 
-    int hasCliArgs = (argc > 1);
+    int hasCliArgs = 0;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == L'-' && wcscmp(argv[i], L"--legacy-ui") != 0) {
+            hasCliArgs = 1;
+            break;
+        }
+    }
     wchar_t javaExe[MAX_PATH * 4];
     swprintf(
         javaExe,

@@ -40,6 +40,31 @@ class DesktopComposeUiSmokeTest {
                     frameNano += 16_000_000L
                 }
             }
+
+            // Exercise deep link routing to GroupScreen + quick-add dialog + Toast overlay
+            val subIntent = android.content.Intent(
+                android.content.Intent.ACTION_VIEW,
+                android.net.Uri.parse("owenclave://add-subscription?url=https%3A%2F%2Fexample.com%2Fapi%2Fsub&hwid=1"),
+            )
+            mainActivity.onNewIntent(subIntent)
+            android.widget.Toast.makeText(mainActivity, "Deep link received", android.widget.Toast.LENGTH_SHORT).show()
+            repeat(4) {
+                scene.render(frameNano)
+                frameNano += 16_000_000L
+            }
+            PendingDeepLink.pendingSubscriptionAdd.value = null
+            PendingDeepLink.pendingDestination.value = null
+        }
+
+        // Also verify compact phone width (3-tab pill mode) renders cleanly
+        DesktopActivityStack.stack.clear()
+        ImageComposeScene(width = 412, height = 892).use { scene ->
+            val mainActivity = ComposeMainActivity()
+            scene.setContent {
+                DesktopActivityStack.Host(mainActivity)
+            }
+            val compactImg = scene.render(0L)
+            assertTrue(compactImg.width == 412 && compactImg.height == 892)
         }
 
         val allTypes = listOf(

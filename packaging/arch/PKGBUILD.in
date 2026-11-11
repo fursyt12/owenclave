@@ -11,6 +11,7 @@ depends=()
 provides=('owenclave')
 conflicts=('owenclave')
 options=('!strip' '!debug' '!emptydirs')
+install=owenclave.install
 
 # The application image built by jpackage, already containing its own runtime, the
 # proxy core, NaiveProxy and tun2socks, so no system JRE is required.

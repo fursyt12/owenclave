@@ -61,6 +61,7 @@ tar -czf "$WORK/owenclave-desktop-$PKGVER.tar.gz" -C "$WORK" opt owenclave.deskt
 sed -e "s/@PKGVER@/$PKGVER/g" \
     -e "s/@PKGDESC@/Owenclave desktop proxy client $PKGVER/" \
     "$PROJECT/packaging/arch/PKGBUILD.in" >"$WORK/PKGBUILD"
+cp "$PROJECT/packaging/arch/owenclave.install" "$WORK/owenclave.install"
 
 build_package() {
   cd "$WORK"
