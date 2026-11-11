@@ -130,6 +130,90 @@ class SystemProxy(
     /** Restores a backup left behind by a previous run, or null when there is none. */
     fun restoreStale(): ProxyRestoreResult? = if (backupFile.isFile) restore() else null
 
+    /**
+     * When starting VPN/TUN mode, another proxy client (e.g. FlClash/Clash) may have
+     * exited while leaving the OS system proxy in manual mode pointing at a dead
+     * loopback port (`127.0.0.1:7890`). Browsers using system proxy settings would
+     * fail with connection-refused on loopback instead of routing through the TUN.
+     * Clears manual mode if every configured loopback proxy port is closed.
+     */
+    fun clearDeadLoopbackProxy(portProbe: (Int) -> Boolean = Companion::isLoopbackPortOpen): Boolean {
+        val backend = detectBackend() ?: return false
+        val state = runCatching { backend.read() }.getOrDefault(emptyMap())
+        if (state.isEmpty()) return false
+
+        fun isDeadLoopback(hostRaw: String?, portRaw: String?): Boolean? {
+            val host = hostRaw?.trim()?.trim('\'', '"').orEmpty().lowercase()
+            if (host.isEmpty()) return null
+            if (host !in LOOPBACK_HOSTS) return false
+            val port = portRaw?.trim()?.trim('\'', '"')?.toIntOrNull() ?: return null
+            if (port !in 1..65535) return null
+            return !portProbe(port)
+        }
+
+        fun parseUrlLoopbackDead(urlRaw: String?): Boolean? {
+            val cleaned = urlRaw?.trim()?.trim('\'', '"').orEmpty()
+            if (cleaned.isEmpty()) return null
+            val withoutScheme = cleaned.substringAfter("://")
+            val hostPort = withoutScheme.substringBefore('/')
+            val colon = hostPort.lastIndexOf(':')
+            if (colon <= 0) return false
+            val host = hostPort.substring(0, colon).trim('[', ']')
+            val port = hostPort.substring(colon + 1)
+            return isDeadLoopback(host, port)
+        }
+
+        val disablePatch: Map<String, String?> = when (backend.id) {
+            "gnome" -> {
+                if (state["gnome:mode"]?.trim('\'') == "manual") {
+                    val checks = listOfNotNull(
+                        isDeadLoopback(state["gnome:http-host"], state["gnome:http-port"]),
+                        isDeadLoopback(state["gnome:https-host"], state["gnome:https-port"]),
+                        isDeadLoopback(state["gnome:socks-host"], state["gnome:socks-port"]),
+                    )
+                    if (checks.isNotEmpty() && checks.all { it }) mapOf("gnome:mode" to "'none'") else null
+                } else null
+            }
+            "kde" -> {
+                if (state["ProxyType"] == "1") {
+                    val checks = listOfNotNull(
+                        parseUrlLoopbackDead(state["httpProxy"]),
+                        parseUrlLoopbackDead(state["httpsProxy"]),
+                        parseUrlLoopbackDead(state["socksProxy"]),
+                    )
+                    if (checks.isNotEmpty() && checks.all { it }) mapOf("ProxyType" to "0") else null
+                } else null
+            }
+            "wininet" -> {
+                if (state["win:ProxyEnable"] == "0x1") {
+                    val entries = state["win:ProxyServer"].orEmpty().split(';').filter { it.isNotBlank() }
+                    val checks = entries.mapNotNull { entry ->
+                        val hp = entry.substringAfter('=')
+                        parseUrlLoopbackDead(hp)
+                    }
+                    if (checks.isNotEmpty() && checks.all { it }) mapOf("win:ProxyEnable" to "0x0") else null
+                } else null
+            }
+            "macos" -> {
+                val activeKinds = listOf("web", "secureweb", "socks").filter {
+                    state["mac:$it.enabled"].equals("Yes", ignoreCase = true)
+                }
+                if (activeKinds.isNotEmpty()) {
+                    val checks = activeKinds.mapNotNull { kind ->
+                        isDeadLoopback(state["mac:$kind.server"], state["mac:$kind.port"])
+                    }
+                    if (checks.size == activeKinds.size && checks.all { it }) {
+                        activeKinds.associate { "mac:$it.enabled" to "No" }
+                    } else null
+                } else null
+            }
+            else -> null
+        } ?: return false
+
+        runCatching { backend.apply(disablePatch) }.onFailure { return false }
+        return true
+    }
+
     // ------------------------------------------------------------- backup file
 
     private data class Backup(
@@ -297,6 +381,8 @@ class SystemProxy(
             "gnome:mode" to get(base, "mode"),
             "gnome:http-host" to get("$base.http", "host"),
             "gnome:http-port" to get("$base.http", "port"),
+            "gnome:https-host" to get("$base.https", "host"),
+            "gnome:https-port" to get("$base.https", "port"),
             "gnome:socks-host" to get("$base.socks", "host"),
             "gnome:socks-port" to get("$base.socks", "port"),
             "gnome:ignore-hosts" to get(base, "ignore-hosts"),
@@ -311,6 +397,8 @@ class SystemProxy(
             put("gnome:mode", "'manual'")
             put("gnome:http-host", "'$host'")
             put("gnome:http-port", httpPort.toString())
+            put("gnome:https-host", "'$host'")
+            put("gnome:https-port", httpPort.toString())
             put("gnome:socks-host", "'$host'")
             put("gnome:socks-port", socksPort.toString())
             if (bypass.isNotEmpty()) {
@@ -338,6 +426,8 @@ class SystemProxy(
             "gnome:mode" -> base to "mode"
             "gnome:http-host" -> "$base.http" to "host"
             "gnome:http-port" -> "$base.http" to "port"
+            "gnome:https-host" -> "$base.https" to "host"
+            "gnome:https-port" -> "$base.https" to "port"
             "gnome:socks-host" -> "$base.socks" to "host"
             "gnome:socks-port" -> "$base.socks" to "port"
             "gnome:ignore-hosts" -> base to "ignore-hosts"
@@ -654,6 +744,15 @@ class SystemProxy(
         const val BACKUP_FILE = "system-proxy-backup.json"
 
         const val BACKUP_VERSION = 1
+
+        private val LOOPBACK_HOSTS = setOf("127.0.0.1", "localhost", "::1")
+
+        fun isLoopbackPortOpen(port: Int): Boolean = runCatching {
+            java.net.Socket().use { socket ->
+                socket.connect(java.net.InetSocketAddress("127.0.0.1", port), 150)
+            }
+            true
+        }.getOrDefault(false)
 
     }
 

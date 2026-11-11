@@ -134,8 +134,15 @@ fun main(args: Array<String>) {
             runCatching { privilegedTun.stop() }
         }
 
-        if (ds.requireHttp && ds.appendHttpProxy && ds.httpUsername.isEmpty() && ds.httpPassword.isEmpty()) {
-            val bypass = ds.httpProxyException.split("\n", ",").map { it.trim() }.filter { it.isNotEmpty() }
+        val shouldApplySystemProxy = ds.requireHttp &&
+            ds.httpUsername.isEmpty() &&
+            ds.httpPassword.isEmpty() &&
+            (ds.serviceMode == Key.MODE_PROXY || ds.appendHttpProxy)
+        if (shouldApplySystemProxy) {
+            val bypass = ds.httpProxyException.split("\n", ",")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .ifEmpty { listOf("localhost", "127.0.0.1", "::1", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12") }
             runCatching {
                 systemProxy.apply(
                     host = "127.0.0.1",
@@ -146,6 +153,13 @@ fun main(args: Array<String>) {
             }.onFailure { io.nekohasekai.sagernet.ktx.Logs.w(it) }
         } else {
             runCatching { systemProxy.restore() }
+            if (ds.serviceMode == Key.MODE_VPN) {
+                runCatching {
+                    if (systemProxy.clearDeadLoopbackProxy()) {
+                        io.nekohasekai.sagernet.ktx.Logs.i("Cleared dead loopback OS system proxy for VPN mode")
+                    }
+                }
+            }
         }
     }
     io.nekohasekai.sagernet.bg.ProxyService.onStopped = {

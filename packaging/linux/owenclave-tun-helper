@@ -142,9 +142,24 @@ SLICE_NAME="owenclave_bypass.slice"
 SLICE_PATH="$CGROUP_ROOT/$SLICE_NAME"
 FWMARK="0x1ee7"
 ROUTE_TABLE="1188"
-TUN_CIDR4="172.19.0.1/30"
-TUN_DNS4="172.19.0.2"
+TUN_NET4="198.19.254.0/30"
+TUN_CIDR4="198.19.254.1/30"
+TUN_DNS4="198.19.254.2"
 TUN_CIDR6="fdfe:dcba:9876::1/126"
+TUN_NET6="fdfe:dcba:9876::/126"
+
+select_tun_subnet4() {
+  existing_v4="$(ip -4 addr show 2>/dev/null; ip -4 route show table main 2>/dev/null || true)"
+  for prefix in 198.19.254 198.19.253 198.19.252 198.19.251 172.31.254 10.255.254; do
+    case "$existing_v4" in
+      *"$prefix."*) continue ;;
+    esac
+    TUN_NET4="$prefix.0/30"
+    TUN_CIDR4="$prefix.1/30"
+    TUN_DNS4="$prefix.2"
+    return 0
+  done
+}
 
 TUN2SOCKS_PID=""
 RUNTIME_DIR="/run/owenclave-tun.$$"
@@ -190,6 +205,9 @@ cleanup_stale() {
   ip6tables -t mangle -D OUTPUT -j OWENCLAVE_BYPASS 2>/dev/null || true
   ip6tables -t mangle -F OWENCLAVE_BYPASS 2>/dev/null || true
   ip6tables -t mangle -X OWENCLAVE_BYPASS 2>/dev/null || true
+  ip6tables -t filter -D OUTPUT -j OWENCLAVE_DNS6 2>/dev/null || true
+  ip6tables -t filter -F OWENCLAVE_DNS6 2>/dev/null || true
+  ip6tables -t filter -X OWENCLAVE_DNS6 2>/dev/null || true
   ip6tables -t nat -D POSTROUTING -m mark --mark "$FWMARK" ! -o lo -j MASQUERADE 2>/dev/null || true
   ip link del "$TUN_DEV" 2>/dev/null || true
 }
@@ -227,6 +245,9 @@ cleanup() {
   ip6tables -t mangle -D OUTPUT -j OWENCLAVE_BYPASS 2>/dev/null || true
   ip6tables -t mangle -F OWENCLAVE_BYPASS 2>/dev/null || true
   ip6tables -t mangle -X OWENCLAVE_BYPASS 2>/dev/null || true
+  ip6tables -t filter -D OUTPUT -j OWENCLAVE_DNS6 2>/dev/null || true
+  ip6tables -t filter -F OWENCLAVE_DNS6 2>/dev/null || true
+  ip6tables -t filter -X OWENCLAVE_DNS6 2>/dev/null || true
   ip6tables -t nat -D POSTROUTING -m mark --mark "$FWMARK" ! -o lo -j MASQUERADE 2>/dev/null || true
 
   if [ -n "$TUN2SOCKS_PID" ]; then
@@ -405,10 +426,15 @@ table inet owenclave_bypass {
     socket cgroupv2 level 1 "$SLICE_NAME" return
     ip daddr 127.0.0.0/8 return
     ip6 daddr ::1 return
-    ip protocol udp udp dport 53 redirect to :$DNS_PORT
-    ip protocol tcp tcp dport 53 redirect to :$DNS_PORT
-    ip6 nexthdr udp udp dport 53 reject
-    ip6 nexthdr tcp tcp dport 53 reject
+    meta nfproto ipv4 udp dport 53 redirect to :$DNS_PORT
+    meta nfproto ipv4 tcp dport 53 redirect to :$DNS_PORT
+  }
+  chain output_dns_filter {
+    type filter hook output priority filter; policy accept;
+    socket cgroupv2 level 1 "$SLICE_NAME" return
+    ip6 daddr ::1 return
+    meta nfproto ipv6 udp dport 53 reject
+    meta nfproto ipv6 tcp dport 53 reject
   }
 }
 EOF_DNS
@@ -437,6 +463,14 @@ EOF_DNS
         iptables -t nat -A OWENCLAVE_DNS -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null || true
         iptables -t nat -A OWENCLAVE_DNS -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null || true
         iptables -t nat -A OUTPUT -j OWENCLAVE_DNS 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+          ip6tables -t filter -N OWENCLAVE_DNS6 2>/dev/null || true
+          ip6tables -t filter -A OWENCLAVE_DNS6 -m cgroup --path "$SLICE_NAME" -j RETURN 2>/dev/null || true
+          ip6tables -t filter -A OWENCLAVE_DNS6 -d ::1/128 -j RETURN 2>/dev/null || true
+          ip6tables -t filter -A OWENCLAVE_DNS6 -p udp --dport 53 -j REJECT 2>/dev/null || true
+          ip6tables -t filter -A OWENCLAVE_DNS6 -p tcp --dport 53 -j REJECT 2>/dev/null || true
+          ip6tables -t filter -A OUTPUT -j OWENCLAVE_DNS6 2>/dev/null || true
+        fi
       fi
     fi
   fi
@@ -448,6 +482,7 @@ if [ "$BYPASS_INSTALLED" = "0" ] && [ -z "$ADDED_HOST_ROUTES4" ] && [ -z "$ADDED
 fi
 
 # 5. Create TUN device and start tun2socks.
+select_tun_subnet4
 ip tuntap add mode tun dev "$TUN_DEV"
 ip link set dev "$TUN_DEV" mtu "$MTU"
 ip -4 addr add "$TUN_CIDR4" dev "$TUN_DEV"
@@ -481,7 +516,7 @@ if [ "$BYPASS_LAN" = "1" ]; then
   ip -4 route replace throw 192.168.0.0/16 table "$ROUTE_TABLE" 2>/dev/null || true
   ip -4 route replace throw 169.254.0.0/16 table "$ROUTE_TABLE" 2>/dev/null || true
   ip -4 route replace throw 100.64.0.0/10 table "$ROUTE_TABLE" 2>/dev/null || true
-  ip -4 route replace "$TUN_CIDR4" dev "$TUN_DEV" table "$ROUTE_TABLE" 2>/dev/null || true
+  ip -4 route replace "$TUN_NET4" dev "$TUN_DEV" table "$ROUTE_TABLE" 2>/dev/null || true
 fi
 
 ip -4 rule add pref 90 fwmark "$FWMARK" lookup main
@@ -493,7 +528,7 @@ if [ "$ENABLE_IPV6" = "1" ]; then
   if [ "$BYPASS_LAN" = "1" ]; then
     ip -6 route replace throw fc00::/7 table "$ROUTE_TABLE" 2>/dev/null || true
     ip -6 route replace throw fe80::/10 table "$ROUTE_TABLE" 2>/dev/null || true
-    ip -6 route replace "$TUN_CIDR6" dev "$TUN_DEV" table "$ROUTE_TABLE" 2>/dev/null || true
+    ip -6 route replace "$TUN_NET6" dev "$TUN_DEV" table "$ROUTE_TABLE" 2>/dev/null || true
   fi
 else
   # Block global IPv6 leaks on dual-stack ISP networks so Happy Eyeballs falls back immediately to IPv4 TUN.

@@ -22,6 +22,8 @@ internal class FakeHost : CommandRunner {
         "org.gnome.system.proxy/mode" to "'none'",
         "org.gnome.system.proxy.http/host" to "''",
         "org.gnome.system.proxy.http/port" to "0",
+        "org.gnome.system.proxy.https/host" to "''",
+        "org.gnome.system.proxy.https/port" to "0",
         "org.gnome.system.proxy.socks/host" to "''",
         "org.gnome.system.proxy.socks/port" to "0",
         "org.gnome.system.proxy/ignore-hosts" to "[]",

@@ -29,6 +29,8 @@ class SystemProxyE2eTest {
         listOf("org.gnome.system.proxy", "mode"),
         listOf("org.gnome.system.proxy.http", "host"),
         listOf("org.gnome.system.proxy.http", "port"),
+        listOf("org.gnome.system.proxy.https", "host"),
+        listOf("org.gnome.system.proxy.https", "port"),
         listOf("org.gnome.system.proxy.socks", "host"),
         listOf("org.gnome.system.proxy.socks", "port"),
         listOf("org.gnome.system.proxy", "ignore-hosts"),

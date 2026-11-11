@@ -365,5 +365,32 @@ class DesktopPrivilegedTunTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `clearDeadLoopbackProxy disables stale dead loopback proxy but preserves live proxy`() {
+        val tempDir = Files.createTempDirectory("owenclave-dead-proxy").toFile()
+        try {
+            val host = FakeHost()
+            host.gnome["org.gnome.system.proxy/mode"] = "'manual'"
+            host.gnome["org.gnome.system.proxy.http/host"] = "'127.0.0.1'"
+            host.gnome["org.gnome.system.proxy.http/port"] = "7890"
+            host.gnome["org.gnome.system.proxy.https/host"] = "'127.0.0.1'"
+            host.gnome["org.gnome.system.proxy.https/port"] = "7890"
+            host.gnome["org.gnome.system.proxy.socks/host"] = "'127.0.0.1'"
+            host.gnome["org.gnome.system.proxy.socks/port"] = "7890"
+
+            val proxy = SystemProxy(runner = host, os = "linux", dataDir = tempDir)
+
+            // Live port (e.g. another proxy still actively running) is left untouched.
+            assertFalse(proxy.clearDeadLoopbackProxy(portProbe = { it == 7890 }))
+            assertEquals("'manual'", host.gnome["org.gnome.system.proxy/mode"])
+
+            // Dead loopback port (closed client left stale gsettings) is switched to 'none'.
+            assertTrue(proxy.clearDeadLoopbackProxy(portProbe = { false }))
+            assertEquals("'none'", host.gnome["org.gnome.system.proxy/mode"])
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }
 
