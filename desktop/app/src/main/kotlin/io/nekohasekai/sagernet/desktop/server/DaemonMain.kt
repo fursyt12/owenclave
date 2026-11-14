@@ -8,6 +8,11 @@ import java.util.concurrent.CountDownLatch
  */
 object DaemonMain {
 
+    @JvmStatic
+    fun main(args: Array<String>) {
+        kotlin.system.exitProcess(run(args))
+    }
+
     fun run(args: Array<String>): Int {
         // Initialize the shared application & JNI runtime (needed for HappLink / Hwid / Certs)
         runCatching { SagerNet.application }

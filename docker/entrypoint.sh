@@ -29,6 +29,6 @@ fi
 
 exec java ${JAVA_OPTS:-} "${JAVA_OPTS_ARR[@]}" \
   -cp "$APP_HOME/lib/*" \
-  io.nekohasekai.sagernet.desktop.MainKt \
+  io.nekohasekai.sagernet.desktop.server.DaemonMain \
   "$@"
 

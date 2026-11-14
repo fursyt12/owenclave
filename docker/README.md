@@ -37,4 +37,6 @@ Owenclave reads standard Mihomo fields from `/config/config.yaml` (`mixed-port`,
 | `SECRET` | Controller Bearer secret |
 | `SUBSCRIPTION_URL` | Subscription URL(s) to fetch and auto-refresh |
 | `AUTO_UPDATE_MINUTES` | Subscription refresh interval in minutes (default `60`) |
+| `FALLBACK_TO_DIRECT` | Route through `bypass` (`DIRECT`) when all proxy servers are unreachable (`true` / `false`) |
+| `HEALTH_CHECK_INTERVAL` | Optional cap in seconds for automatic group health-check intervals |
 

@@ -36,10 +36,19 @@ class CoreRunner(
         private set
 
     @Volatile
+    var startCount: Int = 0
+        private set
+
+    @Volatile
     var lastError: String? = null
         private set
 
     val socksPort: Int get() = settings?.socksPort ?: 0
+
+    val corePid: Long? get() = coreProcess?.takeIf { it.isAlive }?.pid()
+
+    /** True when both the core process and every started external plugin are alive. */
+    val healthy: Boolean get() = running && coreProcess?.isAlive == true && plugins.allAlive
 
     /** Whether any external plugin process is still running. */
     fun pluginAlive(): Boolean = plugins.alive
@@ -54,6 +63,8 @@ class CoreRunner(
         bindInterfaceOverride: String? = null,
         serverInbounds: ServerInboundOptions? = null,
         extraProfiles: List<Profile> = emptyList(),
+        balancers: List<BalancerSpec> = emptyList(),
+        primaryBalancer: BalancerSpec? = null,
     ) {
         stop()
         this.settings = settings
@@ -68,6 +79,8 @@ class CoreRunner(
             outboundInterface,
             serverInbounds,
             extraProfiles,
+            balancers,
+            primaryBalancer,
         )
 
         // External engines have to be listening before the core tries to dial
@@ -169,6 +182,7 @@ class CoreRunner(
         }
 
         running = true
+        startCount += 1
         DataStore.startedProfile = profile.id.hashCode().toLong()
         SagerNet.started = true
         log("connected: ${profile.displayName} (${profile.protocolName})")

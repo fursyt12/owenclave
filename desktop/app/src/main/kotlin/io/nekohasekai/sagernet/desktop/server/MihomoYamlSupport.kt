@@ -1,5 +1,6 @@
 package io.nekohasekai.sagernet.desktop.server
 
+import io.nekohasekai.sagernet.desktop.BalancerSpec
 import io.nekohasekai.sagernet.desktop.Profile
 import io.nekohasekai.sagernet.desktop.RoutingRule
 import io.nekohasekai.sagernet.desktop.RuleTarget
@@ -27,13 +28,23 @@ import java.util.regex.Pattern
  */
 object MihomoYamlSupport {
 
+    val AUTO_BALANCER_TYPES = setOf("fallback", "url-test", "load-balance")
+
     data class ProxyGroupSpec(
         val name: String,
         val type: String,
         val proxies: List<String>,
         val url: String? = null,
         val interval: Int? = null,
-    )
+        val tolerance: Int? = null,
+        val includeAll: Boolean = false,
+        val filter: String? = null,
+        val excludeFilter: String? = null,
+        val fallbackToDirect: Boolean = false,
+    ) {
+        val isAutoBalancer: Boolean
+            get() = type in AUTO_BALANCER_TYPES
+    }
 
     data class RuleProviderSpec(
         val name: String,
@@ -54,7 +65,17 @@ object MihomoYamlSupport {
         val groups: List<ProxyGroupSpec>,
         val ruleProviders: Map<String, RuleProviderSpec>,
         val rawRules: List<String>,
-    )
+    ) {
+        fun hasSameRoutingSemantics(other: ParsedMihomoDocument?): Boolean {
+            if (other == null) return false
+            return virtualDirectNames == other.virtualDirectNames &&
+                virtualRejectNames == other.virtualRejectNames &&
+                virtualDnsNames == other.virtualDnsNames &&
+                groups == other.groups &&
+                ruleProviders == other.ruleProviders &&
+                rawRules == other.rawRules
+        }
+    }
 
     /** Official Telegram AS149154 / Messenger IPv4 & IPv6 prefixes for `GEOIP,telegram` / `telegram.mrs`. */
     private val TELEGRAM_CIDRS = listOf(
@@ -175,7 +196,24 @@ object MihomoYamlSupport {
                 .orEmpty()
             val url = group["url"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
             val interval = group["interval"]?.toString()?.toIntOrNull()
-            groups += ProxyGroupSpec(name = name, type = type, proxies = members, url = url, interval = interval)
+            val tolerance = group["tolerance"]?.toString()?.toIntOrNull()
+            val includeAll = group["include-all"]?.toString()?.equals("true", ignoreCase = true) == true ||
+                group["include-all-proxies"]?.toString()?.equals("true", ignoreCase = true) == true
+            val filter = group["filter"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            val excludeFilter = group["exclude-filter"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            val fallbackToDirect = group["fallback-to-direct"]?.toString()?.equals("true", ignoreCase = true) == true
+            groups += ProxyGroupSpec(
+                name = name,
+                type = type,
+                proxies = members,
+                url = url,
+                interval = interval,
+                tolerance = tolerance,
+                includeAll = includeAll,
+                filter = filter,
+                excludeFilter = excludeFilter,
+                fallbackToDirect = fallbackToDirect,
+            )
         }
 
         val ruleProviders = LinkedHashMap<String, RuleProviderSpec>()
@@ -220,6 +258,43 @@ object MihomoYamlSupport {
     }
 
     /**
+     * Expands a group's member list, honoring `include-all` / `include-all-proxies`,
+     * `filter`, and `exclude-filter`, while keeping trailing `DIRECT` / virtual-direct
+     * entries after included real proxies so automatic failover prefers alive proxies first.
+     */
+    fun expandGroupChoices(
+        spec: ProxyGroupSpec,
+        allProfileNames: List<String>,
+        virtualDirect: Set<String> = emptySet(),
+    ): List<String> {
+        val filterRegex = spec.filter?.let { runCatching { Regex(it) }.getOrNull() }
+        val excludeRegex = spec.excludeFilter?.let { runCatching { Regex(it) }.getOrNull() }
+        fun matchesFilters(name: String): Boolean {
+            if (filterRegex != null && !filterRegex.containsMatchIn(name)) return false
+            if (excludeRegex != null && excludeRegex.containsMatchIn(name)) return false
+            return true
+        }
+        fun isDirectEntry(name: String): Boolean =
+            name.equals("DIRECT", ignoreCase = true) || name in virtualDirect
+
+        val ordered = LinkedHashSet<String>()
+        val trailingDirect = LinkedHashSet<String>()
+
+        for (p in spec.proxies) {
+            if (spec.includeAll && isDirectEntry(p)) {
+                trailingDirect += p
+            } else {
+                ordered += p
+            }
+        }
+        if (spec.includeAll || (spec.proxies.isEmpty() && allProfileNames.isNotEmpty())) {
+            allProfileNames.filter(::matchesFilters).forEach { ordered += it }
+        }
+        trailingDirect.forEach { ordered += it }
+        return ordered.toList()
+    }
+
+    /**
      * Resolves a proxy or group name to a [RuleTarget] (`PROXY`, `DIRECT`, or `BLOCK`)
      * given the current [groupSelections].
      */
@@ -230,6 +305,7 @@ object MihomoYamlSupport {
         virtualDirect: Set<String>,
         virtualReject: Set<String>,
         virtualDns: Set<String> = emptySet(),
+        allProfileNames: List<String> = emptyList(),
         visited: MutableSet<String> = HashSet(),
     ): RuleTarget? {
         val trimmed = targetName.trim()
@@ -245,10 +321,24 @@ object MihomoYamlSupport {
         val group = groupsByName[trimmed] ?: return RuleTarget.PROXY
         if (!visited.add(trimmed)) return RuleTarget.PROXY
 
-        val selected = groupSelections[trimmed]?.takeIf { it in group.proxies }
-            ?: group.proxies.firstOrNull()
+        val choices = expandGroupChoices(group, allProfileNames, virtualDirect)
+        if (group.isAutoBalancer) {
+            val hasNonDirect = choices.any { entry ->
+                !entry.equals("DIRECT", ignoreCase = true) &&
+                    entry !in virtualDirect &&
+                    !entry.equals("REJECT", ignoreCase = true) &&
+                    !entry.equals("REJECT-DROP", ignoreCase = true) &&
+                    entry !in virtualReject
+            }
+            if (hasNonDirect) return RuleTarget.PROXY
+            val first = choices.firstOrNull() ?: return if (group.fallbackToDirect) RuleTarget.DIRECT else RuleTarget.PROXY
+            return resolveRuleTarget(first, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns, allProfileNames, visited)
+        }
+
+        val selected = groupSelections[trimmed]?.takeIf { it in choices }
+            ?: choices.firstOrNull()
             ?: return RuleTarget.PROXY
-        return resolveRuleTarget(selected, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns, visited)
+        return resolveRuleTarget(selected, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns, allProfileNames, visited)
     }
 
     /**
@@ -264,10 +354,119 @@ object MihomoYamlSupport {
         profilesByName[targetName]?.let { return it }
         val group = groupsByName[targetName] ?: return null
         if (!visited.add(targetName)) return null
-        val chosen = groupSelections[targetName]?.takeIf { it in group.proxies }
-            ?: group.proxies.firstOrNull()
+        val choices = expandGroupChoices(group, profilesByName.keys.toList())
+        val chosen = groupSelections[targetName]?.takeIf { it in choices }
+            ?: choices.firstOrNull { !it.equals("DIRECT", ignoreCase = true) && !it.equals("REJECT", ignoreCase = true) }
+            ?: choices.firstOrNull()
             ?: return null
         return resolveSelectedProfile(chosen, profilesByName, groupsByName, groupSelections, visited)
+    }
+
+    /**
+     * Resolves [targetName] to a [BalancerSpec] when it points (directly or through
+     * `select` chains) to an automatic group (`fallback`, `url-test`, `load-balance`),
+     * or when [defaultFallbackToDirect] wraps a single proxy profile for bypass failover.
+     */
+    fun resolveBalancerSpec(
+        targetName: String,
+        profilesByName: Map<String, Profile>,
+        groupsByName: Map<String, ProxyGroupSpec>,
+        groupSelections: Map<String, String>,
+        virtualDirect: Set<String> = emptySet(),
+        virtualReject: Set<String> = emptySet(),
+        defaultFallbackToDirect: Boolean = false,
+        healthCheckIntervalCap: Int = 0,
+        visited: MutableSet<String> = HashSet(),
+    ): BalancerSpec? {
+        val trimmed = targetName.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.equals("DIRECT", ignoreCase = true) || trimmed in virtualDirect) return null
+        if (trimmed.equals("REJECT", ignoreCase = true) || trimmed.equals("REJECT-DROP", ignoreCase = true) || trimmed in virtualReject) return null
+
+        val allProfileNames = profilesByName.keys.toList()
+        fun computeInterval(rawInterval: Int?): Int {
+            val base = (rawInterval ?: 15).coerceIn(1, 3600)
+            return if (healthCheckIntervalCap > 0) minOf(base, healthCheckIntervalCap.coerceAtLeast(1)) else base
+        }
+
+        profilesByName[trimmed]?.let { single ->
+            if (!defaultFallbackToDirect || single.bean == null) return null
+            return BalancerSpec(
+                id = "profile-fb:${single.id}",
+                profileIds = listOf(single.id),
+                strategy = "leastPing",
+                stickyChoice = false,
+                probeIntervalSec = computeInterval(null),
+                fallbackToDirect = true,
+            )
+        }
+
+        val group = groupsByName[trimmed] ?: return null
+        if (!visited.add(trimmed)) return null
+        val choices = expandGroupChoices(group, allProfileNames, virtualDirect)
+
+        if (!group.isAutoBalancer) {
+            val chosen = groupSelections[trimmed]?.takeIf { it in choices }
+                ?: choices.firstOrNull()
+                ?: return null
+            return resolveBalancerSpec(
+                targetName = chosen,
+                profilesByName = profilesByName,
+                groupsByName = groupsByName,
+                groupSelections = groupSelections,
+                virtualDirect = virtualDirect,
+                virtualReject = virtualReject,
+                defaultFallbackToDirect = defaultFallbackToDirect,
+                healthCheckIntervalCap = healthCheckIntervalCap,
+                visited = visited,
+            )
+        }
+
+        val members = LinkedHashMap<String, Profile>()
+        var hasDirectFallback = group.fallbackToDirect || defaultFallbackToDirect
+
+        fun collectFromGroup(g: ProxyGroupSpec, seenGroups: MutableSet<String>) {
+            if (!seenGroups.add(g.name)) return
+            if (g.fallbackToDirect) hasDirectFallback = true
+            val expanded = expandGroupChoices(g, allProfileNames, virtualDirect)
+            for (item in expanded) {
+                when {
+                    item.equals("DIRECT", ignoreCase = true) || item in virtualDirect -> {
+                        hasDirectFallback = true
+                    }
+                    item.equals("REJECT", ignoreCase = true) || item.equals("REJECT-DROP", ignoreCase = true) || item in virtualReject -> {}
+                    item in profilesByName -> {
+                        val p = profilesByName.getValue(item)
+                        if (p.bean != null) members[p.id] = p
+                    }
+                    item in groupsByName -> {
+                        val sub = groupsByName.getValue(item)
+                        if (sub.isAutoBalancer) {
+                            collectFromGroup(sub, seenGroups)
+                        } else {
+                            resolveSelectedProfile(item, profilesByName, groupsByName, groupSelections)?.let { p ->
+                                if (p.bean != null) members[p.id] = p
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        collectFromGroup(group, HashSet())
+        if (members.isEmpty()) return null
+
+        val strategy = if (group.type == "load-balance") "random" else "leastPing"
+        val sticky = !hasDirectFallback && (group.type == "fallback" || (group.type == "url-test" && (group.tolerance ?: 0) > 0))
+        return BalancerSpec(
+            id = group.name,
+            profileIds = members.keys.toList(),
+            strategy = strategy,
+            stickyChoice = sticky,
+            probeUrl = group.url.orEmpty(),
+            probeIntervalSec = computeInterval(group.interval),
+            fallbackToDirect = hasDirectFallback,
+        )
     }
 
     /**
@@ -287,11 +486,15 @@ object MihomoYamlSupport {
         configBaseDir: File? = null,
         socksPort: Int? = null,
         profilesByName: Map<String, Profile> = emptyMap(),
+        balancersOut: MutableMap<String, BalancerSpec>? = null,
+        defaultFallbackToDirect: Boolean = false,
+        healthCheckIntervalCap: Int = 0,
         log: (String) -> Unit = {},
     ): List<RoutingRule> {
         if (rawRules.isEmpty()) return emptyList()
         cacheDir.mkdirs()
 
+        val allProfileNames = profilesByName.keys.toList()
         val providerMatchersCache = HashMap<String, ProviderMatchers>()
         fun providerMatchersFor(name: String): ProviderMatchers? {
             val spec = ruleProviders[name] ?: return null
@@ -300,9 +503,39 @@ object MihomoYamlSupport {
             }
         }
         fun effectiveTargetTag(targetName: String): String? {
-            val target = resolveRuleTarget(targetName, groupsByName, groupSelections, virtualDirect, virtualReject, virtualDns)
-                ?: return null
+            val target = resolveRuleTarget(
+                targetName = targetName,
+                groupsByName = groupsByName,
+                groupSelections = groupSelections,
+                virtualDirect = virtualDirect,
+                virtualReject = virtualReject,
+                virtualDns = virtualDns,
+                allProfileNames = allProfileNames,
+            ) ?: return null
             if (target == RuleTarget.PROXY && profilesByName.isNotEmpty()) {
+                if (balancersOut != null) {
+                    val balancerSpec = resolveBalancerSpec(
+                        targetName = targetName,
+                        profilesByName = profilesByName,
+                        groupsByName = groupsByName,
+                        groupSelections = groupSelections,
+                        virtualDirect = virtualDirect,
+                        virtualReject = virtualReject,
+                        defaultFallbackToDirect = defaultFallbackToDirect,
+                        healthCheckIntervalCap = healthCheckIntervalCap,
+                    )
+                    if (balancerSpec != null) {
+                        balancersOut[balancerSpec.id] = balancerSpec
+                        return "balancer:${balancerSpec.id}"
+                    }
+                    // If an auto-balancer had 0 real profiles and fallbackToDirect is enabled, go direct
+                    val group = groupsByName[targetName.trim()]
+                    if ((group?.fallbackToDirect == true || defaultFallbackToDirect) &&
+                        resolveSelectedProfile(targetName, profilesByName, groupsByName, groupSelections) == null
+                    ) {
+                        return RuleTarget.DIRECT.tag
+                    }
+                }
                 val resolvedProfile = resolveSelectedProfile(targetName, profilesByName, groupsByName, groupSelections)
                 if (resolvedProfile != null) {
                     return "profile:${resolvedProfile.id}"

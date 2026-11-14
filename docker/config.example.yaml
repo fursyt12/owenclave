@@ -7,6 +7,10 @@ mode: rule
 log-level: info
 ipv6: true
 
+# Automatically fall back to direct (`bypass`) if ALL proxy servers are unreachable,
+# preventing LAN internet and DNS outages during upstream server downtime.
+fallback-to-direct: true
+
 # Mihomo REST API + built-in Owenclave Web Console (/ui/)
 external-controller: 0.0.0.0:9090
 secret: ""
@@ -20,7 +24,18 @@ secret: ""
 #     url: https://example.com/sub/token
 
 proxies: []
-proxy-groups: []
+proxy-groups:
+  - name: "Auto-Failover"
+    type: fallback
+    include-all: true
+    url: "http://cp.cloudflare.com/generate_204"
+    interval: 15
+    fallback-to-direct: true
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "Auto-Failover"
+      - "DIRECT"
 rules:
   - GEOIP,private,DIRECT,no-resolve
   - MATCH,PROXY

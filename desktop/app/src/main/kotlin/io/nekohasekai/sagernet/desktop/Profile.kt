@@ -67,7 +67,99 @@ class Profile(
         customConfig?.let { addProperty("customConfig", it) }
     }
 
+    /**
+     * Canonical JSON representation of everything in this profile except [id],
+     * used to detect whether a refreshed subscription actually changed a node.
+     */
+    fun contentSignature(): String = JsonObject().apply {
+        addProperty("name", name)
+        subscriptionId?.let { addProperty("subscriptionId", it) }
+        bean?.let {
+            val normalized = runCatching { it.clone().apply { initializeDefaultValues() } }.getOrDefault(it)
+            addProperty("beanClass", normalized.javaClass.name)
+            add("bean", gson.toJsonTree(normalized))
+        }
+        customConfig?.let { addProperty("customConfig", it) }
+    }.toString()
+
     companion object {
+
+        /**
+         * Preserves existing [Profile.id] values across subscription/config refreshes
+         * whenever an incoming node matches an existing one (exact content first, then
+         * same display name + protocol), and reports whether anything changed.
+         */
+        fun reconcileProfiles(existing: List<Profile>, incoming: List<Profile>): Pair<List<Profile>, Boolean> {
+            if (existing.isEmpty()) {
+                return incoming to incoming.isNotEmpty()
+            }
+            val existingSigs = existing.map { it.contentSignature() }
+            val incomingSigs = incoming.map { it.contentSignature() }
+            val usedExisting = BooleanArray(existing.size)
+            val matchedIds = arrayOfNulls<String>(incoming.size)
+
+            // Pass 1: exact content match preserves the exact existing ID.
+            for (i in incoming.indices) {
+                val sig = incomingSigs[i]
+                for (j in existing.indices) {
+                    if (!usedExisting[j] && existingSigs[j] == sig) {
+                        usedExisting[j] = true
+                        matchedIds[i] = existing[j].id
+                        break
+                    }
+                }
+            }
+
+            // Pass 2: same logical server name (+ protocol, then name alone) keeps ID stable
+            // when e.g. port/credentials changed, while still flagging `changed = true`.
+            for (i in incoming.indices) {
+                if (matchedIds[i] != null) continue
+                val inc = incoming[i]
+                var matchIdx = -1
+                for (j in existing.indices) {
+                    if (!usedExisting[j] &&
+                        existing[j].displayName == inc.displayName &&
+                        existing[j].protocolName == inc.protocolName
+                    ) {
+                        matchIdx = j
+                        break
+                    }
+                }
+                if (matchIdx < 0) {
+                    for (j in existing.indices) {
+                        if (!usedExisting[j] && existing[j].displayName == inc.displayName) {
+                            matchIdx = j
+                            break
+                        }
+                    }
+                }
+                if (matchIdx >= 0) {
+                    usedExisting[matchIdx] = true
+                    matchedIds[i] = existing[matchIdx].id
+                }
+            }
+
+            val reconciled = incoming.mapIndexed { idx, p ->
+                val reusedId = matchedIds[idx]
+                if (reusedId != null && reusedId != p.id) {
+                    Profile(
+                        id = reusedId,
+                        name = p.name,
+                        bean = p.bean,
+                        customConfig = p.customConfig,
+                        subscriptionId = p.subscriptionId,
+                    )
+                } else {
+                    p
+                }
+            }
+
+            val changed = existing.size != reconciled.size ||
+                existing.indices.any { idx ->
+                    existing[idx].id != reconciled[idx].id || existingSigs[idx] != incomingSigs[idx]
+                }
+            return reconciled to changed
+        }
 
         fun fromJson(json: JsonObject): Profile {
             val profile = Profile(

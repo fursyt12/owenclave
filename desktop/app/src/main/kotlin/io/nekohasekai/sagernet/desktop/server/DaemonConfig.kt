@@ -30,6 +30,8 @@ data class DaemonConfig(
     var mode: String = "rule",
     var logLevel: String = "info",
     var ipv6: Boolean = true,
+    var fallbackToDirect: Boolean = false,
+    var healthCheckInterval: Int = 0,
     val externalController: String = "0.0.0.0:9090",
     val secret: String = "",
     val subscriptionUserAgent: String = "Owenclave/${BuildConfig.VERSION_NAME}",
@@ -146,6 +148,16 @@ data class DaemonConfig(
                 ?: yamlBool("ipv6")
                 ?: true
 
+            val fallbackToDirect = argValue(args, "--fallback-to-direct")?.lowercase()?.let { it == "true" || it == "1" }
+                ?: env["FALLBACK_TO_DIRECT"]?.lowercase()?.let { it == "true" || it == "1" || it == "yes" }
+                ?: yamlBool("fallback-to-direct", "bypass-on-unavailable")
+                ?: false
+
+            val healthCheckInterval = argValue(args, "--health-check-interval")?.toIntOrNull()
+                ?: env["HEALTH_CHECK_INTERVAL"]?.toIntOrNull()
+                ?: yamlInt("health-check-interval")
+                ?: 0
+
             val controller = argValue(args, "--controller")
                 ?: env["EXTERNAL_CONTROLLER"]?.takeIf { it.isNotBlank() }
                 ?: yamlStr("external-controller")
@@ -217,6 +229,8 @@ data class DaemonConfig(
                 mode = mode,
                 logLevel = logLevel,
                 ipv6 = ipv6,
+                fallbackToDirect = fallbackToDirect,
+                healthCheckInterval = healthCheckInterval,
                 externalController = controller,
                 secret = secret,
                 subscriptionUserAgent = defaultUa,

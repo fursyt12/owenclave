@@ -290,18 +290,32 @@ class AppState(private val scope: CoroutineScope) {
                 }
             }
             result.onSuccess { beans ->
-                profiles.removeAll { it.subscriptionId == subscription.id }
-                beans.forEach { bean ->
-                    profiles.add(Profile(name = bean.name, bean = bean, subscriptionId = subscription.id))
+                val existing = profiles.filter { it.subscriptionId == subscription.id }
+                if (beans.isEmpty() && existing.isNotEmpty()) {
+                    subscription.lastError = "Subscription returned 0 profiles"
+                    status = "No profiles in ${subscription.displayName}; kept existing ${existing.size} profile(s)"
+                    appendLog(status)
+                } else {
+                    val incoming = beans.map { bean ->
+                        Profile(name = bean.name, bean = bean, subscriptionId = subscription.id)
+                    }
+                    val (reconciled, _) = Profile.reconcileProfiles(existing, incoming)
+                    val firstIdx = profiles.indexOfFirst { it.subscriptionId == subscription.id }
+                    profiles.removeAll { it.subscriptionId == subscription.id }
+                    if (firstIdx in 0..profiles.size) {
+                        profiles.addAll(firstIdx, reconciled)
+                    } else {
+                        profiles.addAll(reconciled)
+                    }
+                    subscription.lastUpdated = System.currentTimeMillis()
+                    subscription.lastError = null
+                    subscription.profileCount = reconciled.size
+                    if (selectedProfileId == null) selectedProfileId = profiles.firstOrNull()?.id
+                    status =
+                        if (reconciled.isEmpty()) "No profiles found in ${subscription.displayName}"
+                        else "Updated ${subscription.displayName}: ${reconciled.size} profile(s)"
+                    appendLog(status)
                 }
-                subscription.lastUpdated = System.currentTimeMillis()
-                subscription.lastError = null
-                subscription.profileCount = beans.size
-                if (selectedProfileId == null) selectedProfileId = profiles.firstOrNull()?.id
-                status =
-                    if (beans.isEmpty()) "No profiles found in ${subscription.displayName}"
-                    else "Updated ${subscription.displayName}: ${beans.size} profile(s)"
-                appendLog(status)
             }.onFailure {
                 // Never let the failure path depend on the class that just failed to
                 // load: describe() re-triggers SubscriptionImporter.<clinit> and a

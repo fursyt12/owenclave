@@ -227,14 +227,17 @@ val prepareWindowsPortable = tasks.register("prepareWindowsPortable") {
 
         val jarFile = appJarTask.get().archiveFile.get().asFile
         jarFile.copyTo(File(libDir, jarFile.name), overwrite = true)
-        runtimeClasspath.get().files.forEach { dep ->
+        val usedWinJarNames = HashSet<String>().apply { add(jarFile.name) }
+        runtimeClasspath.get().files.forEachIndexed { idx, dep ->
             if (dep.isFile && !dep.name.startsWith("skiko-awt-runtime-linux-")) {
-                dep.copyTo(File(libDir, dep.name), overwrite = true)
+                val dstName = if (usedWinJarNames.add(dep.name)) dep.name else "$idx-${dep.name}"
+                dep.copyTo(File(libDir, dstName), overwrite = true)
             }
         }
-        windowsSkikoRuntime.files.forEach { dep ->
+        windowsSkikoRuntime.files.forEachIndexed { idx, dep ->
             if (dep.isFile) {
-                dep.copyTo(File(libDir, dep.name), overwrite = true)
+                val dstName = if (usedWinJarNames.add(dep.name)) dep.name else "win-$idx-${dep.name}"
+                dep.copyTo(File(libDir, dstName), overwrite = true)
             }
         }
 
@@ -331,10 +334,12 @@ val prepareServerDist = tasks.register("prepareServerDist") {
 
         val jarFile = appJarTask.get().archiveFile.get().asFile
         jarFile.copyTo(File(libDir, jarFile.name), overwrite = true)
-        runtimeClasspath.get().files.forEach { dep ->
+        val usedServerJarNames = HashSet<String>().apply { add(jarFile.name) }
+        runtimeClasspath.get().files.forEachIndexed { idx, dep ->
             // Headless daemon never opens a Skiko window; omit GUI native runtimes to keep the image slim.
             if (dep.isFile && !dep.name.startsWith("skiko-awt-runtime-")) {
-                dep.copyTo(File(libDir, dep.name), overwrite = true)
+                val dstName = if (usedServerJarNames.add(dep.name)) dep.name else "$idx-${dep.name}"
+                dep.copyTo(File(libDir, dstName), overwrite = true)
             }
         }
 

@@ -15,6 +15,7 @@ import io.nekohasekai.sagernet.database.RuleEntity
 import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.fmt.AbstractBean
 import io.nekohasekai.sagernet.fmt.buildV2RayConfig
+import io.nekohasekai.sagernet.fmt.internal.BalancerBean
 
 /** Raised when a profile cannot be expressed as a V2Ray config for the core. */
 class UnsupportedProfileException(message: String) : Exception(message)
@@ -45,6 +46,20 @@ data class ServerInboundOptions(
     val username: String = "",
     val password: String = "",
     val tproxyPort: Int? = null,
+)
+
+/**
+ * Automatic multi-outbound health-checked group (`fallback`, `url-test`, `load-balance`)
+ * backed by `owenclave-core`'s `multiObservatory` + `routing.balancers`.
+ */
+data class BalancerSpec(
+    val id: String,
+    val profileIds: List<String>,
+    val strategy: String = "leastPing",
+    val stickyChoice: Boolean = false,
+    val probeUrl: String = "",
+    val probeIntervalSec: Int = 15,
+    val fallbackToDirect: Boolean = false,
 )
 
 /** Result of [DesktopConfigBuilder.build]: the core JSON plus the plugins to run. */
@@ -109,6 +124,8 @@ object DesktopConfigBuilder {
         bindInterface: String? = null,
         serverInbounds: ServerInboundOptions? = null,
         extraProfiles: List<Profile> = emptyList(),
+        balancers: List<BalancerSpec> = emptyList(),
+        primaryBalancer: BalancerSpec? = null,
     ): CoreConfig {
         val bean = profile.bean
         if (bean == null) {
@@ -122,14 +139,120 @@ object DesktopConfigBuilder {
         if (!supports(bean)) throw UnsupportedProfileException(unsupportedReason(bean))
 
         applySettings(settings)
-        val primaryId = entityIdOf(profile.id)
-        val extraEntityIds = registerExtraProfiles(profile.id, primaryId, extraProfiles)
-        installRules(rules, settings.bypassPrivateNetworks, profile.id, extraEntityIds)
+        val direct = settings.routeMode == DesktopSettings.ROUTE_DIRECT
 
-        val entity = ProxyEntity(id = primaryId, groupId = 0L).putBean(bean)
+        val allBeanProfiles = LinkedHashMap<String, Profile>()
+        allBeanProfiles[profile.id] = profile
+        for (extra in extraProfiles) {
+            if (extra.bean != null && extra.id !in allBeanProfiles) {
+                allBeanProfiles[extra.id] = extra
+            }
+        }
+
+        val validPrimaryMembers = if (!direct && primaryBalancer != null) {
+            primaryBalancer.profileIds.distinct().filter { it in allBeanProfiles }
+        } else {
+            emptyList()
+        }
+        val usePrimaryBalancer = validPrimaryMembers.isNotEmpty() && primaryBalancer != null
+
+        val usedIds = HashSet<Long>()
+        fun allocId(seed: String): Long {
+            var candidate = entityIdOf(seed)
+            while (!usedIds.add(candidate)) {
+                candidate++
+            }
+            return candidate
+        }
+
+        val primaryId = if (usePrimaryBalancer) {
+            allocId("balancer-primary:${primaryBalancer!!.id}")
+        } else {
+            allocId(profile.id)
+        }
+
+        val profileEntityIds = LinkedHashMap<String, Long>()
+        val dbEntities = ArrayList<ProxyEntity>()
+        if (!usePrimaryBalancer) {
+            profileEntityIds[profile.id] = primaryId
+            if (balancers.isNotEmpty()) {
+                dbEntities += ProxyEntity(id = primaryId, groupId = 0L).putBean(bean)
+            }
+        }
+        for ((pid, p) in allBeanProfiles) {
+            if (!usePrimaryBalancer && pid == profile.id) continue
+            val eid = allocId(pid)
+            profileEntityIds[pid] = eid
+            dbEntities += ProxyEntity(id = eid, groupId = 0L).putBean(p.bean!!)
+        }
+
+        val balancerEntityIds = LinkedHashMap<String, Long>()
+        val balancerDirectFallbackIds = HashSet<String>()
+        val balancerOverrides = LinkedHashMap<String, BalancerSpec>()
+
+        fun makeBalancerBean(spec: BalancerSpec, memberIds: List<String>): BalancerBean =
+            BalancerBean().apply {
+                initializeDefaultValues()
+                name = spec.id
+                type = BalancerBean.TYPE_LIST
+                strategy = spec.strategy.ifBlank { "leastPing" }
+                proxies = ArrayList(memberIds.mapNotNull { profileEntityIds[it] })
+                probeUrl = spec.probeUrl
+                probeInterval = spec.probeIntervalSec.coerceIn(1, 3600)
+            }
+
+        val entity = if (usePrimaryBalancer) {
+            val pSpec = primaryBalancer!!
+            balancerEntityIds[pSpec.id] = 0L
+            balancerOverrides["balancer-proxy"] = pSpec
+            ProxyEntity(id = primaryId, groupId = 0L).putBean(makeBalancerBean(pSpec, validPrimaryMembers))
+        } else {
+            ProxyEntity(id = primaryId, groupId = 0L).putBean(bean)
+        }
+
+        if (!direct) {
+            for (bSpec in balancers) {
+                val members = bSpec.profileIds.distinct().filter { it in profileEntityIds }
+                if (members.isEmpty()) {
+                    if (bSpec.fallbackToDirect) balancerDirectFallbackIds += bSpec.id
+                    continue
+                }
+                val sameAsPrimary = usePrimaryBalancer && primaryBalancer != null && (
+                    bSpec.id == primaryBalancer.id || (
+                        members == validPrimaryMembers &&
+                            bSpec.strategy == primaryBalancer.strategy &&
+                            bSpec.stickyChoice == primaryBalancer.stickyChoice &&
+                            bSpec.probeUrl == primaryBalancer.probeUrl &&
+                            bSpec.probeIntervalSec == primaryBalancer.probeIntervalSec &&
+                            bSpec.fallbackToDirect == primaryBalancer.fallbackToDirect
+                        )
+                    )
+                if (sameAsPrimary) {
+                    balancerEntityIds[bSpec.id] = 0L
+                    continue
+                }
+                val bEntityId = allocId("balancer:${bSpec.id}")
+                balancerEntityIds[bSpec.id] = bEntityId
+                balancerOverrides["balancer-proxy-$bEntityId"] = bSpec
+                dbEntities += ProxyEntity(id = bEntityId, groupId = 0L).putBean(makeBalancerBean(bSpec, members))
+            }
+        }
+
+        if (dbEntities.isNotEmpty()) {
+            SagerDatabase.proxyDao.updateProxy(dbEntities)
+        }
+
+        installRules(
+            rules = rules,
+            bypassPrivateNetworks = settings.bypassPrivateNetworks,
+            primaryProfileId = if (usePrimaryBalancer) "" else profile.id,
+            extraEntityIds = profileEntityIds,
+            balancerEntityIds = balancerEntityIds,
+            balancerDirectFallbackIds = balancerDirectFallbackIds,
+        )
+
         val result = buildV2RayConfig(entity)
 
-        val direct = settings.routeMode == DesktopSettings.ROUTE_DIRECT
         val plugins = if (direct) {
             // The proxy outbound is replaced by a freedom outbound below, so no
             // external engine is needed at all.
@@ -144,11 +267,13 @@ object DesktopConfigBuilder {
 
         return CoreConfig(
             postProcess(
-                result.config,
-                settings,
-                bindInterface,
-                (result.outboundTagsCurrent + result.outboundTags).toSet(),
-                serverInbounds,
+                config = result.config,
+                settings = settings,
+                bindInterface = bindInterface,
+                proxyTags = (result.outboundTagsCurrent + result.outboundTags).toSet(),
+                serverInbounds = serverInbounds,
+                balancerOverrides = balancerOverrides,
+                localPluginPorts = plugins.map { it.port }.toSet(),
             ),
             plugins,
         )
@@ -156,31 +281,6 @@ object DesktopConfigBuilder {
 
     internal fun entityIdOf(profileId: String): Long =
         (profileId.hashCode().toLong() and 0x7FFF_FFFFL) + 100L
-
-    private fun registerExtraProfiles(
-        primaryProfileId: String,
-        primaryEntityId: Long,
-        extraProfiles: List<Profile>,
-    ): Map<String, Long> {
-        if (extraProfiles.isEmpty()) return emptyMap()
-        val ids = LinkedHashMap<String, Long>()
-        val used = HashSet<Long>().apply { add(primaryEntityId) }
-        val entities = ArrayList<ProxyEntity>()
-        for (extra in extraProfiles) {
-            if (extra.id == primaryProfileId) continue
-            val extraBean = extra.bean ?: continue
-            var candidate = entityIdOf(extra.id)
-            while (!used.add(candidate)) {
-                candidate++
-            }
-            ids[extra.id] = candidate
-            entities += ProxyEntity(id = candidate, groupId = 0L).putBean(extraBean)
-        }
-        if (entities.isNotEmpty()) {
-            SagerDatabase.proxyDao.updateProxy(entities)
-        }
-        return ids
-    }
 
     // ------------------------------------------------------------------ settings
 
@@ -331,12 +431,46 @@ object DesktopConfigBuilder {
         bypassPrivateNetworks: Boolean,
         primaryProfileId: String = "",
         extraEntityIds: Map<String, Long> = emptyMap(),
+        balancerEntityIds: Map<String, Long> = emptyMap(),
+        balancerDirectFallbackIds: Set<String> = emptySet(),
     ) {
         val entities = ArrayList<RuleEntity>()
-        rules.forEachIndexed { index, rule ->
+        var privateInserted = false
+
+        fun appendPrivateBypass() {
+            if (bypassPrivateNetworks && !privateInserted) {
+                privateInserted = true
+                entities += RuleEntity(
+                    id = entities.size.toLong() + 1,
+                    name = "Bypass private networks",
+                    userOrder = entities.size.toLong(),
+                    enabled = true,
+                    ip = PRIVATE_NETWORKS.joinToString("\n"),
+                    outbound = -1L,
+                )
+            }
+        }
+
+        for (rule in rules) {
+            val isPureCatchAll = rule.domains.isEmpty() &&
+                rule.ip.isEmpty() &&
+                rule.port.isEmpty() &&
+                rule.protocol.isEmpty()
+            if (isPureCatchAll) {
+                // Keep RFC1918 / loopback bypass ahead of Mihomo `MATCH` catch-alls.
+                appendPrivateBypass()
+            }
             val resolvedOutbound = when {
                 rule.target == RuleTarget.DIRECT.tag -> -1L
                 rule.target == RuleTarget.BLOCK.tag -> -2L
+                rule.target.startsWith("balancer:") -> {
+                    val bId = rule.target.removePrefix("balancer:")
+                    when {
+                        bId in balancerDirectFallbackIds -> -1L
+                        bId in balancerEntityIds -> balancerEntityIds.getValue(bId)
+                        else -> 0L
+                    }
+                }
                 rule.target.startsWith("profile:") -> {
                     val targetProfileId = rule.target.removePrefix("profile:")
                     if (targetProfileId == primaryProfileId) 0L else (extraEntityIds[targetProfileId] ?: 0L)
@@ -344,9 +478,9 @@ object DesktopConfigBuilder {
                 else -> 0L
             }
             entities += RuleEntity(
-                id = index.toLong() + 1,
+                id = entities.size.toLong() + 1,
                 name = rule.name,
-                userOrder = index.toLong(),
+                userOrder = entities.size.toLong(),
                 enabled = rule.enabled,
                 domains = rule.domains,
                 ip = rule.ip,
@@ -356,16 +490,7 @@ object DesktopConfigBuilder {
                 outbound = resolvedOutbound,
             )
         }
-        if (bypassPrivateNetworks) {
-            entities += RuleEntity(
-                id = entities.size.toLong() + 1,
-                name = "Bypass private networks",
-                userOrder = entities.size.toLong(),
-                enabled = true,
-                ip = PRIVATE_NETWORKS.joinToString("\n"),
-                outbound = -1L,
-            )
-        }
+        appendPrivateBypass()
         androidx.room.DesktopSagerDatabase.enabledRulesOverride = entities
     }
 
@@ -384,6 +509,8 @@ object DesktopConfigBuilder {
         bindInterface: String?,
         proxyTags: Set<String>,
         serverInbounds: ServerInboundOptions? = null,
+        balancerOverrides: Map<String, BalancerSpec> = emptyMap(),
+        localPluginPorts: Set<Int> = emptySet(),
     ): String {
         val root = runCatching { JsonParser.parseString(config).asJsonObject }.getOrElse { return config }
 
@@ -457,6 +584,20 @@ object DesktopConfigBuilder {
         // 2. Routing rules that referenced a dropped inbound (`dns-in` fed the
         //    `dns-out` outbound) would make the core reject the config.
         root.getAsJsonObject("routing")?.let { routing ->
+            routing.getAsJsonArray("balancers")?.forEach { element ->
+                val balancerObj = element.asJsonObject
+                val bTag = balancerObj.get("tag")?.asString ?: return@forEach
+                val spec = balancerOverrides[bTag] ?: return@forEach
+                if (spec.fallbackToDirect) {
+                    balancerObj.addProperty("fallbackTag", "bypass")
+                } else if (spec.stickyChoice && spec.strategy == "leastPing") {
+                    // Exclave-core's stickyChoice caches the last alive tag even after all nodes die,
+                    // which suppresses `fallbackTag`; only enable stickyChoice when fallbackToDirect is off.
+                    balancerObj.getAsJsonObject("strategy")
+                        ?.getAsJsonObject("settings")
+                        ?.addProperty("stickyChoice", true)
+                }
+            }
             val rules = routing.getAsJsonArray("rules")
             if (rules != null) {
                 val keptRules = JsonArray()
@@ -467,7 +608,9 @@ object DesktopConfigBuilder {
                     keptRules.add(rule)
                 }
                 routing.add("rules", keptRules)
-                if (keptRules.size() == 0) root.remove("routing")
+                if (keptRules.size() == 0 && routing.getAsJsonArray("balancers") == null) {
+                    root.remove("routing")
+                }
             }
         }
 
@@ -490,11 +633,12 @@ object DesktopConfigBuilder {
         }
 
         // 4. Transparent mode: every outbound that dials a real socket (so
-        //    everything except blackhole and the internal DNS) has to be pinned
+        //    everything except blackhole, internal DNS, and local loopback
+        //    SOCKS bridges to external plugins like NaiveProxy) has to be pinned
         //    to the physical interface, otherwise it would loop back into TUN.
         if (!bindInterface.isNullOrBlank()) {
             outbounds.forEach { element ->
-                element.asJsonObject.bindToInterface(bindInterface)
+                element.asJsonObject.bindToInterface(bindInterface, localPluginPorts)
             }
         }
 
@@ -512,9 +656,19 @@ object DesktopConfigBuilder {
     }
 
     /** Pins every socket of this outbound to a network interface. */
-    private fun JsonObject.bindToInterface(interfaceName: String) {
+    private fun JsonObject.bindToInterface(interfaceName: String, localPluginPorts: Set<Int> = emptySet()) {
         val protocol = get("protocol")?.asString
         if (protocol == "blackhole" || protocol == "dns") return
+        if (protocol == "socks" && localPluginPorts.isNotEmpty()) {
+            val servers = getAsJsonObject("settings")?.getAsJsonArray("servers")
+            val targetsLocalPlugin = servers != null && servers.size() > 0 && servers.all { srv ->
+                val obj = srv.asJsonObject
+                val addr = obj.get("address")?.asString
+                val port = obj.get("port")?.asInt
+                (addr == "127.0.0.1" || addr == "::1") && port != null && port in localPluginPorts
+            }
+            if (targetsLocalPlugin) return
+        }
         val streamSettings = getAsJsonObject("streamSettings") ?: JsonObject().also { add("streamSettings", it) }
         val sockopt = streamSettings.getAsJsonObject("sockopt") ?: JsonObject().also { streamSettings.add("sockopt", it) }
         sockopt.addProperty("bindToDevice", interfaceName)

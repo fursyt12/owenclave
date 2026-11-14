@@ -17,6 +17,7 @@ services:
       SECRET: ${SECRET:-}
       SUBSCRIPTION_URL: ${SUBSCRIPTION_URL:-}
       INTERFACE_NAME: ${INTERFACE_NAME:-}
+      FALLBACK_TO_DIRECT: ${FALLBACK_TO_DIRECT:-true}
     volumes:
       - ./docker/config:/config
       - ./docker/data:/data

@@ -6,7 +6,9 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import io.nekohasekai.sagernet.BuildConfig
 import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.desktop.BalancerSpec
 import io.nekohasekai.sagernet.desktop.CoreRunner
+import io.nekohasekai.sagernet.desktop.DesktopConfigBuilder
 import io.nekohasekai.sagernet.desktop.DesktopSettings
 import io.nekohasekai.sagernet.desktop.Profile
 import io.nekohasekai.sagernet.desktop.RoutingRule
@@ -71,9 +73,16 @@ class DaemonEngine(val config: DaemonConfig) {
     private val gson = GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create()
     private val stateFile = File(config.dataDir, "daemon-state.json")
     private val ruleCacheDir = File(config.dataDir, "rule-providers")
+    private val subCacheDir = File(config.dataDir, "subscriptions-cache")
+
+    private fun subCacheFile(subId: String): File {
+        val safe = subId.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        return File(subCacheDir, "$safe.yaml")
+    }
 
     private val logBuffer = ArrayDeque<LogRecord>(MAX_LOGS)
     private val delayHistory = LinkedHashMap<String, MutableList<DelayRecord>>()
+    private val nodeHealth = LinkedHashMap<String, Boolean>()
 
     private val configProfiles = ArrayList<Profile>()
     private val manualProfiles = ArrayList<Profile>()
@@ -89,12 +98,16 @@ class DaemonEngine(val config: DaemonConfig) {
     private var selectedProfileId: String? = null
     private var internalSocksPort: Int = 0
     private var tproxyDisabledFallback: Boolean = false
+    private var lastAppliedCoreSignature: String? = null
 
     @Volatile
     var startedAtMillis: Long = 0L
         private set
 
-    private val runner = CoreRunner(workDir = config.dataDir) { line -> recordLog(classifyLogLevel(line), line) }
+    private val runner = CoreRunner(workDir = config.dataDir) { line ->
+        observeCoreLine(line)
+        recordLog(classifyLogLevel(line), line)
+    }
     private var scheduler: ScheduledExecutorService? = null
 
     fun start() {
@@ -156,6 +169,7 @@ class DaemonEngine(val config: DaemonConfig) {
         scheduler?.shutdownNow()
         scheduler = null
         synchronized(lock) {
+            lastAppliedCoreSignature = null
             runCatching { runner.stop() }
         }
     }
@@ -173,6 +187,10 @@ class DaemonEngine(val config: DaemonConfig) {
     }
 
     fun isCoreRunning(): Boolean = runner.running
+
+    fun coreStartCount(): Int = runner.startCount
+
+    fun corePid(): Long? = runner.corePid
 
     fun lastCoreError(): String? = runner.lastError
 
@@ -235,6 +253,11 @@ class DaemonEngine(val config: DaemonConfig) {
 
     fun delayHistoryOf(name: String): List<DelayRecord> = synchronized(lock) {
         delayHistory[name]?.toList().orEmpty()
+    }
+
+    /** `true` if observatory probed the node alive, `false` if dead, `null` if not yet probed. */
+    fun nodeHealthOf(profileId: String): Boolean? = synchronized(lock) {
+        nodeHealth[profileId]
     }
 
     // --------------------------------------------------------------- mutations
@@ -438,7 +461,10 @@ class DaemonEngine(val config: DaemonConfig) {
         return sub
     }
 
-    fun refreshSubscription(idOrName: String, reloadAfter: Boolean = true): Subscription {
+    fun refreshSubscription(idOrName: String, reloadAfter: Boolean = true): Subscription =
+        refreshSubscriptionInternal(idOrName, reloadAfter).first
+
+    private fun refreshSubscriptionInternal(idOrName: String, reloadAfter: Boolean): Pair<Subscription, Boolean> {
         val (sub, ua, socksPort) = synchronized(lock) {
             val found = subscriptions.firstOrNull { it.id == idOrName || it.displayName == idOrName }
                 ?: throw IllegalArgumentException("subscription not found: $idOrName")
@@ -449,60 +475,122 @@ class DaemonEngine(val config: DaemonConfig) {
 
         val headers = DesktopSettings().hwidHeaders(sub.sendHwid)
         // Download directly first so bootstrap works even before upstream is connected,
-        // or via running proxy if direct fails.
-        val body = runCatching {
-            SubscriptionImporter.download(sub.url, socksPort = null, headers = headers, customUserAgent = ua)
-        }.getOrElse { directErr ->
-            if (socksPort != null) {
-                SubscriptionImporter.download(sub.url, socksPort = socksPort, headers = headers, customUserAgent = ua)
-            } else {
-                throw directErr
+        // or via running proxy if direct fails. Never touch running connections on failure.
+        val body = try {
+            runCatching {
+                SubscriptionImporter.download(sub.url, socksPort = null, headers = headers, customUserAgent = ua)
+            }.getOrElse { directErr ->
+                if (socksPort != null) {
+                    SubscriptionImporter.download(sub.url, socksPort = socksPort, headers = headers, customUserAgent = ua)
+                } else {
+                    throw directErr
+                }
             }
+        } catch (err: Throwable) {
+            synchronized(lock) {
+                sub.lastError = err.message ?: err.javaClass.simpleName
+                persistStateLocked()
+            }
+            recordLog("warning", "subscription '${sub.displayName}' failed to update (${err.message}); keeping active session")
+            throw err
         }
 
         val mihomoDoc = MihomoYamlSupport.parseDocument(body, subscriptionId = sub.id)
         val parsedProfiles = if (mihomoDoc != null && (mihomoDoc.profiles.isNotEmpty() || mihomoDoc.rawRules.isNotEmpty())) {
             mihomoDoc.profiles
         } else {
-            SubscriptionImporter.parse(body).map { bean ->
+            runCatching { SubscriptionImporter.parse(body) }.getOrDefault(emptyList()).map { bean ->
                 Profile(name = bean.name, bean = bean, subscriptionId = sub.id)
             }
         }
+        val newDoc = mihomoDoc?.takeIf { it.groups.isNotEmpty() || it.rawRules.isNotEmpty() }
 
+        var effectiveChanged = false
+        var finalCount = 0
         synchronized(lock) {
-            subscriptionProfiles.removeAll { it.subscriptionId == sub.id }
-            subscriptionProfiles.addAll(parsedProfiles)
-            if (mihomoDoc != null && (mihomoDoc.groups.isNotEmpty() || mihomoDoc.rawRules.isNotEmpty())) {
-                subscriptionDocuments[sub.id] = mihomoDoc
+            val existingForSub = subscriptionProfiles.filter { it.subscriptionId == sub.id }
+            if (parsedProfiles.isEmpty() && (newDoc == null || existingForSub.isNotEmpty())) {
+                val msg = if (existingForSub.isNotEmpty()) {
+                    "subscription '${sub.displayName}' returned 0 proxy servers; keeping existing ${existingForSub.size} server(s)"
+                } else {
+                    "subscription '${sub.displayName}' returned no valid profiles or rules"
+                }
+                sub.lastError = msg
+                persistStateLocked()
+                recordLog("warning", "$msg; keeping active session")
+                throw IllegalStateException(msg)
             }
+
+            val (reconciledProfiles, profilesChanged) = Profile.reconcileProfiles(existingForSub, parsedProfiles)
+            val oldDoc = subscriptionDocuments[sub.id]
+            val docChanged = when {
+                newDoc == null && oldDoc == null -> false
+                newDoc != null && oldDoc != null -> !newDoc.hasSameRoutingSemantics(oldDoc)
+                else -> true
+            }
+
+            if (profilesChanged) {
+                val firstIdx = subscriptionProfiles.indexOfFirst { it.subscriptionId == sub.id }
+                subscriptionProfiles.removeAll { it.subscriptionId == sub.id }
+                if (firstIdx in 0..subscriptionProfiles.size) {
+                    subscriptionProfiles.addAll(firstIdx, reconciledProfiles)
+                } else {
+                    subscriptionProfiles.addAll(reconciledProfiles)
+                }
+            }
+
+            if (newDoc != null) {
+                if (docChanged || profilesChanged || oldDoc == null) {
+                    subscriptionDocuments[sub.id] = newDoc.copy(profiles = reconciledProfiles)
+                }
+                if (docChanged || !subCacheFile(sub.id).isFile) {
+                    runCatching {
+                        subCacheDir.mkdirs()
+                        subCacheFile(sub.id).writeText(body)
+                    }
+                }
+            } else if (oldDoc != null) {
+                subscriptionDocuments.remove(sub.id)
+                runCatching { subCacheFile(sub.id).delete() }
+            }
+
+            val prevSelected = selectedProfileId
+            ensureSelectionLocked()
+            val selectionChanged = selectedProfileId != prevSelected
+
             sub.lastUpdated = System.currentTimeMillis()
             sub.lastError = null
-            sub.profileCount = parsedProfiles.size
-            ensureSelectionLocked()
+            sub.profileCount = reconciledProfiles.size
+            finalCount = reconciledProfiles.size
+            effectiveChanged = profilesChanged || docChanged || selectionChanged
             persistStateLocked()
-            if (reloadAfter) reloadCoreLocked()
+
+            if (reloadAfter) {
+                if (effectiveChanged || !runner.healthy) {
+                    reloadCoreLocked()
+                }
+            }
         }
-        recordLog("info", "updated subscription '${sub.displayName}': ${parsedProfiles.size} profile(s)")
-        return sub
+        if (effectiveChanged) {
+            recordLog("info", "updated subscription '${sub.displayName}': $finalCount profile(s)")
+        } else {
+            recordLog("info", "subscription '${sub.displayName}' unchanged ($finalCount profile(s)); keeping active session")
+        }
+        return sub to effectiveChanged
     }
 
     fun refreshAllSubscriptions() {
         val ids = synchronized(lock) { subscriptions.map { it.id } }
-        var changed = false
+        if (ids.isEmpty()) return
+        var anyChanged = false
         for (id in ids) {
             runCatching {
-                refreshSubscription(id, reloadAfter = false)
-                changed = true
-            }.onFailure { err ->
-                synchronized(lock) {
-                    subscriptions.firstOrNull { it.id == id }?.lastError = err.message
-                    persistStateLocked()
-                }
-                recordLog("warning", "subscription refresh failed ($id): ${err.message}")
+                val (_, subChanged) = refreshSubscriptionInternal(id, reloadAfter = false)
+                if (subChanged) anyChanged = true
             }
         }
-        if (changed) {
-            synchronized(lock) {
+        synchronized(lock) {
+            if (anyChanged || !runner.healthy) {
                 ensureSelectionLocked()
                 persistStateLocked()
                 reloadCoreLocked()
@@ -515,6 +603,7 @@ class DaemonEngine(val config: DaemonConfig) {
         subscriptions.remove(sub)
         subscriptionUserAgents.remove(sub.id)
         subscriptionDocuments.remove(sub.id)
+        runCatching { subCacheFile(sub.id).delete() }
         subscriptionProfiles.removeAll { it.subscriptionId == sub.id }
         ensureSelectionLocked()
         persistStateLocked()
@@ -576,23 +665,31 @@ class DaemonEngine(val config: DaemonConfig) {
             patch.get("ipv6")?.takeIf { !it.isJsonNull }?.asBoolean?.let { v6 ->
                 config.ipv6 = v6
             }
+            patch.get("fallback-to-direct")?.takeIf { !it.isJsonNull }?.asBoolean?.let { fb ->
+                config.fallbackToDirect = fb
+            }
+            patch.get("health-check-interval")?.takeIf { !it.isJsonNull }?.asInt?.let { sec ->
+                if (sec in 0..3600) config.healthCheckInterval = sec
+            }
             persistStateLocked()
             reloadCoreLocked()
         }
     }
 
-    fun reload() {
+    fun reload(forceRestart: Boolean = true) {
         synchronized(lock) {
             config.configFile?.takeIf { it.isFile }?.let { file ->
                 runCatching { file.readText() }.getOrNull()?.let { raw ->
-                    configDocument = MihomoYamlSupport.parseDocument(raw, subscriptionId = null)
+                    val parsed = MihomoYamlSupport.parseDocument(raw, subscriptionId = null)
+                    val (reconciled, _) = Profile.reconcileProfiles(configProfiles, parsed?.profiles.orEmpty())
+                    configDocument = parsed?.copy(profiles = reconciled)
                     configProfiles.clear()
-                    configDocument?.profiles?.let { configProfiles.addAll(it) }
+                    configProfiles.addAll(reconciled)
                 }
             }
             ensureSelectionLocked()
             persistStateLocked()
-            reloadCoreLocked()
+            reloadCoreLocked(forceRestart = forceRestart)
         }
     }
 
@@ -638,7 +735,7 @@ class DaemonEngine(val config: DaemonConfig) {
 
     // --------------------------------------------------------- core supervision
 
-    private fun reloadCoreLocked() {
+    private fun reloadCoreLocked(forceRestart: Boolean = false) {
         val active = activeProfileLocked()
         // When no profile exists yet, use a synthetic freedom-compatible placeholder in DIRECT mode
         // so `mixed-port` and health probes remain online.
@@ -654,18 +751,18 @@ class DaemonEngine(val config: DaemonConfig) {
         )
         val forceDirect = active == null || config.mode == "direct"
 
-        val localSocksPort = if (config.socksPort > 0 && (!config.allowLan || config.effectiveListenAddress() in setOf("0.0.0.0", "127.0.0.1"))) {
-            config.socksPort
-        } else {
-            CoreRunner.freePort()
-        }
-        internalSocksPort = localSocksPort
-
+        val balancersMap = LinkedHashMap<String, BalancerSpec>()
         val compiledRules = if (config.mode == "rule" && !forceDirect) {
-            buildEffectiveRulesLocked()
+            buildEffectiveRulesLocked(balancersMap)
         } else {
             emptyList()
         }
+        val primaryBalancer = if (!forceDirect) {
+            resolvePrimaryBalancerLocked(effectiveProfile)
+        } else {
+            null
+        }
+        val allBalancers = balancersMap.values.toList()
 
         val routeMode = when {
             forceDirect -> DesktopSettings.ROUTE_DIRECT
@@ -674,6 +771,38 @@ class DaemonEngine(val config: DaemonConfig) {
         }
 
         val exposeSocksOnLan = config.allowLan && config.effectiveListenAddress() == "0.0.0.0" && config.socksPort > 0
+        val requestedTproxy = config.tproxyPort.takeIf { it > 0 && !tproxyDisabledFallback }
+        val inbounds = ServerInboundOptions(
+            mixedPort = config.mixedPort.takeIf { it > 0 },
+            bindAddress = config.effectiveListenAddress(),
+            tproxyPort = requestedTproxy,
+        )
+        val allProfiles = allProfilesLocked()
+        val outIface = config.interfaceName.takeIf { it.isNotBlank() }
+
+        val stateSignature = buildCoreStateSignature(
+            effectiveProfile = effectiveProfile,
+            allProfiles = allProfiles,
+            compiledRules = compiledRules,
+            primaryBalancer = primaryBalancer,
+            allBalancers = allBalancers,
+            routeMode = routeMode,
+            exposeSocksOnLan = exposeSocksOnLan,
+            inbounds = inbounds,
+            outIface = outIface,
+        )
+        if (!forceRestart && runner.healthy && stateSignature == lastAppliedCoreSignature) {
+            recordLog("info", "core configuration unchanged; keeping active session")
+            return
+        }
+
+        val localSocksPort = if (config.socksPort > 0 && (!config.allowLan || config.effectiveListenAddress() in setOf("0.0.0.0", "127.0.0.1"))) {
+            config.socksPort
+        } else {
+            CoreRunner.freePort()
+        }
+        internalSocksPort = localSocksPort
+
         var desktopSettings = DesktopSettings(
             socksPort = localSocksPort,
             httpPort = config.httpPort.takeIf { it > 0 } ?: CoreRunner.freePort(),
@@ -690,15 +819,6 @@ class DaemonEngine(val config: DaemonConfig) {
                 .withValue(Key.DIRECT_DNS_QUERY_STRATEGY, "UseIPv4")
         }
 
-        val requestedTproxy = config.tproxyPort.takeIf { it > 0 && !tproxyDisabledFallback }
-        val inbounds = ServerInboundOptions(
-            mixedPort = config.mixedPort.takeIf { it > 0 },
-            bindAddress = config.effectiveListenAddress(),
-            tproxyPort = requestedTproxy,
-        )
-        val allProfiles = allProfilesLocked()
-        val outIface = config.interfaceName.takeIf { it.isNotBlank() }
-
         try {
             runner.start(
                 profile = effectiveProfile,
@@ -707,11 +827,19 @@ class DaemonEngine(val config: DaemonConfig) {
                 bindInterfaceOverride = outIface,
                 serverInbounds = inbounds,
                 extraProfiles = allProfiles,
+                balancers = allBalancers,
+                primaryBalancer = primaryBalancer,
             )
+            lastAppliedCoreSignature = stateSignature
             recordLog(
                 "info",
                 "core active: mode=${if (forceDirect) "direct" else config.mode}, " +
                     "profile='${effectiveProfile.displayName}' (${effectiveProfile.protocolName}), " +
+                    (if (primaryBalancer != null) {
+                        "balancer='${primaryBalancer.id}' (${primaryBalancer.profileIds.size} server(s), fallbackToDirect=${primaryBalancer.fallbackToDirect}), "
+                    } else {
+                        ""
+                    }) +
                     "mixed=${config.effectiveListenAddress()}:${config.mixedPort}, " +
                     "rules=${compiledRules.size}" +
                     (if (requestedTproxy != null) ", tproxy=${config.effectiveListenAddress()}:$requestedTproxy" else "") +
@@ -724,18 +852,70 @@ class DaemonEngine(val config: DaemonConfig) {
                     "tproxy-port $requestedTproxy could not start (${e.message}); retrying without TProxy inbound",
                 )
                 tproxyDisabledFallback = true
+                val fallbackInbounds = inbounds.copy(tproxyPort = null)
                 runner.start(
                     profile = effectiveProfile,
                     settings = desktopSettings,
                     rules = compiledRules,
                     bindInterfaceOverride = outIface,
-                    serverInbounds = inbounds.copy(tproxyPort = null),
+                    serverInbounds = fallbackInbounds,
                     extraProfiles = allProfiles,
+                    balancers = allBalancers,
+                    primaryBalancer = primaryBalancer,
+                )
+                lastAppliedCoreSignature = buildCoreStateSignature(
+                    effectiveProfile = effectiveProfile,
+                    allProfiles = allProfiles,
+                    compiledRules = compiledRules,
+                    primaryBalancer = primaryBalancer,
+                    allBalancers = allBalancers,
+                    routeMode = routeMode,
+                    exposeSocksOnLan = exposeSocksOnLan,
+                    inbounds = fallbackInbounds,
+                    outIface = outIface,
                 )
             } else {
                 recordLog("error", "failed to start core: ${e.message}")
                 throw e
             }
+        }
+    }
+
+    private fun buildCoreStateSignature(
+        effectiveProfile: Profile,
+        allProfiles: List<Profile>,
+        compiledRules: List<RoutingRule>,
+        primaryBalancer: BalancerSpec?,
+        allBalancers: List<BalancerSpec>,
+        routeMode: String,
+        exposeSocksOnLan: Boolean,
+        inbounds: ServerInboundOptions,
+        outIface: String?,
+    ): String = buildString(1024) {
+        append("mode=").append(routeMode)
+        append("|log=").append(config.toCoreLogLevel())
+        append("|ipv6=").append(config.ipv6)
+        append("|socks=").append(config.socksPort)
+        append("|http=").append(config.httpPort)
+        append("|lanSocks=").append(exposeSocksOnLan)
+        append("|inbounds=").append(inbounds)
+        append("|iface=").append(outIface.orEmpty())
+        append("|active=").append(effectiveProfile.id).append(':').append(effectiveProfile.contentSignature())
+        append("|primaryBalancer=").append(primaryBalancer)
+        append("|balancers=").append(allBalancers)
+        append("|profiles=")
+        for (p in allProfiles) {
+            append(p.id).append(':').append(p.contentSignature()).append(';')
+        }
+        append("|rules=")
+        for (r in compiledRules) {
+            append(r.enabled).append('|')
+                .append(r.target).append('|')
+                .append(r.domains).append('|')
+                .append(r.ip).append('|')
+                .append(r.port).append('|')
+                .append(r.network).append('|')
+                .append(r.protocol).append(';')
         }
     }
 
@@ -761,13 +941,21 @@ class DaemonEngine(val config: DaemonConfig) {
         val ruleProviders = LinkedHashMap<String, MihomoYamlSupport.RuleProviderSpec>()
         val rawRules = ArrayList<String>()
 
+        // Seed subscription groups first so overriding a group by name in `config.yaml`
+        // preserves the subscription's group display order while letting `config.yaml` win.
+        for (subDoc in subscriptionDocuments.values) {
+            subDoc.groups.forEach { g ->
+                if (g.name !in groupsByName) groupsByName[g.name] = g
+            }
+        }
+        configDocument?.groups?.forEach { g ->
+            groupsByName[g.name] = g
+        }
+
         for (doc in docs) {
             virtualDirect += doc.virtualDirectNames
             virtualReject += doc.virtualRejectNames
             virtualDns += doc.virtualDnsNames
-            doc.groups.forEach { g ->
-                if (g.name !in groupsByName) groupsByName[g.name] = g
-            }
             doc.ruleProviders.forEach { (k, v) ->
                 if (k !in ruleProviders) ruleProviders[k] = v
             }
@@ -785,7 +973,45 @@ class DaemonEngine(val config: DaemonConfig) {
         )
     }
 
-    private fun buildEffectiveRulesLocked(): List<RoutingRule> {
+    private fun resolvePrimaryBalancerLocked(effectiveProfile: Profile): BalancerSpec? {
+        val allProfiles = allProfilesLocked()
+        if (allProfiles.isEmpty()) return null
+        val profilesByName = allProfiles.associateBy { it.displayName }
+        val merged = mergedMihomoContextLocked()
+
+        if (merged.groups.isNotEmpty()) {
+            val rootTarget = groupSelections["GLOBAL"]
+                ?.takeIf { it.isNotBlank() && !it.equals("DIRECT", ignoreCase = true) }
+                ?: merged.groups.firstOrNull { it.name.equals("PROXY", ignoreCase = true) }?.name
+                ?: merged.groups.first().name
+            val resolved = MihomoYamlSupport.resolveBalancerSpec(
+                targetName = rootTarget,
+                profilesByName = profilesByName,
+                groupsByName = merged.groupsByName,
+                groupSelections = groupSelections,
+                virtualDirect = merged.virtualDirect,
+                virtualReject = merged.virtualReject,
+                defaultFallbackToDirect = config.fallbackToDirect,
+                healthCheckIntervalCap = config.healthCheckInterval,
+            )
+            if (resolved != null) return resolved
+        }
+
+        if (config.fallbackToDirect && effectiveProfile.bean != null) {
+            val interval = (if (config.healthCheckInterval > 0) config.healthCheckInterval else 15).coerceIn(1, 3600)
+            return BalancerSpec(
+                id = "primary-fb:${effectiveProfile.id}",
+                profileIds = listOf(effectiveProfile.id),
+                strategy = "leastPing",
+                stickyChoice = false,
+                probeIntervalSec = interval,
+                fallbackToDirect = true,
+            )
+        }
+        return null
+    }
+
+    private fun buildEffectiveRulesLocked(balancersOut: MutableMap<String, BalancerSpec>): List<RoutingRule> {
         val rules = ArrayList<RoutingRule>()
         userRules.filter { it.enabled && it.hasMatchers }.forEach { rules += it }
         val merged = mergedMihomoContextLocked()
@@ -803,6 +1029,9 @@ class DaemonEngine(val config: DaemonConfig) {
                 configBaseDir = config.configFile?.parentFile,
                 socksPort = null,
                 profilesByName = profilesByName,
+                balancersOut = balancersOut,
+                defaultFallbackToDirect = config.fallbackToDirect,
+                healthCheckIntervalCap = config.healthCheckInterval,
                 log = { msg -> recordLog("info", msg) },
             )
         }
@@ -812,13 +1041,30 @@ class DaemonEngine(val config: DaemonConfig) {
     private fun buildGroupViewsLocked(): List<GroupView> {
         val profiles = allProfilesLocked()
         val profileNames = profiles.map { it.displayName }
+        val profilesByName = profiles.associateBy { it.displayName }
         val merged = mergedMihomoContextLocked()
         val views = ArrayList<GroupView>()
 
         for (spec in merged.groups) {
-            val choices = if (spec.proxies.isNotEmpty()) spec.proxies else profileNames + "DIRECT"
-            val now = groupSelections[spec.name]?.takeIf { it in choices }
-                ?: choices.firstOrNull().orEmpty()
+            val expanded = MihomoYamlSupport.expandGroupChoices(spec, profileNames, merged.virtualDirect)
+            val choices = expanded.ifEmpty { profileNames + "DIRECT" }
+            val now = if (spec.isAutoBalancer) {
+                val memberProfiles = choices.mapNotNull { profilesByName[it] }
+                val aliveMembers = memberProfiles.filter { nodeHealth[it.id] == true }
+                when {
+                    aliveMembers.isNotEmpty() -> {
+                        aliveMembers.minByOrNull { p ->
+                            delayHistory[p.displayName]?.lastOrNull()?.delay ?: Int.MAX_VALUE
+                        }?.displayName ?: aliveMembers.first().displayName
+                    }
+                    memberProfiles.isNotEmpty() && memberProfiles.all { nodeHealth[it.id] == false } &&
+                        (spec.fallbackToDirect || config.fallbackToDirect) && "DIRECT" in choices -> "DIRECT"
+                    else -> groupSelections[spec.name]?.takeIf { it in choices } ?: choices.firstOrNull().orEmpty()
+                }
+            } else {
+                groupSelections[spec.name]?.takeIf { it in choices }
+                    ?: choices.firstOrNull().orEmpty()
+            }
             views += GroupView(
                 name = spec.name,
                 type = when (spec.type) {
@@ -954,6 +1200,12 @@ class DaemonEngine(val config: DaemonConfig) {
                     obj.get("userAgent")?.takeIf { !it.isJsonNull }?.asString?.takeIf { it.isNotBlank() }?.let {
                         subscriptionUserAgents[sub.id] = it
                     }
+                    subCacheFile(sub.id).takeIf { it.isFile }?.let { cached ->
+                        runCatching { MihomoYamlSupport.parseDocument(cached.readText(), subscriptionId = sub.id) }
+                            .getOrNull()
+                            ?.takeIf { it.groups.isNotEmpty() || it.rawRules.isNotEmpty() }
+                            ?.let { subscriptionDocuments[sub.id] = it }
+                    }
                 }
             }
 
@@ -973,6 +1225,35 @@ class DaemonEngine(val config: DaemonConfig) {
             }
         }.onFailure { err ->
             recordLog("warning", "failed to read persisted daemon-state.json: ${err.message}")
+        }
+    }
+
+    internal fun observeCoreLine(line: String) {
+        if ("app/observatory:" !in line) return
+        OBSERVATORY_ALIVE_REGEX.find(line)?.let { m ->
+            val entityId = m.groupValues[1].toLongOrNull() ?: return
+            val secs = m.groupValues[2].toDoubleOrNull() ?: return
+            val delayMs = (secs * 1000.0).toInt().coerceAtLeast(1)
+            val stamp = Instant.now().toString()
+            synchronized(lock) {
+                val target = allProfilesLocked().firstOrNull { DesktopConfigBuilder.entityIdOf(it.id) == entityId }
+                if (target != null) {
+                    nodeHealth[target.id] = true
+                    val list = delayHistory.getOrPut(target.displayName) { ArrayList() }
+                    list += DelayRecord(time = stamp, delay = delayMs)
+                    while (list.size > 20) list.removeAt(0)
+                }
+            }
+            return
+        }
+        OBSERVATORY_DEAD_REGEX.find(line)?.let { m ->
+            val entityId = m.groupValues[1].toLongOrNull() ?: return
+            synchronized(lock) {
+                val target = allProfilesLocked().firstOrNull { DesktopConfigBuilder.entityIdOf(it.id) == entityId }
+                if (target != null) {
+                    nodeHealth[target.id] = false
+                }
+            }
         }
     }
 
@@ -999,6 +1280,8 @@ class DaemonEngine(val config: DaemonConfig) {
     companion object {
         private const val MAX_LOGS = 500
         const val DEFAULT_DELAY_URL = "https://www.gstatic.com/generate_204"
+        private val OBSERVATORY_ALIVE_REGEX = Regex("""app/observatory: the outbound proxy-global-(\d+) is alive:([0-9.]+)""")
+        private val OBSERVATORY_DEAD_REGEX = Regex("""app/observatory: the outbound proxy-global-(\d+) is dead""")
 
         /** Exports a [Profile] to a standard share URI where supported by upstream formatters. */
         fun shareUriOf(profile: Profile): String? = runCatching {

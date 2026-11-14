@@ -27,6 +27,9 @@ class ExternalPlugins(private val log: (String) -> Unit) {
     /** True while at least one external engine is still running. */
     val alive: Boolean get() = processes.any { it.second.isAlive }
 
+    /** True when every started external engine is still alive (or none were needed). */
+    val allAlive: Boolean get() = processes.all { it.second.isAlive }
+
     /**
      * Starts every plugin in order.
      *
