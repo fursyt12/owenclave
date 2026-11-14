@@ -85,7 +85,7 @@ class WebControllerServer(
             return
         }
 
-        // Web UI static HTML shell
+        // Web UI static HTML shell & bundled assets (Google Sans Flex variable font + SVG favicon)
         if (method == "GET" && rawPath == "/ui") {
             redirect(exchange, "/ui/")
             return
@@ -93,6 +93,26 @@ class WebControllerServer(
         if (method == "GET" && (rawPath == "/ui/" || rawPath == "/ui/index.html")) {
             sendHtml(exchange, 200, WebDashboardHtml.INDEX_HTML)
             return
+        }
+        if (method == "GET" && (rawPath == "/ui/favicon.svg" || rawPath == "/favicon.ico")) {
+            val svgBytes = WebDashboardHtml.FAVICON_SVG.toByteArray(StandardCharsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "image/svg+xml; charset=utf-8")
+            exchange.responseHeaders.add("Cache-Control", "public, max-age=86400")
+            exchange.sendResponseHeaders(200, svgBytes.size.toLong())
+            exchange.responseBody.use { it.write(svgBytes) }
+            return
+        }
+        if (method == "GET" && rawPath == "/ui/fonts/google-sans-flex.ttf") {
+            val fontBytes = javaClass.classLoader
+                ?.getResourceAsStream("android_res/font/google_sans_flex.ttf")
+                ?.use { it.readBytes() }
+            if (fontBytes != null) {
+                exchange.responseHeaders.add("Content-Type", "font/ttf")
+                exchange.responseHeaders.add("Cache-Control", "public, max-age=86400")
+                exchange.sendResponseHeaders(200, fontBytes.size.toLong())
+                exchange.responseBody.use { it.write(fontBytes) }
+                return
+            }
         }
 
         // Browser navigation to root `/` redirects to `/ui/`
@@ -463,6 +483,8 @@ class WebControllerServer(
         addProperty("allow-lan", engine.config.allowLan)
         addProperty("bind-address", engine.config.effectiveListenAddress())
         addProperty("mode", engine.config.mode)
+        addProperty("fallback-to-direct", engine.config.fallbackToDirect)
+        addProperty("health-check-interval", engine.config.healthCheckInterval)
         addProperty("log-level", engine.config.logLevel)
         addProperty("ipv6", engine.config.ipv6)
         addProperty("interface-name", engine.config.interfaceName)
@@ -532,6 +554,7 @@ class WebControllerServer(
         return JsonObject().apply {
             addProperty("version", BuildConfig.VERSION_NAME)
             addProperty("running", engine.isCoreRunning())
+            addProperty("startedAt", engine.startedAtMillis)
             engine.lastCoreError()?.let { addProperty("lastError", it) }
             add("configs", buildConfigsJson())
             if (active != null) {
@@ -565,6 +588,11 @@ class WebControllerServer(
                 JsonArray().apply {
                     profiles.forEach { p ->
                         val delays = engine.delayHistoryOf(p.displayName)
+                        val healthState = when (engine.nodeHealthOf(p.id)) {
+                            true -> "alive"
+                            false -> "dead"
+                            null -> "unknown"
+                        }
                         add(
                             JsonObject().apply {
                                 addProperty("id", p.id)
@@ -573,6 +601,8 @@ class WebControllerServer(
                                 addProperty("address", p.address)
                                 addProperty("selected", active?.id == p.id)
                                 addProperty("removable", p.subscriptionId == null)
+                                addProperty("health", healthState)
+                                p.subscriptionId?.let { addProperty("subscriptionId", it) }
                                 delays.lastOrNull()?.let { addProperty("delay", it.delay) }
                                 DaemonEngine.shareUriOf(p)?.let { addProperty("shareUri", it) }
                             },
