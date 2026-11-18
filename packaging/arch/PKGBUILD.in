@@ -25,7 +25,18 @@ package() {
   [ -f "$pkgdir/opt/owenclave/bin/tun2socks" ] && chmod 755 "$pkgdir/opt/owenclave/bin/tun2socks"
 
   install -dm755 "$pkgdir/usr/bin"
-  ln -sf /opt/owenclave/bin/Owenclave "$pkgdir/usr/bin/owenclave"
+  cat >"$pkgdir/usr/bin/owenclave" <<'EOF'
+#!/usr/bin/env sh
+if [ -z "${_JAVA_AWT_WM_NONREPARENTING+x}" ]; then
+  case ":${XDG_CURRENT_DESKTOP:-}:${XDG_SESSION_DESKTOP:-}:${DESKTOP_SESSION:-}:" in
+    *[Nn]iri*|*[Hh]yprland*|*[Ss]way*|*[Rr]iver*|*[Cc]osmic*|*[Ll]abwc*|*[Ww]ayfire*|*wlroots*|*dwl*|*jay*|*scroll*|*i3*|*bspwm*|*dwm*|*awesome*|*qtile*|*xmonad*|*leftwm*|*herbstluftwm*)
+      export _JAVA_AWT_WM_NONREPARENTING=1
+      ;;
+  esac
+fi
+exec /opt/owenclave/bin/Owenclave "$@"
+EOF
+  chmod 755 "$pkgdir/usr/bin/owenclave"
 
   install -Dm644 "$srcdir/owenclave.desktop" "$pkgdir/usr/share/applications/owenclave.desktop"
   install -Dm644 "$srcdir/owenclave.png" "$pkgdir/usr/share/pixmaps/owenclave.png"

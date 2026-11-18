@@ -401,6 +401,10 @@ tasks.test {
 compose.desktop {
     application {
         mainClass = "io.nekohasekai.sagernet.desktop.MainKt"
+        jvmArgs(
+            "--add-opens=java.desktop/sun.awt=ALL-UNNAMED",
+            "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
+        )
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm)
@@ -459,6 +463,8 @@ compose.desktop {
                               <string>hy2</string>
                               <string>tuic</string>
                               <string>juicity</string>
+                              <string>naive+https</string>
+                              <string>naive+quic</string>
                               <string>anytls</string>
                               <string>shadowquic</string>
                               <string>sq</string>
@@ -485,6 +491,10 @@ compose.desktop {
 tasks.configureEach {
     if (this is JavaExec && (name == "run" || name.startsWith("run"))) {
         dependsOn(prepareDesktopRuntime)
+        jvmArgs(
+            "--add-opens=java.desktop/sun.awt=ALL-UNNAMED",
+            "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
+        )
         systemProperty("owenclave.devRoot", rootProject.projectDir.absolutePath)
         // `./gradlew :desktop:app:run -Psection=RULES` opens a specific tab, used
         // when verifying that every screen renders.
@@ -508,6 +518,28 @@ tasks.configureEach {
                     val dst = File(binDir, tun2socksBin.name)
                     tun2socksBin.copyTo(dst, overwrite = true)
                     dst.setExecutable(true, false)
+                }
+            }
+        }
+    }
+    if (hostOs == "darwin" && name == "createDistributable") {
+        doLast {
+            val appBundle = appImageDir.get().asFile.resolve("Owenclave.app")
+            val codesign = File("/usr/bin/codesign")
+            if (appBundle.isDirectory && codesign.isFile) {
+                runCatching {
+                    ProcessBuilder("/usr/bin/xattr", "-cr", appBundle.absolutePath).start().waitFor()
+                }
+                val proc = ProcessBuilder(
+                    codesign.absolutePath,
+                    "--force",
+                    "--deep",
+                    "--sign",
+                    "-",
+                    appBundle.absolutePath,
+                ).inheritIO().start()
+                if (proc.waitFor() == 0) {
+                    logger.lifecycle("Ad-hoc signed macOS bundle: $appBundle")
                 }
             }
         }

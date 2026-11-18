@@ -100,11 +100,18 @@ public class Seq {
 				File target = new File(cacheDir, libFileName);
 				File temp = new File(cacheDir, libFileName + ".tmp");
 				Files.copy(stream, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
-				if (!target.isFile() || target.length() != temp.length()) {
+				boolean same = target.isFile()
+					&& target.length() == temp.length()
+					&& Arrays.equals(Files.readAllBytes(target.toPath()), Files.readAllBytes(temp.toPath()));
+				if (!same) {
 					target.delete();
 					if (!temp.renameTo(target)) {
 						Files.copy(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
 						temp.delete();
+					}
+					target.setExecutable(true);
+					if (osTag.equals("darwin")) {
+						prepareMacBinary(target);
 					}
 				} else {
 					temp.delete();
@@ -117,6 +124,19 @@ public class Seq {
 		}
 
 		System.loadLibrary("gojni");
+	}
+
+	private static void prepareMacBinary(File binary) {
+		try {
+			new ProcessBuilder("/usr/bin/xattr", "-c", binary.getAbsolutePath())
+				.redirectErrorStream(true).start().waitFor();
+		} catch (Throwable ignored) {
+		}
+		try {
+			new ProcessBuilder("/usr/bin/codesign", "--force", "--sign", "-", binary.getAbsolutePath())
+				.redirectErrorStream(true).start().waitFor();
+		} catch (Throwable ignored) {
+		}
 	}
 
 	// setContext sets the context in the go-library to be used in RunOnJvm.

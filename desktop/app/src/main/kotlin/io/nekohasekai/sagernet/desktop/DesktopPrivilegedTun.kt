@@ -138,6 +138,7 @@ class DesktopPrivilegedTun(
     private var supervisorProcess: Process? = null
     private var supervisorStdin: BufferedWriter? = null
     private var keepaliveFile: File? = null
+    private var bypassListFile: File? = null
     private var directWinTun: TunSession? = null
     private var activeKey: PrivilegedTunParams.TunnelKey? = null
     private val registeredBypassIps = LinkedHashSet<String>()
@@ -176,7 +177,25 @@ class DesktopPrivilegedTun(
                         Log.i(TAG, "Reused active VPN tunnel for reloaded profile")
                         return
                     }
-                } else if (keepaliveFile?.isFile == true || directWinTun?.running == true) {
+                } else if (os == "darwin" && keepaliveFile?.isFile == true) {
+                    val bf = bypassListFile
+                    if (bf != null) {
+                        val added = ArrayList<String>()
+                        for (ip in params.bypassServerIps) {
+                            val clean = ip.trim()
+                            if (clean.matches(SAFE_IP_REGEX) && registeredBypassIps.add(clean)) {
+                                added += clean
+                            }
+                        }
+                        if (added.isNotEmpty()) {
+                            runCatching { bf.appendText(added.joinToString("\n", postfix = "\n")) }
+                        }
+                        Log.i(TAG, "Reused active macOS VPN tunnel for reloaded profile")
+                        return
+                    }
+                } else if ((keepaliveFile?.isFile == true || directWinTun?.running == true) &&
+                    registeredBypassIps.containsAll(params.bypassServerIps)
+                ) {
                     return
                 }
             }
@@ -210,6 +229,10 @@ class DesktopPrivilegedTun(
             runCatching { f.delete() }
         }
         keepaliveFile = null
+        bypassListFile?.let { f ->
+            runCatching { f.delete() }
+        }
+        bypassListFile = null
 
         directWinTun?.let { tun ->
             runCatching { tun.stop() }
@@ -465,51 +488,116 @@ class DesktopPrivilegedTun(
 
     // ------------------------------------------------------------------- macOS
 
-    private fun startMacLocked(params: PrivilegedTunParams) {
-        val tun2socks = tun2socksLocator()
-            ?: throw TunException("tun2socks binary is missing for ${DesktopRuntime.platformTag}")
-        runCatching { tun2socks.setExecutable(true, false) }
+    internal fun buildMacHelperScript(
+        keepalive: File,
+        statusFile: File,
+        bypassFile: File,
+        tun2socks: File,
+        params: PrivilegedTunParams,
+    ): String {
+        val authPart = if (params.socksUsername.isNotEmpty() || params.socksPassword.isNotEmpty()) {
+            val u = java.net.URLEncoder.encode(params.socksUsername, StandardCharsets.UTF_8).replace("+", "%20")
+            val p = java.net.URLEncoder.encode(params.socksPassword, StandardCharsets.UTF_8).replace("+", "%20")
+            "$u:$p@"
+        } else {
+            ""
+        }
+        val proxyUrl = "socks5://${authPart}127.0.0.1:${params.socksPort}"
+        val bypassLanFlag = if (params.bypassLan) "1" else "0"
+        val enableIpv6Flag = if (params.enableIpv6) "1" else "0"
 
-        val runtimeDir = File(dataDir, "runtime").apply { mkdirs() }
-        val token = System.nanoTime().toString()
-        val keepalive = File(runtimeDir, "owenclave-tun-$token.keepalive").apply { writeText("1") }
-        val statusFile = File(runtimeDir, "owenclave-tun-$token.status").apply { delete() }
-        val scriptFile = File(runtimeDir, "owenclave-tun-macos.sh")
-
-        val bypassArray = params.bypassServerIps
-            .filter { it.matches(Regex("^[0-9a-fA-F:.]+$")) }
-            .joinToString(" ")
-
-        scriptFile.writeText(
-            """
+        return """
             #!/bin/sh
+            export PATH="/usr/sbin:/sbin:/usr/bin:/bin:/usr/local/bin"
             set -eu
             KEEPALIVE="${keepalive.absolutePath}"
             STATUS="${statusFile.absolutePath}"
+            BYPASS_FILE="${bypassFile.absolutePath}"
             TUN2SOCKS="${tun2socks.absolutePath}"
             OWNER_PID="${params.owenclavePid}"
-            SOCKS_PORT="${params.socksPort}"
+            PROXY_URL="$proxyUrl"
             MTU="${params.mtu.coerceIn(1280, 9000)}"
-            BYPASS_IPS="$bypassArray"
+            BYPASS_LAN="$bypassLanFlag"
+            ENABLE_IPV6="$enableIpv6Flag"
             T2S_PID=""
             UTUN=""
             PHYS_GW=""
+            PHYS_GW6=""
+            ADDED_BYPASS_V4=""
+            ADDED_BYPASS_V6=""
+            LAN_ROUTES_ADDED="0"
+            IPV6_ROUTES_ADDED="0"
+            NET_SVC=""
+            ORIG_DNS_RESTORE=""
 
             cleanup() {
+              if [ -n "${'$'}NET_SVC" ] && [ -n "${'$'}ORIG_DNS_RESTORE" ]; then
+                if [ "${'$'}ORIG_DNS_RESTORE" = "__EMPTY__" ]; then
+                  networksetup -setdnsservers "${'$'}NET_SVC" "Empty" >/dev/null 2>&1 || true
+                else
+                  # shellcheck disable=SC2086
+                  networksetup -setdnsservers "${'$'}NET_SVC" ${'$'}ORIG_DNS_RESTORE >/dev/null 2>&1 || true
+                fi
+              fi
+              if [ "${'$'}IPV6_ROUTES_ADDED" = "1" ] && [ -n "${'$'}UTUN" ]; then
+                route -n delete -inet6 -net ::/1 -interface "${'$'}UTUN" >/dev/null 2>&1 || true
+                route -n delete -inet6 -net 8000::/1 -interface "${'$'}UTUN" >/dev/null 2>&1 || true
+              fi
               for r in 1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/5 16.0.0.0/4 32.0.0.0/3 64.0.0.0/2 128.0.0.0/1 198.18.0.0/15; do
                 [ -n "${'$'}UTUN" ] && route -n delete -net "${'$'}r" -interface "${'$'}UTUN" >/dev/null 2>&1 || true
               done
-              for ip in ${'$'}BYPASS_IPS; do
+              if [ "${'$'}LAN_ROUTES_ADDED" = "1" ] && [ -n "${'$'}PHYS_GW" ]; then
+                for lr in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+                  route -n delete -net "${'$'}lr" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
+                done
+              fi
+              for ip in ${'$'}ADDED_BYPASS_V4; do
                 [ -n "${'$'}PHYS_GW" ] && route -n delete -host "${'$'}ip" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
               done
+              for ip6 in ${'$'}ADDED_BYPASS_V6; do
+                [ -n "${'$'}PHYS_GW6" ] && route -n delete -inet6 -host "${'$'}ip6" "${'$'}PHYS_GW6" >/dev/null 2>&1 || true
+              done
               [ -n "${'$'}T2S_PID" ] && kill "${'$'}T2S_PID" >/dev/null 2>&1 || true
-              rm -f "${'$'}KEEPALIVE" "${'$'}STATUS" >/dev/null 2>&1 || true
+              rm -f "${'$'}KEEPALIVE" "${'$'}STATUS" "${'$'}BYPASS_FILE" >/dev/null 2>&1 || true
             }
             trap cleanup EXIT INT TERM HUP
+
+            sync_bypass_ips() {
+              [ -f "${'$'}BYPASS_FILE" ] || return 0
+              while IFS= read -r ip || [ -n "${'$'}ip" ]; do
+                [ -n "${'$'}ip" ] || continue
+                case "${'$'}ip" in
+                  *:*)
+                    case " ${'$'}ADDED_BYPASS_V6 " in
+                      *" ${'$'}ip "*) ;;
+                      *)
+                        if [ -n "${'$'}PHYS_GW6" ]; then
+                          route -n add -inet6 -host "${'$'}ip" "${'$'}PHYS_GW6" >/dev/null 2>&1 || true
+                          ADDED_BYPASS_V6="${'$'}ADDED_BYPASS_V6 ${'$'}ip"
+                        fi
+                        ;;
+                    esac
+                    ;;
+                  *.*)
+                    case " ${'$'}ADDED_BYPASS_V4 " in
+                      *" ${'$'}ip "*) ;;
+                      *)
+                        if [ -n "${'$'}PHYS_GW" ]; then
+                          route -n add -host "${'$'}ip" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
+                          ADDED_BYPASS_V4="${'$'}ADDED_BYPASS_V4 ${'$'}ip"
+                        fi
+                        ;;
+                    esac
+                    ;;
+                esac
+              done <"${'$'}BYPASS_FILE"
+            }
 
             DEF_OUT="${'$'}(route -n get default 2>/dev/null || true)"
             PHYS_IF="${'$'}(printf '%s\n' "${'$'}DEF_OUT" | awk '/interface:/{print ${'$'}2; exit}')"
             PHYS_GW="${'$'}(printf '%s\n' "${'$'}DEF_OUT" | awk '/gateway:/{print ${'$'}2; exit}')"
+            DEF6_OUT="${'$'}(route -n get -inet6 default 2>/dev/null || true)"
+            PHYS_GW6="${'$'}(printf '%s\n' "${'$'}DEF6_OUT" | awk '/gateway:/{print ${'$'}2; exit}')"
             if [ -z "${'$'}PHYS_IF" ]; then
               printf 'ERROR:cannot detect default network interface\n' >"${'$'}STATUS"
               exit 1
@@ -526,11 +614,15 @@ class DesktopPrivilegedTun(
             done
             [ -z "${'$'}UTUN" ] && UTUN="utun32"
 
-            for ip in ${'$'}BYPASS_IPS; do
-              [ -n "${'$'}PHYS_GW" ] && route -n add -host "${'$'}ip" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
-            done
+            sync_bypass_ips
+            if [ "${'$'}BYPASS_LAN" = "1" ] && [ -n "${'$'}PHYS_GW" ]; then
+              for lr in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+                route -n add -net "${'$'}lr" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
+              done
+              LAN_ROUTES_ADDED="1"
+            fi
 
-            "${'$'}TUN2SOCKS" --device "${'$'}UTUN" --proxy "socks5://127.0.0.1:${'$'}SOCKS_PORT" --interface "${'$'}PHYS_IF" --loglevel warn &
+            "${'$'}TUN2SOCKS" --device "${'$'}UTUN" --proxy "${'$'}PROXY_URL" --interface "${'$'}PHYS_IF" --loglevel warn &
             T2S_PID="${'$'}!"
 
             j=0
@@ -539,18 +631,70 @@ class DesktopPrivilegedTun(
               sleep 0.2
               j=${'$'}((j + 1))
             done
+            if ! ifconfig "${'$'}UTUN" >/dev/null 2>&1; then
+              printf 'ERROR:utun interface %s did not appear\n' "${'$'}UTUN" >"${'$'}STATUS"
+              exit 1
+            fi
 
-            ifconfig "${'$'}UTUN" 172.19.0.1 172.19.0.2 mtu "${'$'}MTU" up
+            ifconfig "${'$'}UTUN" 198.18.0.1 198.18.0.1 mtu "${'$'}MTU" up
             for r in 1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/5 16.0.0.0/4 32.0.0.0/3 64.0.0.0/2 128.0.0.0/1 198.18.0.0/15; do
               route -n add -net "${'$'}r" -interface "${'$'}UTUN" >/dev/null
             done
 
-            printf 'OWENCLAVE_TUN_READY tun=%s\n' "${'$'}UTUN" >"${'$'}STATUS"
+            if [ "${'$'}ENABLE_IPV6" = "1" ]; then
+              if ifconfig "${'$'}UTUN" inet6 fdfe:dcba:9876::1 prefixlen 128 up >/dev/null 2>&1; then
+                route -n add -inet6 -net ::/1 -interface "${'$'}UTUN" >/dev/null 2>&1 || true
+                route -n add -inet6 -net 8000::/1 -interface "${'$'}UTUN" >/dev/null 2>&1 || true
+                IPV6_ROUTES_ADDED="1"
+              fi
+            fi
+
+            if command -v networksetup >/dev/null 2>&1; then
+              NET_SVC="${'$'}(networksetup -listnetworkserviceorder 2>/dev/null | awk -v dev="${'$'}PHYS_IF" '
+                /^\([0-9]+\) / { sub(/^\([0-9]+\) /, ""); svc=${'$'}0 }
+                /Device:/ {
+                  if (index(${'$'}0, "Device: " dev ")") > 0 || index(${'$'}0, "Device: " dev ",") > 0) {
+                    print svc
+                    exit
+                  }
+                }
+              ')"
+              if [ -n "${'$'}NET_SVC" ]; then
+                CUR_DNS="${'$'}(networksetup -getdnsservers "${'$'}NET_SVC" 2>/dev/null || true)"
+                if printf '%s\n' "${'$'}CUR_DNS" | grep -qi "There aren't any"; then
+                  ORIG_DNS_RESTORE="__EMPTY__"
+                  networksetup -setdnsservers "${'$'}NET_SVC" 1.1.1.1 8.8.8.8 >/dev/null 2>&1 || true
+                elif printf '%s\n' "${'$'}CUR_DNS" | grep -Eq '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|fe80:)'; then
+                  ORIG_DNS_RESTORE="${'$'}(printf '%s\n' "${'$'}CUR_DNS" | tr '\n' ' ')"
+                  networksetup -setdnsservers "${'$'}NET_SVC" 1.1.1.1 8.8.8.8 >/dev/null 2>&1 || true
+                fi
+              fi
+            fi
+
+            printf 'OWENCLAVE_TUN_READY tun=%s iface=%s\n' "${'$'}UTUN" "${'$'}PHYS_IF" >"${'$'}STATUS"
             while [ -f "${'$'}KEEPALIVE" ] && kill -0 "${'$'}OWNER_PID" 2>/dev/null && kill -0 "${'$'}T2S_PID" 2>/dev/null; do
+              sync_bypass_ips
               sleep 0.3
             done
-            """.trimIndent() + "\n"
-        )
+        """.trimIndent() + "\n"
+    }
+
+    private fun startMacLocked(params: PrivilegedTunParams) {
+        val tun2socks = tun2socksLocator()
+            ?: throw TunException("tun2socks binary is missing for ${DesktopRuntime.platformTag}")
+        runCatching { tun2socks.setExecutable(true, false) }
+
+        val runtimeDir = File(dataDir, "runtime").apply { mkdirs() }
+        val token = System.nanoTime().toString()
+        val keepalive = File(runtimeDir, "owenclave-tun-$token.keepalive").apply { writeText("1") }
+        val statusFile = File(runtimeDir, "owenclave-tun-$token.status").apply { delete() }
+        val bypassFile = File(runtimeDir, "owenclave-tun-$token.bypass").apply {
+            val initialIps = params.bypassServerIps.map { it.trim() }.filter { it.matches(SAFE_IP_REGEX) }
+            writeText(if (initialIps.isEmpty()) "" else initialIps.joinToString("\n", postfix = "\n"))
+        }
+        val scriptFile = File(runtimeDir, "owenclave-tun-macos.sh")
+
+        scriptFile.writeText(buildMacHelperScript(keepalive, statusFile, bypassFile, tun2socks, params))
         scriptFile.setExecutable(true, true)
 
         val command = if (launcher.currentUid() == 0) {
@@ -581,17 +725,20 @@ class DesktopPrivilegedTun(
                 val status = runCatching { statusFile.readText().trim() }.getOrDefault("")
                 if (status.startsWith("OWENCLAVE_TUN_READY")) {
                     keepaliveFile = keepalive
+                    bypassListFile = bypassFile
                     if (launcher.currentUid() == 0) supervisorProcess = proc
                     Log.i(TAG, "macOS VPN tunnel active ($status)")
                     return
                 }
                 if (status.startsWith("ERROR:")) {
                     keepalive.delete()
+                    bypassFile.delete()
                     throw TunException(status.removePrefix("ERROR:"))
                 }
             }
             if (!proc.isAlive && proc.exitValue() != 0) {
                 keepalive.delete()
+                bypassFile.delete()
                 runCatching { errThread.join(1_500L) }
                 val err = errHolder.get()
                 if (err.contains("User canceled", ignoreCase = true) || err.contains("-128")) {
@@ -602,6 +749,7 @@ class DesktopPrivilegedTun(
             Thread.sleep(150)
         }
         keepalive.delete()
+        bypassFile.delete()
         throw TunAuthorizationException("VPN authorization timed out")
     }
 
@@ -719,6 +867,7 @@ class DesktopPrivilegedTun(
 
     companion object {
         private const val TAG = "DesktopTUN"
+        private val SAFE_IP_REGEX = Regex("^[0-9a-fA-F:.]+$")
 
         /**
          * Resolves remote proxy server hostnames from [proxy] into concrete IPv4/IPv6

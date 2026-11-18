@@ -689,7 +689,11 @@ EOF
     CGO_CFLAGS="$cflags" CGO_LDFLAGS="$cgo_ldflags" \
     go -C "$work_dir/src/gobind" build -mod=mod -trimpath -tags=with_clash \
     -buildmode=c-shared -o "$out_dir_norm/$lib_name" .
-  "$strip_bin" "$out_dir/$lib_name" 2>/dev/null || true
+  if [ "$target_os" = "darwin" ]; then
+    command -v codesign >/dev/null 2>&1 && codesign --force --sign - "$out_dir/$lib_name" || true
+  else
+    "$strip_bin" "$out_dir/$lib_name" 2>/dev/null || true
+  fi
   rm -f "$out_dir/${lib_name%.*}.h"
   ls -la "$out_dir/$lib_name"
 }
@@ -712,6 +716,9 @@ for target in $TARGETS; do
   CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" \
     go build -trimpath -tags "with_clash" -ldflags "$LDFLAGS" \
     -o "$out_dir/$bin_name" "$CORE_PKG"
+  if [ "$target_os" = "darwin" ]; then
+    command -v codesign >/dev/null 2>&1 && codesign --force --sign - "$out_dir/$bin_name" || true
+  fi
 
   ls -la "$out_dir/$bin_name"
 

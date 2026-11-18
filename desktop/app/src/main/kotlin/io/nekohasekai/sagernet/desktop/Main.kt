@@ -39,6 +39,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -51,10 +53,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -90,6 +94,7 @@ fun main(args: Array<String>) {
     }
     val instanceHandle = (acquireResult as? SingleInstanceManager.AcquireResult.Primary)?.handle
     android.util.Log.initSession()
+    LinuxWindowSupport.configureBeforeWindow()
 
     runCatching {
         if (java.awt.Desktop.isDesktopSupported()) {
@@ -176,10 +181,14 @@ fun main(args: Array<String>) {
     val useLegacyDesktopUi = args.contains("--legacy-ui") ||
         !System.getProperty("owenclave.section").isNullOrBlank()
 
+    val initialWindowSize = LinuxWindowSupport.initialWindowDpSize(1180, 780)
+
     application {
         val scope = rememberCoroutineScope()
         val state = remember { if (useLegacyDesktopUi) AppState(scope) else null }
-        val windowState = rememberWindowState(size = DpSize(1180.dp, 780.dp))
+        val windowState = rememberWindowState(
+            size = DpSize(initialWindowSize.first.dp, initialWindowSize.second.dp),
+        )
         val appIcon = remember { loadDesktopAppIcon() }
         Window(
             onCloseRequest = {
@@ -195,40 +204,63 @@ fun main(args: Array<String>) {
             icon = appIcon,
             state = windowState,
         ) {
-            LaunchedEffect(window) {
-                window.minimumSize = java.awt.Dimension(420, 560)
+            var linuxScaleOverride by remember {
+                mutableStateOf(LinuxWindowSupport.detectLinuxScaleOverride(window))
             }
-            if (state != null) {
-                App(state)
-            } else {
-                val mainActivity = remember { io.nekohasekai.sagernet.ui.compose.ComposeMainActivity() }
-                androidx.activity.DesktopActivityStack.Host(mainActivity)
-                LaunchedEffect(mainActivity, window) {
-                    fun drainDeepLinks(bringToFront: Boolean) {
-                        if (bringToFront) {
-                            windowState.isMinimized = false
-                            window.isVisible = true
-                            window.toFront()
-                            window.requestFocus()
-                        }
-                        while (true) {
-                            val uri = pendingDeepLinks.poll() ?: break
-                            val viewIntent = android.content.Intent(
-                                android.content.Intent.ACTION_VIEW,
-                                android.net.Uri.parse(uri),
-                            ).apply {
-                                component = android.content.ComponentName(
-                                    mainActivity,
-                                    io.nekohasekai.sagernet.ui.compose.ComposeMainActivity::class.java,
-                                )
-                            }
-                            androidx.activity.DesktopActivityStack.startActivityFromIntent(viewIntent)
-                        }
+            DisposableEffect(window) {
+                window.minimumSize = LinuxWindowSupport.minimumWindowDimension()
+                LinuxWindowSupport.attachWindowFixes(window)
+                val refreshScale = java.beans.PropertyChangeListener {
+                    val updated = LinuxWindowSupport.detectLinuxScaleOverride(window)
+                    if (updated != linuxScaleOverride) {
+                        linuxScaleOverride = updated
                     }
-                    drainDeepLinks(bringToFront = false)
-                    onIncomingDeepLinks = {
-                        javax.swing.SwingUtilities.invokeLater {
-                            drainDeepLinks(bringToFront = true)
+                }
+                window.addPropertyChangeListener("graphicsConfiguration", refreshScale)
+                onDispose {
+                    window.removePropertyChangeListener("graphicsConfiguration", refreshScale)
+                }
+            }
+
+            val baseDensity = LocalDensity.current
+            val effectiveDensity = remember(baseDensity, linuxScaleOverride) {
+                val scale = linuxScaleOverride
+                if (scale != null) Density(density = scale, fontScale = baseDensity.fontScale) else baseDensity
+            }
+
+            CompositionLocalProvider(LocalDensity provides effectiveDensity) {
+                if (state != null) {
+                    App(state)
+                } else {
+                    val mainActivity = remember { io.nekohasekai.sagernet.ui.compose.ComposeMainActivity() }
+                    androidx.activity.DesktopActivityStack.Host(mainActivity)
+                    LaunchedEffect(mainActivity, window) {
+                        fun drainDeepLinks(bringToFront: Boolean) {
+                            if (bringToFront) {
+                                windowState.isMinimized = false
+                                window.isVisible = true
+                                window.toFront()
+                                window.requestFocus()
+                            }
+                            while (true) {
+                                val uri = pendingDeepLinks.poll() ?: break
+                                val viewIntent = android.content.Intent(
+                                    android.content.Intent.ACTION_VIEW,
+                                    android.net.Uri.parse(uri),
+                                ).apply {
+                                    component = android.content.ComponentName(
+                                        mainActivity,
+                                        io.nekohasekai.sagernet.ui.compose.ComposeMainActivity::class.java,
+                                    )
+                                }
+                                androidx.activity.DesktopActivityStack.startActivityFromIntent(viewIntent)
+                            }
+                        }
+                        drainDeepLinks(bringToFront = false)
+                        onIncomingDeepLinks = {
+                            javax.swing.SwingUtilities.invokeLater {
+                                drainDeepLinks(bringToFront = true)
+                            }
                         }
                     }
                 }

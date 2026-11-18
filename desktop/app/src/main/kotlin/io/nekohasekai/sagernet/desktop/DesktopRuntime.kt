@@ -35,6 +35,8 @@ object DesktopRuntime {
     val platformTag: String = "$os-$arch"
 
     val isWindows: Boolean = os == "windows"
+    val isLinux: Boolean = os == "linux"
+    val isMac: Boolean = os == "darwin"
 
     val dataDir: File get() = DesktopEnv.dataDir
 
@@ -160,18 +162,39 @@ object DesktopRuntime {
         stream.use { input ->
             val temporary = File(targetDir, "$fileName.tmp")
             temporary.outputStream().use { output -> input.copyTo(output) }
-            if (!target.isFile || target.length() != temporary.length()) {
+            val same = target.isFile && target.length() == temporary.length() && sha256(target) == sha256(temporary)
+            if (!same) {
                 target.delete()
                 if (!temporary.renameTo(target)) {
                     temporary.copyTo(target, overwrite = true)
                     temporary.delete()
                 }
+                target.setExecutable(true, false)
+                if (isMac) {
+                    runCatching { ProcessBuilder("/usr/bin/xattr", "-c", target.absolutePath).start().waitFor() }
+                    runCatching {
+                        ProcessBuilder("/usr/bin/codesign", "--force", "--sign", "-", target.absolutePath).start().waitFor()
+                    }
+                }
             } else {
                 temporary.delete()
+                target.setExecutable(true, false)
             }
         }
-        target.setExecutable(true, false)
         return target
+    }
+
+    private fun sha256(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buf = ByteArray(16_384)
+            while (true) {
+                val read = input.read(buf)
+                if (read <= 0) break
+                digest.update(buf, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
 }

@@ -327,6 +327,85 @@ class DesktopPrivilegedTunTest {
     }
 
     @Test
+    fun `generated macOS helper script has valid POSIX shell syntax and updates bypass IPs without re-prompting`() {
+        val tempDir = Files.createTempDirectory("owenclave-tun-mac").toFile()
+        try {
+            val tun2socksFile = tempDir.resolve("tun2socks").apply { writeText(""); setExecutable(true) }
+            val osascriptCalls = CopyOnWriteArrayList<List<String>>()
+
+            val launcher = object : PrivilegedProcessLauncher {
+                override fun start(command: List<String>, env: Map<String, String>): Process {
+                    osascriptCalls.add(command)
+                    // Simulate osascript launching the background helper which writes OWENCLAVE_TUN_READY
+                    Thread {
+                        Thread.sleep(60)
+                        val runtimeDir = tempDir.resolve("runtime")
+                        runtimeDir.listFiles { f -> f.name.endsWith(".keepalive") }?.firstOrNull()?.let { ka ->
+                            val status = java.io.File(ka.parentFile, ka.name.replace(".keepalive", ".status"))
+                            status.writeText("OWENCLAVE_TUN_READY tun=utun7 iface=en0\n")
+                        }
+                    }.apply { isDaemon = true }.start()
+                    return FakeInteractiveProcess(immediateExitCode = 0)
+                }
+
+                override fun findExecutable(name: String) = null
+                override fun currentUid(): Int = 501
+                override fun isWindowsAdmin(): Boolean = false
+            }
+
+            val tun = DesktopPrivilegedTun(
+                os = "darwin",
+                dataDir = tempDir,
+                launcher = launcher,
+                tun2socksLocator = { tun2socksFile },
+                authTimeoutMs = 5_000L,
+            )
+
+            tun.start(
+                PrivilegedTunParams(
+                    socksPort = 2080,
+                    enableIpv6 = true,
+                    bypassLan = true,
+                    bypassServerIps = listOf("203.0.113.10", "2001:db8::1"),
+                ),
+            )
+            assertTrue(tun.isRunning())
+            assertEquals(1, osascriptCalls.size)
+            assertEquals("/usr/bin/osascript", osascriptCalls[0][0])
+
+            val scriptFile = tempDir.resolve("runtime/owenclave-tun-macos.sh")
+            assertTrue(scriptFile.isFile)
+            val scriptText = scriptFile.readText()
+            assertTrue(scriptText.contains("export PATH=\"/usr/sbin:/sbin:/usr/bin:/bin:/usr/local/bin\""))
+            assertTrue(scriptText.contains("networksetup -setdnsservers"))
+
+            val shCheck = ProcessBuilder("sh", "-n", scriptFile.absolutePath)
+                .redirectErrorStream(true)
+                .start()
+            val shOut = shCheck.inputStream.bufferedReader().readText()
+            assertEquals(0, shCheck.waitFor(), "macOS helper sh -n failed: $shOut")
+
+            // Reloading with a new server IP appends to the bypass file without invoking osascript a second time!
+            tun.start(
+                PrivilegedTunParams(
+                    socksPort = 2080,
+                    enableIpv6 = true,
+                    bypassLan = true,
+                    bypassServerIps = listOf("198.51.100.42"),
+                ),
+            )
+            assertEquals(1, osascriptCalls.size, "Profile switch must not trigger a second osascript password dialog")
+            val bypassFile = tempDir.resolve("runtime").listFiles { f -> f.name.endsWith(".bypass") }?.single()
+            assertTrue(bypassFile != null && bypassFile.readText().contains("198.51.100.42"))
+
+            tun.stop()
+            assertFalse(tun.isRunning())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `log shim rotates previous session logcat and classifies naive chromium stderr levels`() {
         val tempDir = Files.createTempDirectory("owenclave-log-test").toFile()
         try {

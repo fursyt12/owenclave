@@ -426,6 +426,7 @@ object SelfTest {
         }
 
         return try {
+            LinuxWindowSupport.configureBeforeWindow()
             io.nekohasekai.sagernet.SagerNet.application
             io.nekohasekai.sagernet.database.DataStore.appAutoUpdate = false
 
@@ -495,7 +496,9 @@ object SelfTest {
                         window.setContent {
                             androidx.activity.DesktopActivityStack.Host(mainActivity)
                         }
-                        println("[selftest-gui] ComposeWindow initialized")
+                        println(
+                            "[selftest-gui] ComposeWindow initialized (linuxScaleOverride=${LinuxWindowSupport.detectLinuxScaleOverride(window)})",
+                        )
                     } catch (t: Throwable) {
                         windowError = t
                     } finally {
