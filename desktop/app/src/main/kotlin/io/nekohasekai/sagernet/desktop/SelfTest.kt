@@ -529,6 +529,7 @@ object SelfTest {
         val privilegedTun = DesktopPrivilegedTun()
 
         return try {
+            android.util.Log.initSession()
             val core = DesktopRuntime.coreBinary()
                 ?: error("owenclave-core is missing for ${DesktopRuntime.platformTag}")
             io.nekohasekai.sagernet.SagerNet.application
@@ -696,6 +697,7 @@ object SelfTest {
         val privilegedTun = DesktopPrivilegedTun()
 
         return try {
+            android.util.Log.initSession()
             val core = DesktopRuntime.coreBinary()
                 ?: error("owenclave-core is missing for ${DesktopRuntime.platformTag}")
             check(DesktopRuntime.tun2socksBinary() != null) {
@@ -864,13 +866,24 @@ object SelfTest {
 
     private fun awaitServiceState(expected: io.nekohasekai.sagernet.bg.BaseService.State, timeoutMs: Long) {
         val deadline = System.currentTimeMillis() + timeoutMs
+        var sawNonStopped = false
         while (System.currentTimeMillis() < deadline) {
             val st = io.nekohasekai.sagernet.SagerNet.activeService.data.state
             if (st == expected) return
+            if (st != io.nekohasekai.sagernet.bg.BaseService.State.Stopped) {
+                sawNonStopped = true
+            } else if (sawNonStopped && expected == io.nekohasekai.sagernet.bg.BaseService.State.Connected) {
+                break
+            }
             Thread.sleep(50L)
         }
+        val recentLog = runCatching {
+            File(DesktopRuntime.dataDir, "logcat.log").takeIf { it.isFile }
+                ?.readLines()?.takeLast(20)?.joinToString("\n")
+        }.getOrNull().orEmpty()
         error(
-            "Timed out waiting for service state $expected (actual=${io.nekohasekai.sagernet.SagerNet.activeService.data.state})",
+            "Timed out waiting for service state $expected (actual=${io.nekohasekai.sagernet.SagerNet.activeService.data.state})" +
+                if (recentLog.isNotBlank()) "\n--- logcat ---\n$recentLog" else "",
         )
     }
 

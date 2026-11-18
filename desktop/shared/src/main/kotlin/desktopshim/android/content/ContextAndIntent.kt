@@ -73,7 +73,33 @@ open class Context {
         get() = File(DesktopEnv.dataDir, "no_backup").apply { mkdirs() }
 
     open val cacheDir: File
-        get() = File(DesktopEnv.dataDir, "cache").apply { mkdirs() }
+        get() {
+            val defaultDir = File(DesktopEnv.dataDir, "cache")
+            val osName = System.getProperty("os.name", "").lowercase()
+            val isMac = osName.contains("mac") || osName.contains("darwin")
+            val isWin = osName.contains("win")
+            // `ipc.sock` and `ipc_dns.sock` live in `cacheDir`; macOS XNU limits `sockaddr_un.sun_path`
+            // to 104 bytes (108 on Linux/Windows), which `/var/folders/...` or long usernames exceed.
+            val dir = when {
+                !isWin && (isMac || defaultDir.absolutePath.length > 65) -> {
+                    val hash = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(DesktopEnv.dataDir.absolutePath.toByteArray(Charsets.UTF_8))
+                        .take(6)
+                        .joinToString("") { "%02x".format(it) }
+                    File("/tmp", "owc-$hash")
+                }
+                isWin && defaultDir.absolutePath.length > 75 -> {
+                    val hash = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(DesktopEnv.dataDir.absolutePath.toByteArray(Charsets.UTF_8))
+                        .take(6)
+                        .joinToString("") { "%02x".format(it) }
+                    File(System.getProperty("java.io.tmpdir", "C:\\Temp"), "owc-$hash")
+                }
+                else -> defaultDir
+            }
+            dir.mkdirs()
+            return dir
+        }
 
     open val externalCacheDir: File?
         get() = File(DesktopEnv.dataDir, "external_cache").apply { mkdirs() }

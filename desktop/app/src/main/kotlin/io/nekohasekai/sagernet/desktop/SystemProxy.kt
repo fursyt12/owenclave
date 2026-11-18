@@ -729,11 +729,13 @@ class SystemProxy(
 
         /** Tells WinINet (and every app using it) that the settings changed. */
         private fun refresh() {
+            // Avoid double quotes in the argument string: CreateProcessW / powershell.exe CRT
+            // argv parsing strips unescaped `"` before PowerShell parses `-Command`.
             val script = buildString {
-                append("Add-Type -Namespace WinInet -Name Native -MemberDefinition '")
-                append("[DllImport(\"wininet.dll\", SetLastError=true)] ")
-                append("public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);")
-                append("'; ")
+                append("${'$'}q = [char]34; ")
+                append("Add-Type -Namespace WinInet -Name Native -MemberDefinition ")
+                append("('[DllImport(' + ${'$'}q + 'wininet.dll' + ${'$'}q + ', SetLastError=true)] ")
+                append("public static extern bool InternetSetOption(IntPtr h, int o, IntPtr b, int l);'); ")
                 append("[WinInet.Native]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null; ")
                 append("[WinInet.Native]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null")
             }

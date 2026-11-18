@@ -92,8 +92,8 @@ for hs in sorted(glob.glob("**/hs_err_pid*.log", recursive=True))[:2]:
 if os.path.isfile(log_path):
     with open(log_path, "r", errors="replace") as f:
         lines = [ln.rstrip("\r\n") for ln in f if not ln.startswith("> Task ") and not ln.startswith("> Configure project ")]
-    interesting = [ln for ln in lines if any(k in ln for k in ("FAILED", "Exception", "Error", "Caused by", "What went wrong", "non-zero exit value", "Process "))]
-    summary = "\n".join((interesting[-25:] + ["--- tail ---"] + lines[-25:]))
+    interesting = [ln for ln in lines if any(k in ln for k in ("FAILED", "FAIL", "Exception", "Error", "error", " W/", " E/", "Caused by", "What went wrong", "non-zero exit value", "Process "))]
+    summary = "\n".join((interesting[-30:] + ["--- tail ---"] + lines[-35:]))
     sys.stdout.write(f"::error::[{label}] {esc(summary)[:3800]}\n")
 PY
     return 0
