@@ -56,7 +56,9 @@ fi
 # 2. desktop entry, polkit policy and icon, taken from the image when possible
 cp "$PROJECT/packaging/arch/owenclave.desktop" "$WORK/owenclave.desktop"
 cp "$PROJECT/packaging/arch/org.owenewans.owenclave.policy" "$WORK/org.owenewans.owenclave.policy"
-if [ -f "$APP_IMAGE/lib/Owenclave.png" ]; then
+if [ -f "$PROJECT/packaging/icons/owenclave.png" ]; then
+  cp "$PROJECT/packaging/icons/owenclave.png" "$WORK/owenclave.png"
+elif [ -f "$APP_IMAGE/lib/Owenclave.png" ]; then
   cp "$APP_IMAGE/lib/Owenclave.png" "$WORK/owenclave.png"
 elif [ -f "$PROJECT/app/src/main/ic_launcher-playstore.png" ]; then
   cp "$PROJECT/app/src/main/ic_launcher-playstore.png" "$WORK/owenclave.png"

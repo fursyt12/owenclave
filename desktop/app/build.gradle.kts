@@ -133,7 +133,7 @@ val copyAndroidPreferences = tasks.register<Sync>("copyAndroidPreferences") {
         into("android-preferences")
         rename { "preference-v29.xml" }
     }
-    from(rootProject.file("app/src/main/ic_launcher-playstore.png")) {
+    from(rootProject.file("packaging/icons/owenclave.png")) {
         rename { "owenclave-icon.png" }
     }
     into(androidPreferencesDir)
@@ -257,19 +257,33 @@ val prepareWindowsPortable = tasks.register("prepareWindowsPortable") {
         File(binDir, "Owenclave.bat").writeText(batContent)
 
         val launcherSrc = rootProject.file("packaging/windows/launcher.c")
+        val launcherRc = rootProject.file("packaging/windows/launcher.rc")
         val rootExe = File(appRoot, "Owenclave.exe")
         val binExe = File(binDir, "Owenclave.exe")
         if (launcherSrc.isFile) {
-            val gccProc = ProcessBuilder(
-                "x86_64-w64-mingw32-gcc",
-                "-O2",
-                "-municode",
-                "-s",
-                launcherSrc.absolutePath,
-                "-o",
-                rootExe.absolutePath,
-            ).inheritIO().start()
+            val resObj = File(stagingRoot, "launcher.res.o")
+            val hasRes = launcherRc.isFile && runCatching {
+                ProcessBuilder(
+                    "x86_64-w64-mingw32-windres",
+                    "-i",
+                    launcherRc.absolutePath,
+                    "-o",
+                    resObj.absolutePath,
+                ).directory(launcherRc.parentFile).inheritIO().start().waitFor() == 0 && resObj.isFile
+            }.getOrDefault(false)
+            val gccCmd = buildList {
+                add("x86_64-w64-mingw32-gcc")
+                add("-O2")
+                add("-municode")
+                add("-s")
+                add(launcherSrc.absolutePath)
+                if (hasRes) add(resObj.absolutePath)
+                add("-o")
+                add(rootExe.absolutePath)
+            }
+            val gccProc = ProcessBuilder(gccCmd).inheritIO().start()
             check(gccProc.waitFor() == 0) { "Failed to compile Owenclave.exe with x86_64-w64-mingw32-gcc" }
+            resObj.delete()
             rootExe.copyTo(binExe, overwrite = true)
             rootExe.copyTo(File(appRoot, "owenclave.exe"), overwrite = true)
             rootExe.copyTo(File(binDir, "owenclave.exe"), overwrite = true)
@@ -433,12 +447,13 @@ compose.desktop {
                 menuGroup = "Network"
                 appCategory = "Network"
                 shortcut = true
-                iconFile.set(rootProject.file("app/src/main/ic_launcher-playstore.png"))
+                iconFile.set(rootProject.file("packaging/icons/owenclave.png"))
             }
             macOS {
                 bundleID = "org.owenewans.owenclave.desktop"
                 packageName = "Owenclave"
                 dockName = "Owenclave"
+                iconFile.set(rootProject.file("packaging/macos/Owenclave.icns"))
                 infoPlist {
                     extraKeysRawXml = """
                         <key>CFBundleURLTypes</key>

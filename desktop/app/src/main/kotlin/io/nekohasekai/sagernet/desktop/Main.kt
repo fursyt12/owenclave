@@ -138,7 +138,10 @@ fun main(args: Array<String>) {
         val windowState = rememberWindowState(
             size = DpSize(initialWindowSize.first.dp, initialWindowSize.second.dp),
         )
-        val appIcon = remember { loadDesktopAppIcon() }
+        val appIcon = remember {
+            applyDesktopTaskbarIcon()
+            loadDesktopAppIcon()
+        }
         Window(
             onCloseRequest = {
                 onIncomingDeepLinks = null
@@ -157,6 +160,7 @@ fun main(args: Array<String>) {
                 mutableStateOf(LinuxWindowSupport.detectLinuxScaleOverride(window))
             }
             DisposableEffect(window) {
+                applyDesktopWindowIconImages(window)
                 window.minimumSize = LinuxWindowSupport.minimumWindowDimension()
                 LinuxWindowSupport.attachWindowFixes(window)
                 val refreshScale = java.beans.PropertyChangeListener {
@@ -225,6 +229,62 @@ private fun loadDesktopAppIcon(): Painter? {
         val bytes = stream.use { it.readBytes() }
         BitmapPainter(org.jetbrains.skia.Image.makeFromEncoded(bytes).toComposeImageBitmap())
     }.getOrNull()
+}
+
+private fun loadDesktopIconBufferedImages(): List<java.awt.image.BufferedImage> {
+    return runCatching {
+        val stream = DesktopRuntime::class.java.getResourceAsStream("/owenclave-icon.png")
+            ?: return emptyList()
+        val master = stream.use { javax.imageio.ImageIO.read(it) } ?: return emptyList()
+        listOf(16, 24, 32, 48, 64, 128, 256, 512).map { sz ->
+            if (master.width == sz && master.height == sz) {
+                master
+            } else {
+                val dst = java.awt.image.BufferedImage(sz, sz, java.awt.image.BufferedImage.TYPE_INT_ARGB)
+                val g = dst.createGraphics()
+                try {
+                    g.setRenderingHint(
+                        java.awt.RenderingHints.KEY_INTERPOLATION,
+                        java.awt.RenderingHints.VALUE_INTERPOLATION_BICUBIC,
+                    )
+                    g.setRenderingHint(
+                        java.awt.RenderingHints.KEY_RENDERING,
+                        java.awt.RenderingHints.VALUE_RENDER_QUALITY,
+                    )
+                    g.setRenderingHint(
+                        java.awt.RenderingHints.KEY_ANTIALIASING,
+                        java.awt.RenderingHints.VALUE_ANTIALIAS_ON,
+                    )
+                    g.drawImage(master, 0, 0, sz, sz, null)
+                } finally {
+                    g.dispose()
+                }
+                dst
+            }
+        }
+    }.getOrDefault(emptyList())
+}
+
+private fun applyDesktopTaskbarIcon() {
+    runCatching {
+        if (java.awt.Taskbar.isTaskbarSupported()) {
+            val taskbar = java.awt.Taskbar.getTaskbar()
+            if (taskbar.isSupported(java.awt.Taskbar.Feature.ICON_IMAGE)) {
+                val stream = DesktopRuntime::class.java.getResourceAsStream("/owenclave-icon.png") ?: return
+                val img = stream.use { javax.imageio.ImageIO.read(it) } ?: return
+                taskbar.iconImage = img
+            }
+        }
+    }
+}
+
+private fun applyDesktopWindowIconImages(window: java.awt.Window) {
+    runCatching {
+        val icons = loadDesktopIconBufferedImages()
+        if (icons.isNotEmpty()) {
+            window.iconImages = icons
+        }
+    }
 }
 
 internal object DesktopServiceWiring {
