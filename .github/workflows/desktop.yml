@@ -13,6 +13,7 @@ on:
       - "gradle/**"
       - "version.properties"
       - ".github/workflows/desktop.yml"
+      - ".github/actions/build-desktop/**"
     tags:
       - "desktop-v*"
       - "v*"
@@ -48,11 +49,6 @@ jobs:
             target: darwin/amd64
             artifact: macos-x64
             tag: darwin-amd64
-          - name: macOS arm64
-            os: macos-26
-            target: darwin/arm64
-            artifact: macos-arm64
-            tag: darwin-arm64
           - name: Windows x64
             os: windows-latest
             target: windows/amd64
@@ -61,431 +57,95 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Setup Go
-        uses: actions/setup-go@v7
+      - name: Build and verify desktop target
+        uses: ./.github/actions/build-desktop
         with:
-          go-version: 1.27.3
-          cache-dependency-path: "library/core/go.sum"
-      - name: Setup Java
-        uses: actions/setup-java@v6
+          target: ${{ matrix.target }}
+          artifact: ${{ matrix.artifact }}
+          tag: ${{ matrix.tag }}
+
+  build-macos-arm64:
+    name: macOS arm64
+    runs-on: xcode-27
+    continue-on-error: true
+    outputs:
+      started: ${{ steps.desktop.outputs.started }}
+      succeeded: ${{ steps.desktop.outputs.succeeded }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build and verify desktop target
+        id: desktop
+        uses: ./.github/actions/build-desktop
         with:
-          distribution: 'temurin'
-          java-version: 21
-      - name: Install WiX (Windows MSI)
-        if: runner.os == 'Windows'
-        run: choco install wixtoolset --no-progress -y
-      - name: Install Skiko runtime libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgl1 libfontconfig1
-      - name: Warm Go module cache
-        shell: bash
+          target: darwin/arm64
+          artifact: macos-arm64
+          tag: darwin-arm64
+
+  build-macos-arm64-fallback:
+    name: macOS arm64 (fallback pool)
+    needs: [build, build-macos-arm64]
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      needs.build-macos-arm64.outputs.succeeded != 'true' &&
+      needs.build-macos-arm64.outputs.started != 'true'
+    runs-on: macos-26
+    continue-on-error: true
+    outputs:
+      started: ${{ steps.desktop.outputs.started }}
+      succeeded: ${{ steps.desktop.outputs.succeeded }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build and verify desktop target
+        id: desktop
+        uses: ./.github/actions/build-desktop
+        with:
+          target: darwin/arm64
+          artifact: macos-arm64
+          tag: darwin-arm64
+
+  verify-macos-arm64:
+    name: Verify macOS arm64 outcome
+    needs: [build, build-macos-arm64, build-macos-arm64-fallback]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check macOS arm64 test status
         env:
-          # `|` lets Go fall back on any proxy error, not only on 404/410;
-          # proxy.golang.org occasionally fails mid download with INTERNAL_ERROR.
-          GOPROXY: "https://proxy.golang.org|https://goproxy.io|direct"
-        run: |
-          set -uo pipefail
-          for attempt in 1 2 3 4; do
-            echo "::group::go mod download (attempt $attempt)"
-            if (cd library/core && go mod download); then
-              echo "module cache is warm"
-              echo "::endgroup::"
-              exit 0
-            fi
-            echo "::endgroup::"
-            echo "attempt $attempt failed, retrying in 20s"
-            sleep 20
-          done
-          echo "::error::go mod download failed after 4 attempts"
-          exit 1
-      - name: Build core
-        shell: bash
-        env:
-          GOPROXY: "https://proxy.golang.org|https://goproxy.io|direct"
-        run: |
-          set -uo pipefail
-          for attempt in 1 2 3; do
-            if TARGETS="${{ matrix.target }}" bash bin/desktop/core/build.sh > /tmp/core-build.log 2>&1; then
-              cat /tmp/core-build.log
-              exit 0
-            fi
-            cat /tmp/core-build.log
-            echo "core build attempt $attempt failed, retrying in 20s"
-            sleep 20
-          done
-          tail -25 /tmp/core-build.log | while IFS= read -r line; do echo "::error::core-build $line"; done
-          echo "::error::core build failed after 3 attempts"
-          exit 1
-      - name: Download NaiveProxy
-        shell: bash
-        run: TARGETS="${{ matrix.target }}" bash bin/desktop/naive/download.sh
-      - name: Download tun2socks (transparent mode)
-        shell: bash
-        run: TARGETS="${{ matrix.target }}" bash bin/desktop/tun2socks/download.sh
-      - name: Verify binaries
-        shell: bash
-        run: |
-          tag="${{ matrix.target }}"
-          tag="${tag//\//-}"
-          ls -la "desktop/core/dist/$tag" "desktop/naive/dist/$tag" "desktop/tun2socks/dist/$tag"
-      - name: Gradle cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.gradle
-          key: gradle-desktop-${{ matrix.artifact }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
-          restore-keys: |
-            gradle-desktop-${{ matrix.artifact }}-
-      - name: Build the Arch package and repository
-        if: runner.os == 'Linux' && matrix.tag == 'linux-amd64'
-        shell: bash
+          PRIMARY_STARTED: ${{ needs.build-macos-arm64.outputs.started }}
+          PRIMARY_SUCCEEDED: ${{ needs.build-macos-arm64.outputs.succeeded }}
+          FALLBACK_STARTED: ${{ needs.build-macos-arm64-fallback.outputs.started }}
+          FALLBACK_SUCCEEDED: ${{ needs.build-macos-arm64-fallback.outputs.succeeded }}
         run: |
           set -euo pipefail
-          ./gradlew :desktop:app:createDistributable --console=plain
-          docker run --rm -v "$PWD":/work -w /work archlinux:latest bash -c "
-            pacman -Sy --noconfirm --needed base-devel >/dev/null &&
-            bash bin/desktop/arch/package.sh
-          "
-          sudo chown -R "$(id -u):$(id -g)" desktop/arch
-          ls -la desktop/arch/dist
-      - name: Unit tests (importers + config builder)
-        shell: bash
-        run: |
-          set -uo pipefail
-          source bin/desktop/ci-report.sh
-          if ! ./gradlew :desktop:app:test :desktop:shared:test --console=plain > /tmp/unit-tests.log 2>&1; then
-            cat /tmp/unit-tests.log
-            report_test_failures "Unit tests" /tmp/unit-tests.log
+          if [ "$PRIMARY_STARTED" = "true" ] && [ "$PRIMARY_SUCCEEDED" != "true" ]; then
+            echo "::error::macOS arm64 acquired a runner on primary pool and failed build/tests"
             exit 1
           fi
-          cat /tmp/unit-tests.log
-      - name: macOS jpackage probe
-        if: runner.os == 'macOS'
-        shell: bash
-        continue-on-error: true
-        run: |
-          set +e
-          work=/tmp/jpprobe; rm -rf "$work"; mkdir -p "$work/in"
-          cp desktop/app/build/libs/app.jar "$work/in/"
-          "$JAVA_HOME/bin/jpackage" --type app-image --input "$work/in" \
-            --main-jar app.jar --main-class io.nekohasekai.sagernet.desktop.MainKt \
-            --name Probe --app-version 1.0.0 --dest "$work/out" > "$work/probe.log" 2>&1
-          rc=$?
-          echo "::notice::jpackage probe exit code $rc"
-          tail -25 "$work/probe.log" | while IFS= read -r line; do echo "::error::jpackage-probe $line"; done
-          exit 0
-      - name: Build portable archive and application image
-        shell: bash
-        run: |
-          set -uo pipefail
-          # CI logs need a token, annotations do not: surface Gradle failures as
-          # annotations so a broken packaging step can be diagnosed from the API.
-          source bin/desktop/ci-report.sh
-          echo "--- createDistributable ---"
-          if ! ./gradlew :desktop:app:createDistributable --console=plain > /tmp/create.log 2>&1; then
-            tail -30 /tmp/create.log
-            dump_jpackage_logs desktop/app/build/compose/logs
-            dump_jpackage_args desktop/app/build/compose/tmp/createDistributable.args.txt
-            report_gradle_failure "createDistributable" /tmp/create.log
+          if [ "$FALLBACK_STARTED" = "true" ] && [ "$FALLBACK_SUCCEEDED" != "true" ]; then
+            echo "::error::macOS arm64 acquired a runner on fallback pool and failed build/tests"
             exit 1
           fi
-          tail -3 /tmp/create.log
-          echo "--- packagePortable ---"
-          if ! ./gradlew :desktop:app:packagePortable --console=plain > /tmp/portable.log 2>&1; then
-            tail -30 /tmp/portable.log
-            dump_jpackage_logs desktop/app/build/compose/logs
-            report_gradle_failure "packagePortable" /tmp/portable.log
-            exit 1
-          fi
-          tail -3 /tmp/portable.log
-      - name: Verify the bundled runtime
-        shell: bash
-        run: |
-          set -uo pipefail
-          # The binaries are staged into the application jar under bin/: a missing
-          # download step used to ship an application without tun2socks, which only
-          # showed up as a silent transparent mode failure, so it is asserted here.
-          jar="$(find desktop/app/build/compose/binaries/main/app -type f -name 'app-*.jar' | head -1)"
-          echo "application jar: $jar"
-          listing=""
-          if command -v unzip >/dev/null 2>&1; then
-            listing="$(unzip -Z1 "$jar" | grep -a '^bin/' || true)"
-          fi
-          if [ -z "$listing" ] && command -v python3 >/dev/null 2>&1; then
-            listing="$(python3 -c 'import sys,zipfile;print("\n".join(n for n in zipfile.ZipFile(sys.argv[1]).namelist() if n.startswith("bin/")))' "$jar" 2>/dev/null || true)"
-          fi
-          if [ -z "$listing" ]; then
-            echo "::error::cannot read the contents of $jar"
-            exit 1
-          fi
-          printf '%s\n' "$listing"
-          missing=0
-          for name in owenclave-core naive tun2socks; do
-            fileName="$name"
-            if [ "$RUNNER_OS" = "Windows" ]; then fileName="$name.exe"; fi
-            if ! printf '%s\n' "$listing" | grep -qx "bin/$fileName"; then
-              echo "::error::bin/$fileName is missing from the application image"
-              missing=1
-            fi
-          done
-          jniName="libgojni.so"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            jniName="gojni.dll"
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            jniName="libgojni.dylib"
-          fi
-          if ! printf '%s\n' "$listing" | grep -qx "bin/$jniName"; then
-            echo "::error::bin/$jniName is missing from the application image"
-            missing=1
-          fi
-          if [ "$RUNNER_OS" = "Linux" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/owenclave-tun-helper'; then
-            echo "::error::bin/owenclave-tun-helper is missing from the Linux application image"
-            missing=1
-          fi
-          if [ "$RUNNER_OS" = "Windows" ] && ! printf '%s\n' "$listing" | grep -qx 'bin/wintun.dll'; then
-            echo "::error::bin/wintun.dll is missing from the Windows application image"
-            missing=1
-          fi
-          # jlink silently leaves java.net.http out; the packaged app then dies with
-          # NoClassDefFoundError the first time a subscription is fetched
-          runtime="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type d -name runtime | head -1)"
-          if [ -n "$runtime" ] && [ -f "$runtime/release" ]; then
-            found="$(grep -o 'java.net.http\|jdk.crypto.ec\|java.sql\|jdk.unsupported' "$runtime/release" | sort -u | tr '\n' ' ')"
-            echo "::notice::jlink runtime modules: $found"
-            for module in java.net.http jdk.crypto.ec java.sql jdk.unsupported; do
-              if ! grep -q "$module" "$runtime/release"; then
-                echo "::error::the bundled runtime is missing $module, so subscriptions, DB or TLS would fail at runtime"
-                missing=1
-              fi
-            done
+          if [ "$PRIMARY_SUCCEEDED" = "true" ] || [ "$FALLBACK_SUCCEEDED" = "true" ]; then
+            echo "::notice::macOS arm64 verified and packaged cleanly"
           else
-            echo "::warning::no bundled runtime release file found to check"
+            echo "::warning::Both GitHub-hosted Apple Silicon pools timed out waiting for VM capacity"
           fi
-          exit "$missing"
-      - name: Development self test (core tunnel)
-        shell: bash
-        run: ./gradlew :desktop:app:run --args="--selftest" --console=plain
-      - name: Packaged self test (bundled core tunnel)
-        shell: bash
-        run: |
-          set -uo pipefail
-          source bin/desktop/ci-report.sh
-          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
-          echo "launcher: $launcher"
-          for flag in --version --selftest --selftest-gui --selftest-system-proxy; do
-            if ! "$launcher" "$flag" > "/tmp/selftest${flag}.log" 2>&1; then
-              cat "/tmp/selftest${flag}.log"
-              report_test_failures "Packaged self test ($flag)" "/tmp/selftest${flag}.log"
-              exit 1
-            fi
-            cat "/tmp/selftest${flag}.log"
-          done
-      - name: Protocol self tests (bundled core, every protocol family)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
-          # starts the shipped core as a local server per protocol and tunnels a
-          # request through the config the shared Android generator produced
-          "$launcher" --selftest-protocols
-      - name: Subscription download self test (bundled runtime)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
-          # Offline only: the payload comes from a loopback server, so no secret is
-          # needed. This is the run that proves java.net.http is in the jlink image:
-          # without it SubscriptionImporter dies with NoClassDefFoundError here
-          # instead of in a user's face.
-          "$launcher" --selftest-subscription
-      - name: NaiveProxy plugin self test
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
-          "$launcher" --selftest-naive
-      - name: Transparent mode self test (network namespace, informational)
-        if: runner.os == 'Linux'
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave' | head -1)"
-          echo "launcher: $launcher"
-          mkdir -p /tmp/owenclave-netns
-          log=/tmp/tun-netns.log
-          # a network namespace gives CAP_NET_ADMIN for the TUN device without
-          # touching the runner's own routes. GitHub runs this step as `bash -e`,
-          # so the status goes through an if: a bare `sudo ...` that fails aborted
-          # the step before any diagnostic below could run.
-          status=0
-          if ! sudo unshare -rn bash -c "
-            ip link set lo up
-            ip route add default dev lo || true
-            export JAVA_TOOL_OPTIONS=-Dowenclave.dataDir=/tmp/owenclave-netns
-            '$launcher' --selftest-tun-stub
-          " >"$log" 2>&1; then
-            status=$?
-          fi
-          echo "::notice::transparent mode, network namespace: launcher exit status $status"
-          # the job logs need a token, annotations do not: publish the end of the
-          # log either way so a failure here can be diagnosed from the API
-          if [ ! -s "$log" ]; then
-            echo "::warning::transparent mode, network namespace: the launcher wrote nothing to stderr or stdout; unshare=$(command -v unshare || echo missing) sudo=$(command -v sudo || echo missing)"
-          fi
-          tail -20 "$log" | while IFS= read -r line; do echo "::notice::tun-netns-log $line"; done
-          if grep -q '\[selftest-tun\] PASS' "$log"; then
-            echo "::notice::transparent mode, network namespace: PASS"
-          else
-            # informational only: the namespace of the hosted runner produces no
-            # output at all here, while the real run below passes on Linux and both
-            # macOS builds and is the check that counts
-            echo "::notice::transparent mode, network namespace: inconclusive on this runner (informational; the real run below is authoritative)"
-            grep -aE 'selftest-tun|Exception|denied|No such|not found' "$log" | tail -8 | while IFS= read -r line; do
-              echo "::notice::tun-netns $line"
-            done
-          fi
-          exit 0
-      - name: Package installer (best effort)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          source bin/desktop/ci-report.sh
-          if ./gradlew :desktop:app:packageDistributionForCurrentOS --console=plain > /tmp/installer.log 2>&1; then
-            tail -5 /tmp/installer.log
-            find desktop/app/build/compose/binaries/main -maxdepth 2 -type f \
-              \( -name '*.deb' -o -name '*.rpm' -o -name '*.dmg' -o -name '*.msi' -o -name '*.pkg' \) \
-              | while IFS= read -r file; do echo "::notice::installer $file"; done
-          else
-            tail -25 /tmp/installer.log
-            dump_jpackage_logs desktop/app/build/compose/logs
-            report_gradle_failure "packageDistributionForCurrentOS" /tmp/installer.log
-          fi
-          exit 0
-      - name: Upload the Arch repository
-        if: runner.os == 'Linux' && matrix.tag == 'linux-amd64'
-        uses: actions/upload-artifact@v7
-        with:
-          name: owenclave-arch-repo
-          path: desktop/arch/dist/**
-          if-no-files-found: warn
-      - name: Upload desktop artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: owenclave-desktop-${{ matrix.artifact }}
-          path: desktop/app/build/compose/binaries/main/**
-          if-no-files-found: warn
-      - name: Upload platform binaries
-        uses: actions/upload-artifact@v7
-        with:
-          name: owenclave-binaries-${{ matrix.artifact }}
-          path: |
-            desktop/core/dist/${{ matrix.tag }}
-            desktop/naive/dist/${{ matrix.tag }}
-          if-no-files-found: warn
-      - name: End-to-end VPN / TUN service self test (Windows, macOS & Linux, authoritative)
-        shell: bash
-        run: |
-          set -uo pipefail
-          run_with_timeout() {
-            local secs="$1"; shift
-            "$@" &
-            local pid=$!
-            ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) &
-            local watcher=$!
-            wait "$pid"
-            local rc=$?
-            kill "$watcher" 2>/dev/null || true
-            return $rc
-          }
-          if [ "${RUNNER_OS}" = "Windows" ]; then
-            launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave.exe' | sort | head -1)"
-          else
-            launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave' | sort | head -1)"
-          fi
-          echo "launcher: $launcher"
-          log=/tmp/vpn-e2e.log
-          if [ "${RUNNER_OS}" = "Windows" ]; then
-            e2e_ok=0
-            run_with_timeout 180 "$launcher" --selftest-vpn-e2e >"$log" 2>&1 && e2e_ok=1
-          else
-            e2e_ok=0
-            run_with_timeout 180 sudo -E "$launcher" --selftest-vpn-e2e >"$log" 2>&1 && e2e_ok=1
-          fi
-          if [ "$e2e_ok" != "1" ]; then
-            cat "$log"
-            tail -25 "$log" | while IFS= read -r line; do echo "::error::vpn-e2e $line"; done
-            exit 1
-          fi
-          cat "$log"
-          if ! grep -q '\[selftest-vpn-e2e\] PASS' "$log"; then
-            tail -25 "$log" | while IFS= read -r line; do echo "::error::vpn-e2e $line"; done
-            exit 1
-          fi
-          echo "::notice::vpn-e2e (${RUNNER_OS}): PASS"
-      # Runs last: it takes over the default route, so it must not be able to
-      # jeopardise the artifact uploads. Needs administrator rights, which the
-      # runners provide.
-      - name: Transparent mode self test (real, takes over the default route)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          # `timeout` is not available on every runner, a watchdog is portable
-          run_with_timeout() {
-            local secs="$1"; shift
-            "$@" &
-            local pid=$!
-            ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) &
-            local watcher=$!
-            wait "$pid"
-            local rc=$?
-            kill "$watcher" 2>/dev/null || true
-            return $rc
-          }
-          if [ "${RUNNER_OS}" = "Windows" ]; then
-            launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave.exe' | head -1)"
-          else
-            launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave' | head -1)"
-          fi
-          echo "launcher: $launcher"
-          log=/tmp/tun-real.log
-          # TUN needs administrator rights, and the runners grant them through sudo
-          if [ "${RUNNER_OS}" = "Windows" ]; then
-            run_with_timeout 180 "$launcher" --selftest-tun >"$log" 2>&1 || true
-          else
-            run_with_timeout 180 sudo -E "$launcher" --selftest-tun >"$log" 2>&1 || true
-          fi
-          tail -25 "$log"
-          if grep -q '\[selftest-tun\] PASS' "$log"; then
-            echo "::notice::transparent mode, real run: PASS"
-          else
-            echo "::warning::transparent mode, real run: did not pass"
-            grep -aE 'selftest-tun|Exception|denied|failed|error' "$log" | tail -10 | while IFS= read -r line; do
-              echo "::warning::tun-real $line"
-            done
-          fi
-          exit 0
 
   publish:
     name: Publish Release
     if: |
       always() &&
-      needs.build.result != 'failure' &&
-      (needs.build.result == 'success' || needs.build.result == 'cancelled') &&
+      needs.build.result == 'success' &&
+      needs.verify-macos-arm64.result == 'success' &&
       (
         (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/desktop-v') || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/0.'))) ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'y' && github.event.inputs.tag != '')
       )
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-macos-arm64, build-macos-arm64-fallback, verify-macos-arm64]
     env:
       GH_TOKEN: ${{ github.token }}
     permissions:
@@ -514,10 +174,6 @@ jobs:
           echo "DESKTOP_VERSION=${desktop_version}" >>"$GITHUB_ENV"
           rm -rf release notes.md base-notes.md
           mkdir -p release
-          # Installer names do not contain the platform, so the macOS dmg of both
-          # architectures would overwrite each other: suffix them with the matrix tag
-          # taken from the artifact directory name. Portable archives already carry
-          # the os and the architecture.
           while IFS= read -r file; do
             rel="${file#artifacts/}"
             leg="${rel%%/*}"
@@ -529,8 +185,6 @@ jobs:
             esac
             cp "$file" "release/$target"
           done < <(find artifacts -type f \( -name "*.zip" -o -name "*.dmg" -o -name "*.msi" -o -name "*.deb" -o -name "*.rpm" \) | sort)
-          # the Arch repository files must keep their exact names: pacman asks for
-          # <repo>.db and for the package file inside the repository
           mkdir -p arch
           find artifacts/owenclave-arch-repo -type f -name '*.pkg.tar.zst' -exec cp {} release/ \; 2>/dev/null || true
           find artifacts/owenclave-arch-repo -type f \( -name '*.pkg.tar.zst' -o -name 'owenclave.db*' -o -name 'owenclave.files*' \) -exec cp {} arch/ \; 2>/dev/null || true
@@ -629,11 +283,6 @@ jobs:
             else
               gh release edit "$TAG" --title "$release_title" --notes-file combined-notes.md --prerelease=false
             fi
-            # drop desktop assets that belonged to an earlier layout of this release while preserving Android APKs
-            while IFS= read -r asset; do
-              case "$asset" in *.apk|*.aab|*.sha256) continue ;; esac
-              [ -f "release/$asset" ] || gh release delete-asset "$TAG" "$asset" --yes
-            done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
           }
 
           if gh release view "$TAG" >/dev/null 2>&1; then
@@ -658,8 +307,6 @@ jobs:
           fi
           gh release view "$TAG"
 
-          # Stable repository release: the URL used by the one command installer and
-          # by the Server line in /etc/pacman.conf never changes.
           if [ -n "$(ls -A arch 2>/dev/null)" ]; then
             if ! gh release view desktop-repo >/dev/null 2>&1; then
               gh release create desktop-repo --latest=false --title "Arch repository" \
