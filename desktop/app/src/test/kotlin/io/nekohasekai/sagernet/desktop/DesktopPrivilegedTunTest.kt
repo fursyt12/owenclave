@@ -573,5 +573,93 @@ class DesktopPrivilegedTunTest {
             }
         }
     }
+
+    @Test
+    fun `generated Windows helper script uses locale-independent NetTCPIP cmdlets, requires wintun dll, and reloads bypass IPs without re-prompting UAC`() {
+        val tempDir = Files.createTempDirectory("owenclave-tun-win").toFile()
+        try {
+            val tun2socksFile = tempDir.resolve("tun2socks.exe").apply { writeText("stub") }
+            val uacCalls = CopyOnWriteArrayList<List<String>>()
+
+            val launcher = object : PrivilegedProcessLauncher {
+                override fun start(command: List<String>, env: Map<String, String>): Process {
+                    uacCalls.add(command)
+                    Thread {
+                        Thread.sleep(60)
+                        val runtimeDir = tempDir.resolve("runtime")
+                        runtimeDir.listFiles { f -> f.name.endsWith(".keepalive") }?.firstOrNull()?.let { ka ->
+                            val status = java.io.File(ka.parentFile, ka.name.replace(".keepalive", ".status"))
+                            // Include UTF-8 BOM to verify BOM-tolerant parsing on Windows PowerShell 5.1
+                            status.writeText("\uFEFFOWENCLAVE_TUN_READY tun=OwenclaveTUN iface=Ethernet ifIndex=12\r\n")
+                        }
+                    }.apply { isDaemon = true }.start()
+                    return FakeInteractiveProcess(immediateExitCode = 0)
+                }
+
+                override fun findExecutable(name: String) = null
+                override fun currentUid(): Int = -1
+                override fun isWindowsAdmin(): Boolean = false
+            }
+
+            val tun = DesktopPrivilegedTun(
+                os = "windows",
+                dataDir = tempDir,
+                launcher = launcher,
+                tun2socksLocator = { tun2socksFile },
+                authTimeoutMs = 5_000L,
+            )
+
+            // Missing wintun.dll next to tun2socks.exe must fail fast with a clear TunException
+            val missingErr = assertFailsWith<TunException> {
+                tun.start(PrivilegedTunParams(socksPort = 2080))
+            }
+            assertTrue(missingErr.message.orEmpty().contains("wintun.dll"))
+
+            // Place wintun.dll alongside tun2socks.exe and verify UAC launch + reload
+            tempDir.resolve("wintun.dll").writeText("stub-dll")
+            tun.start(
+                PrivilegedTunParams(
+                    socksPort = 2080,
+                    socksUsername = "win-user",
+                    socksPassword = "win-pass",
+                    enableIpv6 = true,
+                    bypassLan = true,
+                    bypassServerIps = listOf("203.0.113.10"),
+                ),
+            )
+            assertTrue(tun.isRunning())
+            assertEquals(1, uacCalls.size)
+
+            val psFile = tempDir.resolve("runtime/owenclave-tun-win.ps1")
+            assertTrue(psFile.isFile)
+            val psText = psFile.readText()
+            assertFalse(psText.contains("netsh "), "Windows helper must not rely on localized netsh commands")
+            assertFalse(psText.contains("wintun://"), "tun2socks device driver must not use unsupported wintun:// scheme")
+            assertTrue(psText.contains("New-NetIPAddress"))
+            assertTrue(psText.contains("Set-DnsClientServerAddress"))
+            assertTrue(psText.contains("New-NetRoute"))
+            assertTrue(psText.contains("win-user:win-pass@127.0.0.1:2080"))
+
+            // Reloading with a new server IP appends to .bypass without triggering a second UAC prompt!
+            tun.start(
+                PrivilegedTunParams(
+                    socksPort = 2080,
+                    socksUsername = "win-user",
+                    socksPassword = "win-pass",
+                    enableIpv6 = true,
+                    bypassLan = true,
+                    bypassServerIps = listOf("198.51.100.77"),
+                ),
+            )
+            assertEquals(1, uacCalls.size, "Profile switch on Windows must not trigger a second UAC dialog")
+            val bypassFile = tempDir.resolve("runtime").listFiles { f -> f.name.endsWith(".bypass") }?.single()
+            assertTrue(bypassFile != null && bypassFile.readText().contains("198.51.100.77"))
+
+            tun.stop()
+            assertFalse(tun.isRunning())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }
 

@@ -276,24 +276,43 @@ class DnsResolver(context: Context? = null, looper: Any? = null) {
         @JvmStatic
         fun snapshotPhysicalBypassDnsIps(): List<String> {
             val out = LinkedHashSet<String>()
-            val resolvConf = File("/etc/resolv.conf")
-            if (resolvConf.isFile) {
+            fun maybeAddIp(rawIp: String) {
+                val addr = parseLiteralIp(rawIp.trim()) ?: return
+                val text = addr.hostAddress?.substringBefore('%').orEmpty()
+                if (!addr.isLoopbackAddress &&
+                    !addr.isAnyLocalAddress &&
+                    !addr.isLinkLocalAddress &&
+                    !text.startsWith("198.18.") &&
+                    !text.startsWith("198.19.") &&
+                    text !in TUNNEL_HIJACK_PUBLIC_DNS
+                ) {
+                    out.add(text)
+                }
+            }
+            val os = System.getProperty("os.name", "").lowercase()
+            if (os.contains("win")) {
                 runCatching {
-                    resolvConf.useLines { lines ->
-                        for (raw in lines) {
-                            val line = raw.substringBefore('#').trim()
-                            if (!line.startsWith("nameserver")) continue
-                            val ipStr = line.removePrefix("nameserver").trim()
-                            val addr = parseLiteralIp(ipStr) ?: continue
-                            val text = addr.hostAddress?.substringBefore('%').orEmpty()
-                            if (!addr.isLoopbackAddress &&
-                                !addr.isAnyLocalAddress &&
-                                !addr.isLinkLocalAddress &&
-                                !text.startsWith("198.18.") &&
-                                !text.startsWith("198.19.") &&
-                                text !in TUNNEL_HIJACK_PUBLIC_DNS
-                            ) {
-                                out.add(text)
+                    val ps = ProcessBuilder(
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | " +
+                            "Where-Object { \$_.InterfaceAlias -notlike '*Owenclave*' -and \$_.InterfaceAlias -notlike '*wintun*' -and \$_.InterfaceAlias -notlike '*Loopback*' }).ServerAddresses",
+                    ).redirectErrorStream(true).start()
+                    val stdout = ps.inputStream.bufferedReader().use { it.readText() }
+                    ps.waitFor(4, java.util.concurrent.TimeUnit.SECONDS)
+                    stdout.lineSequence().forEach { maybeAddIp(it) }
+                }
+            } else {
+                val resolvConf = File("/etc/resolv.conf")
+                if (resolvConf.isFile) {
+                    runCatching {
+                        resolvConf.useLines { lines ->
+                            for (raw in lines) {
+                                val line = raw.substringBefore('#').trim()
+                                if (!line.startsWith("nameserver")) continue
+                                maybeAddIp(line.removePrefix("nameserver"))
                             }
                         }
                     }

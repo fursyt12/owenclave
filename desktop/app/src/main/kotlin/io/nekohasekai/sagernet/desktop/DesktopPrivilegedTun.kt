@@ -175,7 +175,7 @@ class DesktopPrivilegedTun(
                     }
                     if (changed) stdin.flush()
                 }
-            } else if (os == "darwin" && keepaliveFile?.isFile == true) {
+            } else if ((os == "darwin" || os == "windows") && keepaliveFile?.isFile == true) {
                 val bf = bypassListFile ?: return
                 val added = ArrayList<String>()
                 for (ip in ips) {
@@ -219,7 +219,7 @@ class DesktopPrivilegedTun(
                         Log.i(TAG, "Reused active VPN tunnel for reloaded profile")
                         return
                     }
-                } else if (os == "darwin" && keepaliveFile?.isFile == true) {
+                } else if ((os == "darwin" || os == "windows") && keepaliveFile?.isFile == true) {
                     val bf = bypassListFile
                     if (bf != null) {
                         val added = ArrayList<String>()
@@ -232,7 +232,7 @@ class DesktopPrivilegedTun(
                         if (added.isNotEmpty()) {
                             runCatching { bf.appendText(added.joinToString("\n", postfix = "\n")) }
                         }
-                        Log.i(TAG, "Reused active macOS VPN tunnel for reloaded profile")
+                        Log.i(TAG, "Reused active $os VPN tunnel for reloaded profile")
                         return
                     }
                 } else if ((keepaliveFile?.isFile == true || directWinTun?.running == true) &&
@@ -303,7 +303,7 @@ class DesktopPrivilegedTun(
                     runCatching { proc.destroyForcibly() }
                 }
             }
-        } else if (os == "darwin" && prevMacPid > 0L) {
+        } else if ((os == "darwin" || os == "windows") && prevMacPid > 0L) {
             val waitDeadline = System.currentTimeMillis() + 5_000L
             while (System.currentTimeMillis() < waitDeadline) {
                 val alive = runCatching {
@@ -836,113 +836,288 @@ class DesktopPrivilegedTun(
 
     // ----------------------------------------------------------------- Windows
 
+    internal fun buildWindowsHelperScript(
+        keepalive: File,
+        statusFile: File,
+        bypassFile: File,
+        tun2socks: File,
+        params: PrivilegedTunParams,
+    ): String {
+        val tunName = params.tunDevice
+            .takeIf { it.isNotBlank() && it != TunSession.DEFAULT_LINUX_DEVICE }
+            ?: "OwenclaveTUN"
+        val authPart = if (params.socksUsername.isNotEmpty() || params.socksPassword.isNotEmpty()) {
+            val u = java.net.URLEncoder.encode(params.socksUsername, StandardCharsets.UTF_8).replace("+", "%20")
+            val p = java.net.URLEncoder.encode(params.socksPassword, StandardCharsets.UTF_8).replace("+", "%20")
+            "$u:$p@"
+        } else {
+            ""
+        }
+        val proxyUrl = "socks5://${authPart}127.0.0.1:${params.socksPort}"
+        val mtuVal = params.mtu.coerceIn(1280, 9000)
+        val bypassLanVal = if (params.bypassLan) 1 else 0
+        val ipv6Val = if (params.enableIpv6) 1 else 0
+
+        return """
+            ${'$'}ErrorActionPreference = 'Stop'
+            ${'$'}keepalive = '${keepalive.absolutePath.replace("'", "''")}'
+            ${'$'}statusFile = '${statusFile.absolutePath.replace("'", "''")}'
+            ${'$'}bypassFile = '${bypassFile.absolutePath.replace("'", "''")}'
+            ${'$'}tun2socks = '${tun2socks.absolutePath.replace("'", "''")}'
+            ${'$'}tunName = '${tunName.replace("'", "''")}'
+            ${'$'}proxyUrl = '${proxyUrl.replace("'", "''")}'
+            ${'$'}mtu = $mtuVal
+            ${'$'}bypassLan = $bypassLanVal
+            ${'$'}enableIpv6 = $ipv6Val
+            ${'$'}ownerPid = ${params.owenclavePid}
+            ${'$'}t2s = ${'$'}null
+            ${'$'}tunIdx = 0
+            ${'$'}physIdx = 0
+            ${'$'}gw = ''
+            ${'$'}gw6 = ''
+            ${'$'}lanAdded = ${'$'}false
+            ${'$'}ipv6Added = ${'$'}false
+            ${'$'}addedBypass = New-Object 'System.Collections.Generic.HashSet[string]'
+            ${'$'}utf8NoBom = New-Object System.Text.UTF8Encoding(${'$'}false)
+
+            function Write-Status([string]${'$'}msg) {
+              ${'$'}tmp = "${'$'}statusFile.tmp"
+              [System.IO.File]::WriteAllText(${'$'}tmp, "${'$'}msg`n", ${'$'}utf8NoBom)
+              Move-Item -Force -LiteralPath ${'$'}tmp -Destination ${'$'}statusFile
+            }
+
+            function Sync-BypassIps {
+              if (-not (Test-Path -LiteralPath ${'$'}bypassFile)) { return }
+              foreach (${'$'}raw in (Get-Content -LiteralPath ${'$'}bypassFile -ErrorAction SilentlyContinue)) {
+                ${'$'}ip = "${'$'}raw".Trim()
+                if (-not ${'$'}ip -or ${'$'}addedBypass.Contains(${'$'}ip)) { continue }
+                if (${'$'}ip.Contains(':')) {
+                  if (${'$'}gw6 -and ${'$'}physIdx -gt 0) {
+                    Remove-NetRoute -DestinationPrefix "${'$'}ip/128" -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                    New-NetRoute -DestinationPrefix "${'$'}ip/128" -InterfaceIndex ${'$'}physIdx -NextHop ${'$'}gw6 -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+                    [void]${'$'}addedBypass.Add(${'$'}ip)
+                  }
+                } elseif (${'$'}ip.Contains('.')) {
+                  if (${'$'}gw -and ${'$'}gw -ne '0.0.0.0' -and ${'$'}physIdx -gt 0) {
+                    & route.exe delete ${'$'}ip 2>${'$'}null | Out-Null
+                    & route.exe add ${'$'}ip mask 255.255.255.255 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
+                    [void]${'$'}addedBypass.Add(${'$'}ip)
+                  }
+                }
+              }
+            }
+
+            try {
+              ${'$'}defRoute = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                Where-Object { ${'$'}_.InterfaceAlias -ne ${'$'}tunName -and ${'$'}_.InterfaceAlias -ne 'wintun' -and ${'$'}_.NextHop -ne '0.0.0.0' } |
+                Sort-Object { ${'$'}_.RouteMetric + ${'$'}_.InterfaceMetric } |
+                Select-Object -First 1
+              if (-not ${'$'}defRoute) {
+                throw 'Cannot detect physical IPv4 default network interface'
+              }
+              ${'$'}physIf = ${'$'}defRoute.InterfaceAlias
+              ${'$'}physIdx = [int]${'$'}defRoute.InterfaceIndex
+              ${'$'}gw = ${'$'}defRoute.NextHop
+
+              ${'$'}defRoute6 = Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue |
+                Where-Object { ${'$'}_.InterfaceAlias -ne ${'$'}tunName -and ${'$'}_.InterfaceAlias -ne 'wintun' -and ${'$'}_.NextHop -ne '::' } |
+                Sort-Object { ${'$'}_.RouteMetric + ${'$'}_.InterfaceMetric } |
+                Select-Object -First 1
+              if (${'$'}defRoute6) { ${'$'}gw6 = ${'$'}defRoute6.NextHop }
+
+              Sync-BypassIps
+              if (${'$'}bypassLan -eq 1 -and ${'$'}gw -and ${'$'}gw -ne '0.0.0.0' -and ${'$'}physIdx -gt 0) {
+                & route.exe add 10.0.0.0 mask 255.0.0.0 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
+                & route.exe add 172.16.0.0 mask 255.240.0.0 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
+                & route.exe add 192.168.0.0 mask 255.255.0.0 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
+                ${'$'}lanAdded = ${'$'}true
+              }
+
+              ${'$'}workDir = [System.IO.Path]::GetDirectoryName(${'$'}tun2socks)
+              ${'$'}t2sArgs = @('--device', ${'$'}tunName, '--proxy', ${'$'}proxyUrl, '--interface', ${'$'}physIf, '--mtu', "${'$'}mtu", '--loglevel', 'warn')
+              ${'$'}t2s = Start-Process -FilePath ${'$'}tun2socks -ArgumentList ${'$'}t2sArgs -WorkingDirectory ${'$'}workDir -WindowStyle Hidden -PassThru
+
+              ${'$'}tunAdapter = ${'$'}null
+              for (${'$'}i = 0; ${'$'}i -lt 75; ${'$'}i++) {
+                if (${'$'}t2s.HasExited) {
+                  throw "tun2socks.exe exited prematurely (code ${'$'}(${'$'}t2s.ExitCode))"
+                }
+                ${'$'}tunAdapter = Get-NetAdapter -Name ${'$'}tunName -ErrorAction SilentlyContinue
+                if (${'$'}tunAdapter -and ${'$'}tunAdapter.ifIndex -gt 0) { break }
+                Start-Sleep -Milliseconds 200
+              }
+              if (-not ${'$'}tunAdapter) {
+                throw "Wintun adapter '${'$'}tunName' did not appear within 15s"
+              }
+              ${'$'}tunIdx = [int]${'$'}tunAdapter.ifIndex
+
+              Remove-NetIPAddress -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -Confirm:${'$'}false -ErrorAction SilentlyContinue
+              New-NetIPAddress -InterfaceIndex ${'$'}tunIdx -IPAddress '198.18.0.1' -PrefixLength 15 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+              Set-NetIPInterface -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -InterfaceMetric 1 -NlMtuBytes ${'$'}mtu -ErrorAction SilentlyContinue | Out-Null
+              Set-DnsClientServerAddress -InterfaceIndex ${'$'}tunIdx -ServerAddresses @('1.1.1.1', '8.8.8.8') -ErrorAction SilentlyContinue | Out-Null
+
+              foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1')) {
+                Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                New-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+              }
+
+              if (${'$'}enableIpv6 -eq 1) {
+                try {
+                  New-NetIPAddress -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -IPAddress 'fdfe:dcba:9876::1' -PrefixLength 126 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+                  foreach (${'$'}p6 in @('::/1', '8000::/1')) {
+                    Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                    New-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -NextHop '::' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+                  }
+                  ${'$'}ipv6Added = ${'$'}true
+                } catch {}
+              }
+
+              Clear-DnsClientCache -ErrorAction SilentlyContinue
+              Write-Status "OWENCLAVE_TUN_READY tun=${'$'}tunName iface=${'$'}physIf ifIndex=${'$'}physIdx pid=${'$'}PID"
+
+              while ((Test-Path -LiteralPath ${'$'}keepalive) -and (-not ${'$'}t2s.HasExited) -and (Get-Process -Id ${'$'}ownerPid -ErrorAction SilentlyContinue)) {
+                Sync-BypassIps
+                Start-Sleep -Milliseconds 200
+              }
+            } catch {
+              Write-Status ("ERROR:" + ${'$'}_.Exception.Message)
+              exit 1
+            } finally {
+              if (${'$'}tunIdx -gt 0) {
+                foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1')) {
+                  Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                }
+                if (${'$'}ipv6Added) {
+                  foreach (${'$'}p6 in @('::/1', '8000::/1')) {
+                    Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                  }
+                }
+              }
+              if (${'$'}lanAdded) {
+                & route.exe delete 10.0.0.0 mask 255.0.0.0 2>${'$'}null | Out-Null
+                & route.exe delete 172.16.0.0 mask 255.240.0.0 2>${'$'}null | Out-Null
+                & route.exe delete 192.168.0.0 mask 255.255.0.0 2>${'$'}null | Out-Null
+              }
+              foreach (${'$'}ip in ${'$'}addedBypass) {
+                if (${'$'}ip.Contains(':')) {
+                  Remove-NetRoute -DestinationPrefix "${'$'}ip/128" -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                } else {
+                  & route.exe delete ${'$'}ip 2>${'$'}null | Out-Null
+                }
+              }
+              if (${'$'}t2s -and -not ${'$'}t2s.HasExited) {
+                Stop-Process -Id ${'$'}t2s.Id -Force -ErrorAction SilentlyContinue
+                try { ${'$'}t2s.WaitForExit(3000) | Out-Null } catch {}
+              }
+              Clear-DnsClientCache -ErrorAction SilentlyContinue
+              Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath ${'$'}keepalive, ${'$'}bypassFile, "${'$'}statusFile.tmp", ${'$'}statusFile
+            }
+        """.trimIndent() + "\r\n"
+    }
+
     private fun startWindowsLocked(params: PrivilegedTunParams) {
         val tun2socks = tun2socksLocator()
             ?: throw TunException("tun2socks.exe is missing for ${DesktopRuntime.platformTag}")
-
-        if (launcher.isWindowsAdmin()) {
-            val session = TunSession { line -> Log.i("OwenclaveTUN", line) }
-            session.start(
-                primaryInterface = TunSession.primaryInterface(),
-                mtu = params.mtu,
-                socksPort = params.socksPort,
-                requestedDevice = params.tunDevice,
-                ipv6 = params.enableIpv6,
-            )
-            directWinTun = session
-            return
+        val wintunDll = File(tun2socks.parentFile, "wintun.dll")
+        if (!wintunDll.isFile) {
+            throw TunException("wintun.dll is missing next to ${tun2socks.name} in ${tun2socks.parentFile}")
         }
 
         val runtimeDir = File(dataDir, "runtime").apply { mkdirs() }
         val token = System.nanoTime().toString()
         val keepalive = File(runtimeDir, "owenclave-tun-$token.keepalive").apply { writeText("1") }
         val statusFile = File(runtimeDir, "owenclave-tun-$token.status").apply { delete() }
+        val bypassFile = File(runtimeDir, "owenclave-tun-$token.bypass").apply {
+            val initialIps = params.bypassServerIps.map { it.trim() }.filter { it.matches(SAFE_IP_REGEX) }
+            writeText(if (initialIps.isEmpty()) "" else initialIps.joinToString("\r\n", postfix = "\r\n"))
+        }
         val psScript = File(runtimeDir, "owenclave-tun-win.ps1")
-        val bypassIpsLiteral = params.bypassServerIps
-            .filter { it.matches(Regex("^[0-9.]+$")) }
-            .joinToString(",") { "'$it'" }
+        psScript.writeText(buildWindowsHelperScript(keepalive, statusFile, bypassFile, tun2socks, params))
 
-        psScript.writeText(
-            """
-            ${'$'}ErrorActionPreference = 'Stop'
-            ${'$'}keepalive = '${keepalive.absolutePath.replace("'", "''")}'
-            ${'$'}statusFile = '${statusFile.absolutePath.replace("'", "''")}'
-            ${'$'}tun2socks = '${tun2socks.absolutePath.replace("'", "''")}'
-            ${'$'}tunName = '${params.tunDevice.replace("'", "''")}'
-            ${'$'}socksPort = ${params.socksPort}
-            ${'$'}ownerPid = ${params.owenclavePid}
-            ${'$'}bypassIps = @($bypassIpsLiteral)
-            ${'$'}t2s = ${'$'}null
-            ${'$'}gw = ''
-            try {
-              ${'$'}defRoute = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
-              ${'$'}physIf = ${'$'}defRoute.InterfaceAlias
-              ${'$'}gw = ${'$'}defRoute.NextHop
-              foreach (${'$'}ip in ${'$'}bypassIps) {
-                if (${'$'}gw -and ${'$'}gw -ne '0.0.0.0') {
-                  & route.exe add "${'$'}ip" mask 255.255.255.255 "${'$'}gw" metric 1 | Out-Null
+        val isAdmin = launcher.isWindowsAdmin()
+        val proc: Process
+        val errHolder = AtomicReference("")
+        val errThread: Thread
+
+        if (isAdmin) {
+            proc = launcher.start(
+                listOf(
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    psScript.absolutePath,
+                ),
+            )
+            errThread = Thread({
+                runCatching {
+                    errHolder.set(proc.errorStream.bufferedReader().use { it.readText() }.trim())
                 }
-              }
-              ${'$'}t2s = Start-Process -FilePath ${'$'}tun2socks -ArgumentList @('--device', "wintun://${'$'}tunName", '--proxy', "socks5://127.0.0.1:${'$'}socksPort", '--interface', ${'$'}physIf, '--loglevel', 'warn') -WorkingDirectory ([System.IO.Path]::GetDirectoryName(${'$'}tun2socks)) -WindowStyle Hidden -PassThru
-              for (${'$'}i = 0; ${'$'}i -lt 60; ${'$'}i++) {
-                if ((& netsh interface show interface "name=${'$'}tunName" 2>${'$'}null)) { break }
-                Start-Sleep -Milliseconds 200
-              }
-              & netsh interface ipv4 set address "name=${'$'}tunName" source=static addr=172.19.0.1 mask=255.255.255.252 | Out-Null
-              & netsh interface ipv4 add route 0.0.0.0/1 "${'$'}tunName" 172.19.0.1 metric=1 | Out-Null
-              & netsh interface ipv4 add route 128.0.0.0/1 "${'$'}tunName" 172.19.0.1 metric=1 | Out-Null
-              Set-Content -Path ${'$'}statusFile -Value "OWENCLAVE_TUN_READY tun=${'$'}tunName"
-              while ((Test-Path ${'$'}keepalive) -and (-not ${'$'}t2s.HasExited) -and (Get-Process -Id ${'$'}ownerPid -ErrorAction SilentlyContinue)) {
-                Start-Sleep -Milliseconds 300
-              }
-            } catch {
-              Set-Content -Path ${'$'}statusFile -Value ("ERROR:" + ${'$'}_.Exception.Message)
-            } finally {
-              & netsh interface ipv4 delete route 0.0.0.0/1 "${'$'}tunName" 2>${'$'}null | Out-Null
-              & netsh interface ipv4 delete route 128.0.0.0/1 "${'$'}tunName" 2>${'$'}null | Out-Null
-              foreach (${'$'}ip in ${'$'}bypassIps) {
-                & route.exe delete "${'$'}ip" 2>${'$'}null | Out-Null
-              }
-              if (${'$'}t2s -and -not ${'$'}t2s.HasExited) { Stop-Process -Id ${'$'}t2s.Id -Force -ErrorAction SilentlyContinue }
-              Remove-Item -Force -ErrorAction SilentlyContinue ${'$'}keepalive, ${'$'}statusFile
+            }, "owenclave-tun-win").apply {
+                isDaemon = true
+                start()
             }
-            """.trimIndent()
-        )
+        } else {
+            val elevateCmd = "try { Start-Process -FilePath 'powershell.exe' " +
+                "-ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','${psScript.absolutePath.replace("'", "''")}') " +
+                "-Verb RunAs -WindowStyle Hidden; exit 0 } catch { Write-Error ${'$'}_.Exception.Message; exit 126 }"
 
-        val elevateCmd = "try { Start-Process -FilePath 'powershell.exe' " +
-            "-ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','${psScript.absolutePath.replace("'", "''")}') " +
-            "-Verb RunAs -WindowStyle Hidden; exit 0 } catch { Write-Error ${'$'}_.Exception.Message; exit 126 }"
-
-        val proc = launcher.start(
-            listOf("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", elevateCmd)
-        )
-        val errText = proc.errorStream.bufferedReader().use { it.readText() }.trim()
-        proc.waitFor(authTimeoutMs, TimeUnit.MILLISECONDS)
-        if (proc.exitValue() != 0) {
-            keepalive.delete()
-            if (proc.exitValue() == 126 || errText.contains("canceled", ignoreCase = true)) {
-                throw TunAuthorizationException("VPN authorization was cancelled")
+            val uacProc = launcher.start(
+                listOf("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", elevateCmd),
+            )
+            val errText = uacProc.errorStream.bufferedReader().use { it.readText() }.trim()
+            uacProc.waitFor(authTimeoutMs, TimeUnit.MILLISECONDS)
+            if (uacProc.exitValue() != 0) {
+                keepalive.delete()
+                bypassFile.delete()
+                statusFile.delete()
+                if (uacProc.exitValue() == 126 || errText.contains("canceled", ignoreCase = true) || errText.contains("cancelled", ignoreCase = true)) {
+                    throw TunAuthorizationException("VPN authorization was cancelled")
+                }
+                throw TunAuthorizationException("Failed to elevate VPN helper: $errText")
             }
-            throw TunAuthorizationException("Failed to elevate VPN helper: $errText")
+            proc = uacProc
+            errThread = Thread {}
         }
 
-        val deadline = System.currentTimeMillis() + 25_000L
+        val waitMs = if (isAdmin) authTimeoutMs.coerceAtLeast(30_000L) else 30_000L
+        val deadline = System.currentTimeMillis() + waitMs
         while (System.currentTimeMillis() < deadline) {
             if (statusFile.isFile) {
-                val status = runCatching { statusFile.readText().trim() }.getOrDefault("")
+                val status = runCatching {
+                    statusFile.readText(StandardCharsets.UTF_8).removePrefix("\uFEFF").trim()
+                }.getOrDefault("")
                 if (status.startsWith("OWENCLAVE_TUN_READY")) {
                     keepaliveFile = keepalive
+                    statusMonitorFile = statusFile
+                    bypassListFile = bypassFile
+                    macHelperPid = Regex("pid=(\\d+)").find(status)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    if (isAdmin) supervisorProcess = proc
                     Log.i(TAG, "Windows VPN tunnel active ($status)")
                     return
                 }
                 if (status.startsWith("ERROR:")) {
                     keepalive.delete()
+                    bypassFile.delete()
+                    statusFile.delete()
                     throw TunException(status.removePrefix("ERROR:"))
                 }
+            }
+            if (isAdmin && !proc.isAlive && proc.exitValue() != 0) {
+                keepalive.delete()
+                bypassFile.delete()
+                statusFile.delete()
+                runCatching { errThread.join(1_500L) }
+                val err = errHolder.get()
+                throw TunException("Windows VPN helper exited (${proc.exitValue()}): $err")
             }
             Thread.sleep(150)
         }
         keepalive.delete()
+        bypassFile.delete()
+        statusFile.delete()
         throw TunException("Timed out waiting for Windows Wintun adapter to initialize")
     }
 

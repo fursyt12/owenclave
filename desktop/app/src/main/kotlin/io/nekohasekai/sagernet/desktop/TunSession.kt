@@ -196,33 +196,50 @@ class TunSession(private val log: (String) -> Unit) {
         startPump(binary, name, primaryInterface, socksPort)
         waitForDevice(name)
 
-        run(
-            "netsh", "interface", "ipv4", "set", "address",
-            "name=$name", "source=static", "addr=198.18.0.1", "mask=255.254.0.0",
-        )
-        runQuiet(
-            "netsh", "interface", "ipv4", "set", "dnsservers",
-            "name=$name", "static", "address=8.8.8.8", "register=none", "validate=no",
-        )
-        run("netsh", "interface", "ipv4", "add", "route", "0.0.0.0/0", name, "198.18.0.1", "metric=1")
-        teardown.add {
-            runQuiet("netsh", "interface", "ipv4", "delete", "route", "0.0.0.0/0", name)
+        val setupPs = buildString {
+            append("\$ErrorActionPreference = 'Stop'; ")
+            append("\$idx = [int](Get-NetAdapter -Name '$name').ifIndex; ")
+            append("Remove-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv4 -Confirm:\$false -ErrorAction SilentlyContinue; ")
+            append("New-NetIPAddress -InterfaceIndex \$idx -IPAddress '198.18.0.1' -PrefixLength 15 -PolicyStore ActiveStore | Out-Null; ")
+            append("Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv4 -InterfaceMetric 1 -NlMtuBytes $mtu -ErrorAction SilentlyContinue | Out-Null; ")
+            append("Set-DnsClientServerAddress -InterfaceIndex \$idx -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction SilentlyContinue | Out-Null; ")
+            append("foreach (\$p in @('0.0.0.0/1','128.0.0.0/1')) { ")
+            append("Remove-NetRoute -InterfaceIndex \$idx -DestinationPrefix \$p -Confirm:\$false -ErrorAction SilentlyContinue; ")
+            append("New-NetRoute -InterfaceIndex \$idx -DestinationPrefix \$p -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null ")
+            append("}; ")
+            append("Clear-DnsClientCache -ErrorAction SilentlyContinue")
         }
-        runQuiet("netsh", "interface", "ipv4", "set", "interface", "name=$name", "mtu=$mtu")
+        run("powershell", "-NoProfile", "-NonInteractive", "-Command", setupPs)
+        teardown.add {
+            val cleanPs = "Get-NetAdapter -Name '$name' -ErrorAction SilentlyContinue | ForEach-Object { " +
+                "Remove-NetRoute -InterfaceIndex \$_.ifIndex -DestinationPrefix '0.0.0.0/1' -Confirm:\$false -ErrorAction SilentlyContinue; " +
+                "Remove-NetRoute -InterfaceIndex \$_.ifIndex -DestinationPrefix '128.0.0.0/1' -Confirm:\$false -ErrorAction SilentlyContinue " +
+                "}; Clear-DnsClientCache -ErrorAction SilentlyContinue"
+            runQuiet("powershell", "-NoProfile", "-NonInteractive", "-Command", cleanPs)
+        }
         if (ipv6) setupIpv6Windows(name)
-        log("transparent mode: $name up, default route via the tunnel (physical: $primaryInterface)")
+        log("transparent mode: $name up, split default routes via the tunnel (physical: $primaryInterface)")
     }
 
     private fun setupIpv6Windows(name: String) {
         try {
-            run("netsh", "interface", "ipv6", "add", "address", "name=$name", "address=$TUN_ADDRESS6")
-            teardown.add {
-                runQuiet("netsh", "interface", "ipv6", "delete", "address", "name=$name", "address=$TUN_ADDRESS6")
+            val ipv6Ps = buildString {
+                append("\$ErrorActionPreference = 'Stop'; ")
+                append("\$idx = [int](Get-NetAdapter -Name '$name').ifIndex; ")
+                append("New-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv6 -IPAddress '$TUN_ADDRESS6' -PrefixLength 126 -PolicyStore ActiveStore | Out-Null; ")
+                append("foreach (\$p in @('::/1','8000::/1')) { ")
+                append("Remove-NetRoute -InterfaceIndex \$idx -AddressFamily IPv6 -DestinationPrefix \$p -Confirm:\$false -ErrorAction SilentlyContinue; ")
+                append("New-NetRoute -InterfaceIndex \$idx -AddressFamily IPv6 -DestinationPrefix \$p -NextHop '::' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null ")
+                append("}")
             }
-            run("netsh", "interface", "ipv6", "add", "route", "prefix=::/1", "name=$name", "metric=1")
-            teardown.add { runQuiet("netsh", "interface", "ipv6", "delete", "route", "prefix=::/1", "name=$name") }
-            run("netsh", "interface", "ipv6", "add", "route", "prefix=8000::/1", "name=$name", "metric=1")
-            teardown.add { runQuiet("netsh", "interface", "ipv6", "delete", "route", "prefix=8000::/1", "name=$name") }
+            run("powershell", "-NoProfile", "-NonInteractive", "-Command", ipv6Ps)
+            teardown.add {
+                val cleanPs = "Get-NetAdapter -Name '$name' -ErrorAction SilentlyContinue | ForEach-Object { " +
+                    "Remove-NetRoute -InterfaceIndex \$_.ifIndex -AddressFamily IPv6 -DestinationPrefix '::/1' -Confirm:\$false -ErrorAction SilentlyContinue; " +
+                    "Remove-NetRoute -InterfaceIndex \$_.ifIndex -AddressFamily IPv6 -DestinationPrefix '8000::/1' -Confirm:\$false -ErrorAction SilentlyContinue " +
+                    "}"
+                runQuiet("powershell", "-NoProfile", "-NonInteractive", "-Command", cleanPs)
+            }
             log("transparent mode: IPv6 $TUN_ADDRESS6 routed into $name")
         } catch (e: Exception) {
             log("transparent mode: IPv6 setup failed, continuing with IPv4 only: ${e.message}")
@@ -260,7 +277,13 @@ class TunSession(private val log: (String) -> Unit) {
         while (System.currentTimeMillis() < deadline) {
             if (pump?.isAlive != true) throw TunException("tun2socks terminated while creating the device")
             val visible = when (DesktopRuntime.os) {
-                "windows" -> runQuiet("netsh", "interface", "show", "interface", "name=$name").isNotEmpty()
+                "windows" -> runQuiet(
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Get-NetAdapter -Name '$name' -ErrorAction SilentlyContinue).Name",
+                ).isNotEmpty()
                 else -> runQuiet("ifconfig", name).isNotEmpty()
             }
             if (visible) return

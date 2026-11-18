@@ -19,10 +19,11 @@ PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 TUN2SOCKS_VERSION="${TUN2SOCKS_VERSION:-2.7.0}"
 WINTUN_VERSION="${WINTUN_VERSION:-0.14.1}"
 BASE_URL="https://github.com/xjasonlyu/tun2socks/releases/download/v$TUN2SOCKS_VERSION"
-WINTUN_URL="https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip"
-# wintun.net is not always reachable; the DLL is only needed for the Windows TUN
-# mode, so a failure here is a warning rather than a build error.
-WINTUN_SHA256="${WINTUN_SHA256:-}"
+WINTUN_URLS=(
+  "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip"
+  "https://download.wireguard.com/wintun/builds/wintun-$WINTUN_VERSION.zip"
+)
+WINTUN_SHA256="${WINTUN_SHA256:-07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51}"
 
 OUT_ROOT="${OUT_ROOT:-$PROJECT/desktop/tun2socks/dist}"
 CACHE_DIR="${CACHE_DIR:-$PROJECT/desktop/tun2socks/cache}"
@@ -134,34 +135,33 @@ PY
   if [ "$target_os" = "windows" ]; then
     wintun_archive="$CACHE_DIR/wintun-$WINTUN_VERSION.zip"
     wintun_ok=0
-    for attempt in 1 2 3; do
-      if [ -s "$wintun_archive" ]; then
-        cached="$(cat "$wintun_archive.sha256" 2>/dev/null || true)"
-        if [ -n "$cached" ] && [ "$(sha256_of "$wintun_archive")" = "$cached" ]; then
-          wintun_ok=1
-          break
-        fi
-      fi
-      if curl -fL --retry 2 --connect-timeout 20 "$WINTUN_URL" -o "$wintun_archive"; then
-        sha256_of "$wintun_archive" >"$wintun_archive.sha256"
-        if [ -n "$WINTUN_SHA256" ] && [ "$(cat "$wintun_archive.sha256")" != "$WINTUN_SHA256" ]; then
-          echo "!!! checksum mismatch for wintun.zip" >&2
-          wintun_ok=0
-        else
-          wintun_ok=1
-        fi
-        break
-      fi
-      echo "    wintun download attempt $attempt failed"
-      sleep 5
-    done
-    if [ "$wintun_ok" = "1" ]; then
-      if [ "$target_arch" = "arm64" ]; then
-        wintun_dir="arm64"
-      else
-        wintun_dir="amd64"
-      fi
-      python3 - "$wintun_archive" "$out_dir" "$wintun_dir" <<'PYWINTUN'
+    if [ -s "$wintun_archive" ] && [ "$(sha256_of "$wintun_archive")" = "$WINTUN_SHA256" ]; then
+      wintun_ok=1
+    else
+      for wurl in "${WINTUN_URLS[@]}"; do
+        for attempt in 1 2 3; do
+          echo ">>> downloading wintun-$WINTUN_VERSION.zip from $wurl (attempt $attempt)"
+          if curl -fL --retry 2 --connect-timeout 20 "$wurl" -o "$wintun_archive"; then
+            if [ "$(sha256_of "$wintun_archive")" = "$WINTUN_SHA256" ]; then
+              wintun_ok=1
+              break 2
+            fi
+            echo "!!! checksum mismatch for wintun archive from $wurl" >&2
+          fi
+          sleep 3
+        done
+      done
+    fi
+    if [ "$wintun_ok" != "1" ]; then
+      echo "!!! ERROR: failed to download verified wintun-$WINTUN_VERSION.zip" >&2
+      exit 1
+    fi
+    if [ "$target_arch" = "arm64" ]; then
+      wintun_dir="arm64"
+    else
+      wintun_dir="amd64"
+    fi
+    python3 - "$wintun_archive" "$out_dir" "$wintun_dir" <<'PYWINTUN'
 import os, shutil, sys, tempfile, zipfile
 
 archive, out_dir, arch = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -174,11 +174,6 @@ with tempfile.TemporaryDirectory() as tmp:
     shutil.copy2(source, os.path.join(out_dir, "wintun.dll"))
     print(f"    extracted -> {os.path.join(out_dir, 'wintun.dll')}")
 PYWINTUN
-    else
-      echo "!!! WARNING: could not download wintun.dll from $WINTUN_URL"
-      echo "!!! Windows TUN mode needs wintun.dll next to tun2socks.exe;"
-      echo "!!! get it from https://www.wintun.net/ and copy it to $out_dir"
-    fi
   fi
 
   ls -la "$out_dir"

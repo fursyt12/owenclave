@@ -58,9 +58,34 @@ object DesktopRuntime {
     @Synchronized
     fun naiveBinary(): File? = cache.getOrPut("naive") { locate("naive") }
 
-    /** Userspace TUN pump used by the transparent mode. */
+    /** Userspace TUN pump used by the transparent mode (ensures `wintun.dll` sits alongside `tun2socks.exe` on Windows). */
     @Synchronized
-    fun tun2socksBinary(): File? = cache.getOrPut("tun2socks") { locate("tun2socks") }
+    fun tun2socksBinary(): File? = cache.getOrPut("tun2socks") {
+        val bin = locate("tun2socks") ?: return@getOrPut null
+        if (isWindows) {
+            ensureWindowsWintunDll(bin.parentFile)
+        }
+        bin
+    }
+
+    private fun ensureWindowsWintunDll(targetDir: File?) {
+        if (targetDir == null) return
+        val alongside = File(targetDir, "wintun.dll")
+        if (alongside.isFile && alongside.length() > 0L) return
+        val source = locateFile("wintun.dll") ?: return
+        if (source.canonicalFile != alongside.canonicalFile) {
+            runCatching {
+                targetDir.mkdirs()
+                val tmp = File(targetDir, "wintun.dll.tmp")
+                source.copyTo(tmp, overwrite = true)
+                alongside.delete()
+                if (!tmp.renameTo(alongside)) {
+                    tmp.copyTo(alongside, overwrite = true)
+                    tmp.delete()
+                }
+            }
+        }
+    }
 
     /** Privileged Linux TUN & policy-routing helper invoked via Polkit (`pkexec`). */
     @Synchronized

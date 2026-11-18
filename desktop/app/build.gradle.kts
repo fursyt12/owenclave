@@ -481,6 +481,8 @@ compose.desktop {
             windows {
                 menuGroup = "Owenclave"
                 dirChooser = true
+                shortcut = true
+                iconFile.set(rootProject.file("packaging/windows/owenclave.ico"))
                 upgradeUuid = "6f2f2d3c-31a5-4d3f-9a3e-8f0b6f0f0f01"
             }
         }

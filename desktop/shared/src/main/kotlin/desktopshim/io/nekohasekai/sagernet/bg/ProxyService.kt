@@ -145,13 +145,18 @@ open class ProxyService : Service(),
                 if (physIf.isNotEmpty()) {
                     runCatching { libexclavecore.Libexclavecore.setenv("OWENCLAVE_PHYSICAL_IF", physIf) }
                 }
+            } else if (isWindows) {
+                val physIf = withContext(Dispatchers.IO) { detectWindowsPhysicalIfIndex() }
+                if (physIf.isNotEmpty()) {
+                    runCatching { libexclavecore.Libexclavecore.setenv("OWENCLAVE_PHYSICAL_IF", physIf) }
+                }
             }
         } else {
             lastBoundDnsPort = 0
             lastPhysicalDnsBypassIps = emptyList()
             activePhysicalDnsBypassIps = emptyList()
             android.net.DnsResolver.setPhysicalDnsOverride(null)
-            if (isMacOs) {
+            if (isMacOs || isWindows) {
                 runCatching { libexclavecore.Libexclavecore.unsetenv("OWENCLAVE_PHYSICAL_IF") }
             }
             if (DataStore.serviceMode == Key.MODE_PROXY) {
@@ -184,7 +189,7 @@ open class ProxyService : Service(),
             onPreStart?.invoke(this@ProxyService)
         }
         proxy.v2rayPoint.withLocalResolver(this)
-        if (isMacOs) {
+        if (isMacOs || isWindows) {
             proxy.v2rayPoint.withAlternativeSystemDialer("")
         }
         super.startProcesses()
@@ -232,7 +237,7 @@ open class ProxyService : Service(),
                 lastPhysicalDnsBypassIps = emptyList()
                 activePhysicalDnsBypassIps = emptyList()
                 android.net.DnsResolver.setPhysicalDnsOverride(null)
-                if (isMacOs) {
+                if (isMacOs || isWindows) {
                     runCatching { libexclavecore.Libexclavecore.unsetenv("OWENCLAVE_PHYSICAL_IF") }
                 }
                 withContext(Dispatchers.IO) {
@@ -399,6 +404,28 @@ open class ProxyService : Service(),
         if (fromScutil.isNotEmpty()) {
             lastPhysicalInterface = fromScutil
             return fromScutil
+        }
+        return lastPhysicalInterface
+    }
+
+    private fun detectWindowsPhysicalIfIndex(): String {
+        val fromRoute = runCatching {
+            val proc = ProcessBuilder(
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | " +
+                    "Where-Object { \$_.InterfaceAlias -notlike '*Owenclave*' -and \$_.InterfaceAlias -notlike '*wintun*' -and \$_.NextHop -ne '0.0.0.0' } | " +
+                    "Sort-Object { \$_.RouteMetric + \$_.InterfaceMetric } | Select-Object -First 1).InterfaceIndex",
+            ).redirectErrorStream(true).start()
+            val out = proc.inputStream.bufferedReader().use { it.readText() }
+            proc.waitFor(5, TimeUnit.SECONDS)
+            out.lineSequence().map { it.trim() }.firstOrNull { it.toIntOrNull()?.let { n -> n > 0 } == true }.orEmpty()
+        }.getOrDefault("")
+        if (fromRoute.isNotEmpty()) {
+            lastPhysicalInterface = fromRoute
+            return fromRoute
         }
         return lastPhysicalInterface
     }

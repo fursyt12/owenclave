@@ -931,8 +931,8 @@ object SelfTest {
     }
 
     private fun fetchExternalUnproxied(url: String): Pair<Int, String> {
-        val cmd = if (DesktopRuntime.isLinux) {
-            listOf(
+        val cmd = when {
+            DesktopRuntime.isLinux -> listOf(
                 "/bin/sh",
                 "-c",
                 "mkdir -p /sys/fs/cgroup/owenclave_selftest.slice 2>/dev/null || true; " +
@@ -942,9 +942,15 @@ object SelfTest {
                 "sh",
                 url,
             )
-        } else {
-            val curlBin = if (File("/usr/bin/curl").canExecute()) "/usr/bin/curl" else "curl"
-            listOf(curlBin, "--noproxy", "*", "-sS", "--max-time", "12", "-w", "\n%{http_code}", url)
+            DesktopRuntime.isWindows -> {
+                val sysCurl = File(System.getenv("SystemRoot") ?: "C:\\Windows", "System32\\curl.exe")
+                val curlBin = if (sysCurl.isFile) sysCurl.absolutePath else "curl.exe"
+                listOf(curlBin, "--noproxy", "*", "-sS", "--max-time", "12", "-w", "\n%{http_code}", url)
+            }
+            else -> {
+                val curlBin = if (File("/usr/bin/curl").canExecute()) "/usr/bin/curl" else "curl"
+                listOf(curlBin, "--noproxy", "*", "-sS", "--max-time", "12", "-w", "\n%{http_code}", url)
+            }
         }
         val res = ProcessCommandRunner.run(cmd)
         val lines = res.stdout.trimEnd('\r', '\n')

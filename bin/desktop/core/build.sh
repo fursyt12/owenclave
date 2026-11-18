@@ -306,8 +306,88 @@ func bindPhysicalInterface(fd uintptr, addr v2rayNet.Address) error {
 }
 EOF
 
+    cat << 'EOF' > "$raw_work_dir/libexclavecore/bind_windows.go"
+//go:build windows
+
+package libexclavecore
+
+import (
+	"encoding/binary"
+	"net"
+	"os"
+	"strconv"
+	"sync"
+	"syscall"
+	"time"
+	"unsafe"
+
+	v2rayNet "github.com/exclavenetwork/exclave-core/v5/common/net"
+)
+
+const (
+	winIPUnicastIf   = 31 // IP_UNICAST_IF in ws2ipdef.h (network byte order)
+	winIPv6UnicastIf = 31 // IPV6_UNICAST_IF in ws2ipdef.h (host byte order)
+)
+
+var (
+	winIfMu        sync.Mutex
+	winCachedKey   string
+	winCachedIndex int
+	winCachedUntil time.Time
+)
+
+func resolveWindowsIfIndex(raw string) (int, error) {
+	if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+		return parsed, nil
+	}
+	now := time.Now()
+	winIfMu.Lock()
+	if raw == winCachedKey && winCachedIndex > 0 && now.Before(winCachedUntil) {
+		idx := winCachedIndex
+		winIfMu.Unlock()
+		return idx, nil
+	}
+	winIfMu.Unlock()
+
+	iface, err := net.InterfaceByName(raw)
+	if err != nil {
+		return 0, err
+	}
+
+	winIfMu.Lock()
+	winCachedKey = raw
+	winCachedIndex = iface.Index
+	winCachedUntil = now.Add(2 * time.Second)
+	winIfMu.Unlock()
+	return iface.Index, nil
+}
+
+func bindPhysicalInterface(fd uintptr, addr v2rayNet.Address) error {
+	if addr != nil && addr.Family().IsIP() {
+		if addr.IP().IsLoopback() {
+			return nil
+		}
+	}
+	raw := os.Getenv("OWENCLAVE_PHYSICAL_IF")
+	if raw == "" {
+		return nil
+	}
+	idx, err := resolveWindowsIfIndex(raw)
+	if err != nil || idx <= 0 {
+		return err
+	}
+	if addr != nil && addr.Family().IsIPv6() {
+		return syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IPV6, winIPv6UnicastIf, idx)
+	}
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(idx))
+	netOrderIdx := int(*(*int32)(unsafe.Pointer(&b[0])))
+	return syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, winIPUnicastIf, netOrderIdx)
+}
+EOF
+
     cat << 'EOF' > "$raw_work_dir/libexclavecore/bind_other.go"
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package libexclavecore
 

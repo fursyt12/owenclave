@@ -97,24 +97,36 @@ public class Seq {
 			try (InputStream stream = in) {
 				File cacheDir = new File(System.getProperty("java.io.tmpdir"), "owenclave-jni-" + System.getProperty("user.name", "user"));
 				cacheDir.mkdirs();
-				File target = new File(cacheDir, libFileName);
-				File temp = new File(cacheDir, libFileName + ".tmp");
-				Files.copy(stream, temp.toPath(), StandardCopyOption.REPLACE_EXISTING);
+				byte[] bytes = stream.readAllBytes();
+				String targetName = libFileName;
+				if (osTag.equals("windows")) {
+					java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+					byte[] digest = md.digest(bytes);
+					StringBuilder hex = new StringBuilder(8);
+					for (int i = 0; i < 4; i++) {
+						hex.append(String.format(Locale.ROOT, "%02x", digest[i] & 0xff));
+					}
+					targetName = "gojni-" + hex + ".dll";
+				}
+				File target = new File(cacheDir, targetName);
 				boolean same = target.isFile()
-					&& target.length() == temp.length()
-					&& Arrays.equals(Files.readAllBytes(target.toPath()), Files.readAllBytes(temp.toPath()));
+					&& target.length() == bytes.length
+					&& Arrays.equals(Files.readAllBytes(target.toPath()), bytes);
 				if (!same) {
+					File temp = new File(cacheDir, targetName + "." + ProcessHandle.current().pid() + ".tmp");
+					Files.write(temp.toPath(), bytes);
 					target.delete();
 					if (!temp.renameTo(target)) {
-						Files.copy(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
-						temp.delete();
+						try {
+							Files.copy(temp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+						} finally {
+							temp.delete();
+						}
 					}
 					target.setExecutable(true);
 					if (osTag.equals("darwin")) {
 						prepareMacBinary(target);
 					}
-				} else {
-					temp.delete();
 				}
 				target.setExecutable(true);
 				System.load(target.getAbsolutePath());
