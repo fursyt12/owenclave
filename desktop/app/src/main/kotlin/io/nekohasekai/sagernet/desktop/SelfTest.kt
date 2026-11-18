@@ -517,6 +517,430 @@ object SelfTest {
         }
     }
 
+    /**
+     * Real end-to-end System Proxy (`Key.MODE_PROXY`) verification exercising the exact
+     * GUI service stack (`SagerNet.startService` -> `ProxyService` -> `libgojni` `V2RayInstance`
+     * -> `DesktopServiceWiring` -> `SystemProxy`).
+     */
+    fun runSystemProxyE2e(): Int {
+        val httpServer = LocalHttpServer(PAYLOAD)
+        var ssServer: Process? = null
+        val systemProxy = SystemProxy()
+        val privilegedTun = DesktopPrivilegedTun()
+
+        return try {
+            val core = DesktopRuntime.coreBinary()
+                ?: error("owenclave-core is missing for ${DesktopRuntime.platformTag}")
+            io.nekohasekai.sagernet.SagerNet.application
+            DesktopServiceWiring.install(systemProxy, privilegedTun)
+
+            val ssPort = CoreRunner.freePort()
+            val ssConfig = File(DesktopRuntime.dataDir, "selftest-sysproxy-ss.json")
+            ssConfig.writeText(
+                """
+                {
+                  "log": { "loglevel": "warning" },
+                  "inbounds": [
+                    {
+                      "tag": "ss-in",
+                      "listen": "127.0.0.1",
+                      "port": $ssPort,
+                      "protocol": "shadowsocks",
+                      "settings": { "method": "$METHOD", "password": "$PASSWORD", "network": "tcp,udp" }
+                    }
+                  ],
+                  "outbounds": [ { "tag": "direct", "protocol": "freedom" } ]
+                }
+                """.trimIndent(),
+            )
+            ssServer = ProcessBuilder(core.absolutePath, "run", "-c", ssConfig.absolutePath)
+                .directory(DesktopRuntime.dataDir)
+                .redirectErrorStream(true)
+                .start()
+            val ssProc = ssServer
+            Thread({
+                runCatching { ssProc.inputStream.bufferedReader().forEachLine { println("[sysproxy-ss] $it") } }
+            }, "sysproxy-ss-log").apply { isDaemon = true; start() }
+            awaitPort(ssPort)
+
+            val socksPort = CoreRunner.freePort()
+            val httpPort = CoreRunner.freePort()
+            val ds = io.nekohasekai.sagernet.database.DataStore
+            ds.serviceMode = io.nekohasekai.sagernet.Key.MODE_PROXY
+            // Deliberately keep fresh-install default (requireHttp = false) to verify ProxyService enables HTTP automatically!
+            ds.requireHttp = false
+            ds.requireSocks = true
+            ds.socksPort = socksPort
+            ds.httpPort = httpPort
+            ds.bypassLan = false
+            ds.routeMode = io.nekohasekai.sagernet.RouteMode.RULE
+
+            val bean = ShadowsocksBean().apply {
+                serverAddress = "127.0.0.1"
+                serverPort = ssPort
+                method = METHOD
+                password = PASSWORD
+                name = "sysproxy-e2e"
+                initializeDefaultValues()
+            }
+            val groupId = ds.selectedGroupForImport()
+            val entity = io.nekohasekai.sagernet.database.ProxyEntity(groupId = groupId).apply {
+                putBean(bean)
+                userOrder = 1L
+            }
+            entity.id = io.nekohasekai.sagernet.database.SagerDatabase.proxyDao.addProxy(entity)
+            ds.selectedProxy = entity.id
+
+            val backendReason = systemProxy.unavailableReason()
+            println("[selftest-system-proxy] backend=${systemProxy.backendName()} unavailableReason=$backendReason")
+            if (DesktopRuntime.isMac || DesktopRuntime.isWindows) {
+                check(backendReason == null) {
+                    "SystemProxy backend must be available on ${DesktopRuntime.os}, got: $backendReason"
+                }
+            }
+
+            io.nekohasekai.sagernet.SagerNet.startService()
+            awaitServiceState(io.nekohasekai.sagernet.bg.BaseService.State.Connected, 20_000L)
+
+            val svc = io.nekohasekai.sagernet.SagerNet.activeService
+            check(svc.activeHttpPort == httpPort) { "Expected activeHttpPort=$httpPort, got ${svc.activeHttpPort}" }
+            check(svc.activeSocksPort == socksPort) { "Expected activeSocksPort=$socksPort, got ${svc.activeSocksPort}" }
+            check(!ds.requireHttp) { "DataStore.requireHttp user preference must not be permanently mutated" }
+
+            val targetUrl = "http://127.0.0.1:${httpServer.port}/"
+            val viaHttp = fetchViaJavaProxy(
+                targetUrl,
+                java.net.Proxy(java.net.Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", httpPort)),
+            )
+            println("[selftest-system-proxy] HTTP proxy 127.0.0.1:$httpPort -> ${viaHttp.first} '${viaHttp.second.trim()}'")
+            check(viaHttp.first == 200 && viaHttp.second.trim() == PAYLOAD) {
+                "HTTP inbound failed: ${viaHttp.first} ${viaHttp.second}"
+            }
+
+            val viaSocks = fetchViaJavaProxy(
+                targetUrl,
+                java.net.Proxy(java.net.Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort)),
+            )
+            println("[selftest-system-proxy] SOCKS proxy 127.0.0.1:$socksPort -> ${viaSocks.first} '${viaSocks.second.trim()}'")
+            check(viaSocks.first == 200 && viaSocks.second.trim() == PAYLOAD) {
+                "SOCKS inbound failed: ${viaSocks.first} ${viaSocks.second}"
+            }
+
+            if (DesktopRuntime.isMac) {
+                check(systemProxy.hasBackup()) { "Expected system-proxy-backup.json to be written on macOS" }
+                val scutilOut = ProcessCommandRunner.run(listOf("scutil", "--proxy")).stdout
+                println("[selftest-system-proxy] scutil --proxy (connected):\n$scutilOut")
+                check(Regex("HTTPEnable\\s*:\\s*1").containsMatchIn(scutilOut)) {
+                    "macOS scutil --proxy missing HTTPEnable : 1\n$scutilOut"
+                }
+                check(Regex("HTTPPort\\s*:\\s*$httpPort").containsMatchIn(scutilOut)) {
+                    "macOS scutil --proxy missing HTTPPort : $httpPort\n$scutilOut"
+                }
+                check(Regex("HTTPSEnable\\s*:\\s*1").containsMatchIn(scutilOut)) {
+                    "macOS scutil --proxy missing HTTPSEnable : 1\n$scutilOut"
+                }
+                check(Regex("SOCKSEnable\\s*:\\s*1").containsMatchIn(scutilOut)) {
+                    "macOS scutil --proxy missing SOCKSEnable : 1\n$scutilOut"
+                }
+                check(Regex("SOCKSPort\\s*:\\s*$socksPort").containsMatchIn(scutilOut)) {
+                    "macOS scutil --proxy missing SOCKSPort : $socksPort\n$scutilOut"
+                }
+            } else if (DesktopRuntime.isWindows) {
+                check(systemProxy.hasBackup()) { "Expected system-proxy-backup.json to be written on Windows" }
+            }
+
+            io.nekohasekai.sagernet.SagerNet.stopService()
+            awaitServiceState(io.nekohasekai.sagernet.bg.BaseService.State.Stopped, 15_000L)
+            check(!systemProxy.hasBackup()) { "Expected system-proxy-backup.json to be restored & removed on stop" }
+
+            if (DesktopRuntime.isMac) {
+                val scutilAfter = ProcessCommandRunner.run(listOf("scutil", "--proxy")).stdout
+                println("[selftest-system-proxy] scutil --proxy (restored):\n$scutilAfter")
+                check(!Regex("HTTPPort\\s*:\\s*$httpPort").containsMatchIn(scutilAfter) ||
+                    Regex("HTTPEnable\\s*:\\s*0").containsMatchIn(scutilAfter)
+                ) {
+                    "macOS proxy was not restored after stop:\n$scutilAfter"
+                }
+            }
+
+            println("[selftest-system-proxy] PASS")
+            0
+        } catch (t: Throwable) {
+            println("[selftest-system-proxy] FAIL: ${t.javaClass.simpleName}: ${t.message}")
+            t.printStackTrace()
+            1
+        } finally {
+            runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
+            runCatching { privilegedTun.stop() }
+            runCatching { systemProxy.restore() }
+            runCatching { ssServer?.destroyForcibly() }
+            httpServer.stop()
+        }
+    }
+
+    /**
+     * Real end-to-end VPN / TUN (`Key.MODE_VPN`) verification exercising the exact GUI
+     * service stack (`SagerNet.startService` -> `ProxyService` -> `libgojni` `V2RayInstance`
+     * -> `DesktopServiceWiring` -> `DesktopPrivilegedTun` + `tun2socks`), including:
+     *   1. Unproxied OS packets routed through `utun` / `owenclave-tun` -> `Shadowsocks` #1
+     *   2. Direct physical interface binding (`IP_BOUND_IF` on macOS / cgroup `fwmark` on Linux) + DNS without routing loop
+     *   3. Live hot-reload (`SagerNet.reloadService`) to `Shadowsocks` #2 without dropping TUN
+     *   4. Clean teardown (`SagerNet.stopService`) and route restoration.
+     */
+    fun runVpnE2e(): Int {
+        val http1 = LocalHttpServer("vpn-e2e-profile-1")
+        val http2 = LocalHttpServer("vpn-e2e-profile-2")
+        var ss1: Process? = null
+        var ss2: Process? = null
+        val systemProxy = SystemProxy()
+        val privilegedTun = DesktopPrivilegedTun()
+
+        return try {
+            val core = DesktopRuntime.coreBinary()
+                ?: error("owenclave-core is missing for ${DesktopRuntime.platformTag}")
+            check(DesktopRuntime.tun2socksBinary() != null) {
+                "tun2socks is missing for ${DesktopRuntime.platformTag}"
+            }
+            io.nekohasekai.sagernet.SagerNet.application
+            DesktopServiceWiring.install(systemProxy, privilegedTun)
+
+            fun startRedirectSsServer(name: String, targetHttpPort: Int): Pair<Int, Process> {
+                val port = CoreRunner.freePort()
+                val cfg = File(DesktopRuntime.dataDir, "selftest-$name.json")
+                cfg.writeText(
+                    """
+                    {
+                      "log": { "loglevel": "warning" },
+                      "inbounds": [
+                        {
+                          "tag": "ss-in",
+                          "listen": "127.0.0.1",
+                          "port": $port,
+                          "protocol": "shadowsocks",
+                          "settings": { "method": "$METHOD", "password": "$PASSWORD", "network": "tcp,udp" }
+                        }
+                      ],
+                      "outbounds": [
+                        {
+                          "tag": "redirect-http",
+                          "protocol": "freedom",
+                          "settings": { "redirect": "127.0.0.1:$targetHttpPort" }
+                        }
+                      ]
+                    }
+                    """.trimIndent(),
+                )
+                val proc = ProcessBuilder(core.absolutePath, "run", "-c", cfg.absolutePath)
+                    .directory(DesktopRuntime.dataDir)
+                    .redirectErrorStream(true)
+                    .start()
+                Thread({
+                    runCatching { proc.inputStream.bufferedReader().forEachLine { println("[$name] $it") } }
+                }, "$name-log").apply { isDaemon = true; start() }
+                awaitPort(port)
+                return port to proc
+            }
+
+            val (ssPort1, proc1) = startRedirectSsServer("vpn-ss1", http1.port)
+            ss1 = proc1
+            val (ssPort2, proc2) = startRedirectSsServer("vpn-ss2", http2.port)
+            ss2 = proc2
+
+            val ds = io.nekohasekai.sagernet.database.DataStore
+            ds.serviceMode = io.nekohasekai.sagernet.Key.MODE_VPN
+            ds.socksPort = CoreRunner.freePort()
+            ds.httpPort = CoreRunner.freePort()
+            ds.bypassLan = true
+            ds.enableVPNInterfaceIPv6Address = false
+            ds.routeMode = io.nekohasekai.sagernet.RouteMode.RULE
+
+            io.nekohasekai.sagernet.database.SagerDatabase.rulesDao.reset()
+            io.nekohasekai.sagernet.database.SagerDatabase.rulesDao.createRule(
+                io.nekohasekai.sagernet.database.RuleEntity(
+                    name = "e2e-tun-sentinel",
+                    userOrder = 1L,
+                    enabled = true,
+                    ip = "198.18.0.254/32",
+                    outbound = 0L,
+                ),
+            )
+            io.nekohasekai.sagernet.database.SagerDatabase.rulesDao.createRule(
+                io.nekohasekai.sagernet.database.RuleEntity(
+                    name = "e2e-direct-bypass",
+                    userOrder = 2L,
+                    enabled = true,
+                    network = "tcp,udp",
+                    outbound = -1L,
+                ),
+            )
+
+            val groupId = ds.selectedGroupForImport()
+            fun addSsProfile(name: String, port: Int): io.nekohasekai.sagernet.database.ProxyEntity {
+                val b = ShadowsocksBean().apply {
+                    serverAddress = "127.0.0.1"
+                    serverPort = port
+                    method = METHOD
+                    password = PASSWORD
+                    this.name = name
+                    initializeDefaultValues()
+                }
+                val p = io.nekohasekai.sagernet.database.ProxyEntity(groupId = groupId).apply {
+                    putBean(b)
+                    userOrder = if (name.endsWith("1")) 1L else 2L
+                }
+                p.id = io.nekohasekai.sagernet.database.SagerDatabase.proxyDao.addProxy(p)
+                return p
+            }
+
+            val profile1 = addSsProfile("vpn-profile-1", ssPort1)
+            val profile2 = addSsProfile("vpn-profile-2", ssPort2)
+            ds.selectedProxy = profile1.id
+
+            println("[selftest-vpn-e2e] Stage 1: starting VPN on profile 1 (id=${profile1.id})")
+            io.nekohasekai.sagernet.SagerNet.startService()
+            awaitServiceState(io.nekohasekai.sagernet.bg.BaseService.State.Connected, 30_000L)
+            check(privilegedTun.isRunning()) { "DesktopPrivilegedTun must be running in Connected state" }
+
+            val r1 = fetchExternalUnproxied("http://198.18.0.254/")
+            println("[selftest-vpn-e2e] Stage 1 sentinel response: HTTP ${r1.first} '${r1.second.trim()}'")
+            check(r1.first == 200 && r1.second.trim() == "vpn-e2e-profile-1") {
+                "Stage 1 TUN routing failed: expected 'vpn-e2e-profile-1', got HTTP ${r1.first} '${r1.second}'"
+            }
+
+            val ext1 = fetchExternalInternetProbe()
+            println("[selftest-vpn-e2e] Stage 1 external probe (IP_BOUND_IF / fwmark + DNS): HTTP ${ext1.first}")
+            check(ext1.first in 200..399) {
+                "Stage 1 external bypass probe looped or failed: HTTP ${ext1.first} '${ext1.second}'"
+            }
+
+            println("[selftest-vpn-e2e] Stage 2: hot-reloading VPN to profile 2 (id=${profile2.id})")
+            ds.selectedProxy = profile2.id
+            io.nekohasekai.sagernet.SagerNet.reloadService()
+            awaitProfileReloaded(profile2.id, 20_000L)
+            check(privilegedTun.isRunning()) { "DesktopPrivilegedTun must remain running across profile reload" }
+
+            val r2 = fetchExternalUnproxied("http://198.18.0.254/")
+            println("[selftest-vpn-e2e] Stage 2 sentinel response: HTTP ${r2.first} '${r2.second.trim()}'")
+            check(r2.first == 200 && r2.second.trim() == "vpn-e2e-profile-2") {
+                "Stage 2 reloaded TUN routing failed: expected 'vpn-e2e-profile-2', got HTTP ${r2.first} '${r2.second}'"
+            }
+
+            val ext2 = fetchExternalInternetProbe()
+            println("[selftest-vpn-e2e] Stage 2 external probe after reload: HTTP ${ext2.first}")
+            check(ext2.first in 200..399) {
+                "Stage 2 external probe after reload failed: HTTP ${ext2.first} '${ext2.second}'"
+            }
+
+            println("[selftest-vpn-e2e] Stage 3: stopping VPN and verifying route teardown")
+            io.nekohasekai.sagernet.SagerNet.stopService()
+            awaitServiceState(io.nekohasekai.sagernet.bg.BaseService.State.Stopped, 20_000L)
+            check(!privilegedTun.isRunning()) { "DesktopPrivilegedTun must stop after SagerNet.stopService()" }
+
+            val ext3 = fetchExternalInternetProbe()
+            println("[selftest-vpn-e2e] Stage 3 post-teardown direct internet probe: HTTP ${ext3.first}")
+            check(ext3.first in 200..399) {
+                "Stage 3 post-teardown internet connectivity broken: HTTP ${ext3.first} '${ext3.second}'"
+            }
+
+            println("[selftest-vpn-e2e] PASS")
+            0
+        } catch (t: Throwable) {
+            println("[selftest-vpn-e2e] FAIL: ${t.javaClass.simpleName}: ${t.message}")
+            t.printStackTrace()
+            1
+        } finally {
+            runCatching { io.nekohasekai.sagernet.SagerNet.stopService() }
+            runCatching { privilegedTun.stop() }
+            runCatching { systemProxy.restore() }
+            if (DesktopRuntime.isLinux) {
+                runCatching { File("/sys/fs/cgroup/owenclave_selftest.slice").delete() }
+            }
+            runCatching { ss1?.destroyForcibly() }
+            runCatching { ss2?.destroyForcibly() }
+            http1.stop()
+            http2.stop()
+        }
+    }
+
+    private fun awaitServiceState(expected: io.nekohasekai.sagernet.bg.BaseService.State, timeoutMs: Long) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val st = io.nekohasekai.sagernet.SagerNet.activeService.data.state
+            if (st == expected) return
+            Thread.sleep(50L)
+        }
+        error(
+            "Timed out waiting for service state $expected (actual=${io.nekohasekai.sagernet.SagerNet.activeService.data.state})",
+        )
+    }
+
+    private fun awaitProfileReloaded(expectedProfileId: Long, timeoutMs: Long) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val st = io.nekohasekai.sagernet.SagerNet.activeService.data.state
+            if (st == io.nekohasekai.sagernet.bg.BaseService.State.Connected &&
+                io.nekohasekai.sagernet.database.DataStore.startedProfile == expectedProfileId
+            ) {
+                return
+            }
+            Thread.sleep(50L)
+        }
+        error(
+            "Timed out waiting for reload to profile $expectedProfileId " +
+                "(state=${io.nekohasekai.sagernet.SagerNet.activeService.data.state}, " +
+                "started=${io.nekohasekai.sagernet.database.DataStore.startedProfile})",
+        )
+    }
+
+    private fun fetchViaJavaProxy(url: String, proxy: java.net.Proxy): Pair<Int, String> {
+        val conn = URL(url).openConnection(proxy) as HttpURLConnection
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 10_000
+        conn.instanceFollowRedirects = false
+        return try {
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            code to stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun fetchExternalInternetProbe(): Pair<Int, String> {
+        val urls = listOf("http://cp.cloudflare.com/generate_204", "http://example.com/")
+        var last: Pair<Int, String> = -1 to "not attempted"
+        for (u in urls) {
+            val res = fetchExternalUnproxied(u)
+            if (res.first in 200..399) return res
+            last = res
+        }
+        return last
+    }
+
+    private fun fetchExternalUnproxied(url: String): Pair<Int, String> {
+        val cmd = if (DesktopRuntime.isLinux) {
+            listOf(
+                "/bin/sh",
+                "-c",
+                "mkdir -p /sys/fs/cgroup/owenclave_selftest.slice 2>/dev/null || true; " +
+                    "echo \$\$ >/sys/fs/cgroup/owenclave_selftest.slice/cgroup.procs 2>/dev/null || " +
+                    "echo \$\$ >/sys/fs/cgroup/cgroup.procs 2>/dev/null || true; " +
+                    "exec curl --noproxy '*' -sS --max-time 12 -w '\\n%{http_code}' \"\$1\"",
+                "sh",
+                url,
+            )
+        } else {
+            val curlBin = if (File("/usr/bin/curl").canExecute()) "/usr/bin/curl" else "curl"
+            listOf(curlBin, "--noproxy", "*", "-sS", "--max-time", "12", "-w", "\n%{http_code}", url)
+        }
+        val res = ProcessCommandRunner.run(cmd)
+        val lines = res.stdout.trimEnd('\r', '\n')
+        val nl = lines.lastIndexOf('\n')
+        val code = if (nl >= 0) lines.substring(nl + 1).trim().toIntOrNull() ?: -1 else lines.trim().toIntOrNull() ?: -1
+        val body = if (nl >= 0) lines.substring(0, nl) else ""
+        return if (code > 0) code to body else -1 to res.output
+    }
+
     private fun java.io.InputStream.readFully(buffer: ByteArray) {
         var offset = 0
         while (offset < buffer.size) {

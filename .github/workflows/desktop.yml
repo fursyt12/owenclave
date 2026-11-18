@@ -273,7 +273,7 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then name="Owenclave.exe"; else name="Owenclave"; fi
           launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name "$name" | sort | head -1)"
           echo "launcher: $launcher"
-          for flag in --version --selftest --selftest-gui; do
+          for flag in --version --selftest --selftest-gui --selftest-system-proxy; do
             if ! "$launcher" "$flag" > "/tmp/selftest${flag}.log" 2>&1; then
               cat "/tmp/selftest${flag}.log"
               report_test_failures "Packaged self test ($flag)" "/tmp/selftest${flag}.log"
@@ -389,6 +389,36 @@ jobs:
             desktop/core/dist/${{ matrix.tag }}
             desktop/naive/dist/${{ matrix.tag }}
           if-no-files-found: warn
+      - name: End-to-end VPN / TUN service self test (macOS & Linux, authoritative)
+        if: runner.os == 'macOS' || runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          run_with_timeout() {
+            local secs="$1"; shift
+            "$@" &
+            local pid=$!
+            ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) &
+            local watcher=$!
+            wait "$pid"
+            local rc=$?
+            kill "$watcher" 2>/dev/null || true
+            return $rc
+          }
+          launcher="$(find desktop/app/build/compose/binaries/main/app -maxdepth 4 -type f -name 'Owenclave' | sort | head -1)"
+          echo "launcher: $launcher"
+          log=/tmp/vpn-e2e.log
+          if ! run_with_timeout 180 sudo -E "$launcher" --selftest-vpn-e2e >"$log" 2>&1; then
+            cat "$log"
+            tail -25 "$log" | while IFS= read -r line; do echo "::error::vpn-e2e $line"; done
+            exit 1
+          fi
+          cat "$log"
+          if ! grep -q '\[selftest-vpn-e2e\] PASS' "$log"; then
+            tail -25 "$log" | while IFS= read -r line; do echo "::error::vpn-e2e $line"; done
+            exit 1
+          fi
+          echo "::notice::vpn-e2e (${RUNNER_OS}): PASS"
       # Runs last: it takes over the default route, so it must not be able to
       # jeopardise the artifact uploads. Needs administrator rights, which the
       # runners provide.

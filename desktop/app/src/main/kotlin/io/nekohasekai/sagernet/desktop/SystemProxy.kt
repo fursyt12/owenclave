@@ -573,7 +573,8 @@ class SystemProxy(
 
             if (values.containsKey("mac:bypass")) {
                 val domains = value("mac:bypass").orEmpty().split(" ").filter { it.isNotBlank() }
-                command(listOf("networksetup", "-setproxybypassdomains", service) + domains)
+                val args = if (domains.isEmpty()) listOf("Empty") else domains
+                command(listOf("networksetup", "-setproxybypassdomains", service) + args)
             }
         }
 
@@ -634,6 +635,10 @@ class SystemProxy(
             val primaryDevice = Regex("interface:\\s+(\\S+)")
                 .find(runner.run(listOf("route", "-n", "get", "default")).stdout)
                 ?.groupValues?.get(1)
+                ?.takeIf { !it.startsWith("utun", ignoreCase = true) }
+                ?: Regex("^\\s*(en\\d+)\\s*:", RegexOption.MULTILINE)
+                    .find(runner.run(listOf("scutil", "--nwi")).stdout)
+                    ?.groupValues?.get(1)
 
             val services = ArrayList<Pair<String, String?>>()
             var current: String? = null
@@ -651,7 +656,13 @@ class SystemProxy(
                     if (index >= 0) services[index] = current to device
                 }
             }
-            val chosen = services.firstOrNull { it.second == primaryDevice } ?: services.firstOrNull()
+            val chosen = (if (primaryDevice != null) services.firstOrNull { it.second == primaryDevice } else null)
+                ?: services.firstOrNull { (svc, _) ->
+                    svc.contains("Wi-Fi", ignoreCase = true) ||
+                        svc.contains("Ethernet", ignoreCase = true) ||
+                        svc.contains("LAN", ignoreCase = true)
+                }
+                ?: services.firstOrNull()
             return chosen?.first
                 ?: throw SystemProxyException("cannot resolve the active network service from networksetup")
         }

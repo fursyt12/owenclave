@@ -185,6 +185,28 @@ class SystemProxyTest {
         assertEquals("", host.mac["socks.Server"])
     }
 
+    @Test
+    fun `macos restores empty bypass domains using Empty keyword without networksetup error`() {
+        val host = FakeHost().apply {
+            mac["bypass"] = ""
+        }
+        val dir = dataDir()
+        val proxy = proxy(host, "darwin", dir)
+
+        proxy.apply("127.0.0.1", 9080, 2080, bypass = listOf("localhost", "127.0.0.1", "192.168.0.0/16"))
+        assertEquals("localhost 127.0.0.1 192.168.0.0/16", host.mac["bypass"])
+        assertTrue(proxy.hasBackup())
+
+        val restoreRes = proxy.restore()
+        assertTrue(restoreRes.restored, restoreRes.message)
+        assertFalse(proxy.hasBackup())
+        assertEquals("", host.mac["bypass"])
+        assertTrue(
+            host.commands.any { it.contains("-setproxybypassdomains") && it.last() == "Empty" },
+            "Clearing bypass domains on macOS requires passing 'Empty' to networksetup",
+        )
+    }
+
     // --------------------------------------------------------------- Windows
 
     @Test

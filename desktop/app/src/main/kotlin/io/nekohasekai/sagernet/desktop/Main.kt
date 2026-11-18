@@ -119,58 +119,7 @@ fun main(args: Array<String>) {
     val systemProxy = SystemProxy()
     val privilegedTun = DesktopPrivilegedTun()
     runCatching { systemProxy.restoreStale() }
-    io.nekohasekai.sagernet.bg.ProxyService.onStarted = { service ->
-        val ds = io.nekohasekai.sagernet.database.DataStore
-        if (ds.serviceMode == Key.MODE_VPN) {
-            val bypassIps = DesktopPrivilegedTun.resolveBypassServerIps(service.data.proxy)
-            privilegedTun.start(
-                PrivilegedTunParams(
-                    socksPort = ds.socksPort,
-                    socksUsername = ds.socksUsername,
-                    socksPassword = ds.socksPassword,
-                    localDnsPort = service.activeDnsPort,
-                    mtu = ds.mtu,
-                    enableIpv6 = ds.enableVPNInterfaceIPv6Address,
-                    bypassLan = ds.bypassLan,
-                    bypassServerIps = bypassIps,
-                )
-            )
-        } else {
-            runCatching { privilegedTun.stop() }
-        }
-
-        val shouldApplySystemProxy = ds.requireHttp &&
-            ds.httpUsername.isEmpty() &&
-            ds.httpPassword.isEmpty() &&
-            (ds.serviceMode == Key.MODE_PROXY || ds.appendHttpProxy)
-        if (shouldApplySystemProxy) {
-            val bypass = ds.httpProxyException.split("\n", ",")
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .ifEmpty { listOf("localhost", "127.0.0.1", "::1", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12") }
-            runCatching {
-                systemProxy.apply(
-                    host = "127.0.0.1",
-                    httpPort = ds.httpPort,
-                    socksPort = ds.socksPort,
-                    bypass = bypass,
-                )
-            }.onFailure { io.nekohasekai.sagernet.ktx.Logs.w(it) }
-        } else {
-            runCatching { systemProxy.restore() }
-            if (ds.serviceMode == Key.MODE_VPN) {
-                runCatching {
-                    if (systemProxy.clearDeadLoopbackProxy()) {
-                        io.nekohasekai.sagernet.ktx.Logs.i("Cleared dead loopback OS system proxy for VPN mode")
-                    }
-                }
-            }
-        }
-    }
-    io.nekohasekai.sagernet.bg.ProxyService.onStopped = {
-        runCatching { privilegedTun.stop() }
-        runCatching { systemProxy.restore() }
-    }
+    DesktopServiceWiring.install(systemProxy, privilegedTun)
     Runtime.getRuntime().addShutdownHook(Thread {
         runCatching { instanceHandle?.close() }
         runCatching { privilegedTun.stop() }
@@ -278,6 +227,81 @@ private fun loadDesktopAppIcon(): Painter? {
     }.getOrNull()
 }
 
+internal object DesktopServiceWiring {
+    private val DEFAULT_SYSTEM_PROXY_BYPASS = listOf(
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "192.168.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+    )
+
+    fun install(systemProxy: SystemProxy, privilegedTun: DesktopPrivilegedTun) {
+        io.nekohasekai.sagernet.bg.ProxyService.onPreStart = { service ->
+            val ds = io.nekohasekai.sagernet.database.DataStore
+            if (ds.serviceMode == Key.MODE_VPN && privilegedTun.isRunning()) {
+                val bypassIps = (
+                    DesktopPrivilegedTun.resolveBypassServerIps(service.data.proxy) +
+                        service.activePhysicalDnsBypassIps
+                ).distinct()
+                privilegedTun.prepareBypassIps(bypassIps)
+            }
+        }
+        io.nekohasekai.sagernet.bg.ProxyService.onStarted = { service ->
+            val ds = io.nekohasekai.sagernet.database.DataStore
+            if (ds.serviceMode == Key.MODE_VPN) {
+                val bypassIps = (
+                    DesktopPrivilegedTun.resolveBypassServerIps(service.data.proxy) +
+                        service.activePhysicalDnsBypassIps
+                ).distinct()
+                privilegedTun.start(
+                    PrivilegedTunParams(
+                        socksPort = service.activeSocksPort.takeIf { it > 0 } ?: ds.socksPort,
+                        socksUsername = ds.socksUsername,
+                        socksPassword = ds.socksPassword,
+                        localDnsPort = service.activeDnsPort,
+                        mtu = ds.mtu,
+                        enableIpv6 = ds.enableVPNInterfaceIPv6Address,
+                        bypassLan = ds.bypassLan,
+                        bypassServerIps = bypassIps,
+                    ),
+                )
+            } else {
+                runCatching { privilegedTun.stop() }
+            }
+
+            if (service.activeSystemProxyEligible && ds.serviceMode == Key.MODE_PROXY) {
+                val bypass = ds.httpProxyException.split("\n", ",")
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .ifEmpty { DEFAULT_SYSTEM_PROXY_BYPASS }
+                runCatching {
+                    systemProxy.apply(
+                        host = "127.0.0.1",
+                        httpPort = service.activeHttpPort,
+                        socksPort = service.activeSocksPort,
+                        bypass = bypass,
+                    )
+                }.onFailure { io.nekohasekai.sagernet.ktx.Logs.w(it) }
+            } else {
+                runCatching { systemProxy.restore() }
+                if (ds.serviceMode == Key.MODE_VPN) {
+                    runCatching {
+                        if (systemProxy.clearDeadLoopbackProxy()) {
+                            io.nekohasekai.sagernet.ktx.Logs.i("Cleared dead loopback OS system proxy for VPN mode")
+                        }
+                    }
+                }
+            }
+        }
+        io.nekohasekai.sagernet.bg.ProxyService.onStopped = {
+            runCatching { privilegedTun.stop() }
+            runCatching { systemProxy.restore() }
+        }
+    }
+}
+
 /** Headless entry points used for verification and packaging checks. */
 private fun runCli(args: Array<String>): Int? {
     val isCliFlag = args.any {
@@ -349,6 +373,12 @@ private fun runCli(args: Array<String>): Int? {
     }
     if (args.contains("--selftest-tun-stub")) {
         return SelfTest.runTun(stub = true)
+    }
+    if (args.contains("--selftest-system-proxy")) {
+        return SelfTest.runSystemProxyE2e()
+    }
+    if (args.contains("--selftest-vpn-e2e")) {
+        return SelfTest.runVpnE2e()
     }
     if (args.contains("--print-settings")) {
         // Print the stored values of the settings document so the renderer (and the

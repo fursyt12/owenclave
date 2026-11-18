@@ -138,7 +138,9 @@ class DesktopPrivilegedTun(
     private var supervisorProcess: Process? = null
     private var supervisorStdin: BufferedWriter? = null
     private var keepaliveFile: File? = null
+    private var statusMonitorFile: File? = null
     private var bypassListFile: File? = null
+    private var macHelperPid: Long = 0L
     private var directWinTun: TunSession? = null
     private var activeKey: PrivilegedTunParams.TunnelKey? = null
     private val registeredBypassIps = LinkedHashSet<String>()
@@ -149,6 +151,46 @@ class DesktopPrivilegedTun(
             directWinTun != null -> directWinTun?.running == true
             keepaliveFile != null -> keepaliveFile?.isFile == true
             else -> false
+        }
+    }
+
+    /**
+     * Pre-registers bypass host routes on an already-running tunnel BEFORE `super.startProcesses()`
+     * spawns a reloaded `v2rayPoint` or external `naive` child process so initial outbound packets
+     * never race ahead of the `/32` physical gateway route.
+     */
+    fun prepareBypassIps(ips: List<String>) {
+        synchronized(lock) {
+            if (!isRunning() || ips.isEmpty()) return
+            val stdin = supervisorStdin
+            if (os == "linux" && stdin != null) {
+                runCatching {
+                    var changed = false
+                    for (ip in ips) {
+                        val clean = ip.trim()
+                        if (clean.matches(SAFE_IP_REGEX) && registeredBypassIps.add(clean)) {
+                            stdin.write("ADD_BYPASS $clean\n")
+                            changed = true
+                        }
+                    }
+                    if (changed) stdin.flush()
+                }
+            } else if (os == "darwin" && keepaliveFile?.isFile == true) {
+                val bf = bypassListFile ?: return
+                val added = ArrayList<String>()
+                for (ip in ips) {
+                    val clean = ip.trim()
+                    if (clean.matches(SAFE_IP_REGEX) && registeredBypassIps.add(clean)) {
+                        added += clean
+                    }
+                }
+                if (added.isNotEmpty()) {
+                    runCatching { bf.appendText(added.joinToString("\n", postfix = "\n")) }
+                    if (macHelperPid > 0L) {
+                        Thread.sleep(300L)
+                    }
+                }
+            }
         }
     }
 
@@ -225,14 +267,17 @@ class DesktopPrivilegedTun(
         activeKey = null
         registeredBypassIps.clear()
 
+        val prevStatusFile = statusMonitorFile
+        val prevBypassFile = bypassListFile
+        val prevMacPid = macHelperPid
+        statusMonitorFile = null
+        bypassListFile = null
+        macHelperPid = 0L
+
         keepaliveFile?.let { f ->
             runCatching { f.delete() }
         }
         keepaliveFile = null
-        bypassListFile?.let { f ->
-            runCatching { f.delete() }
-        }
-        bypassListFile = null
 
         directWinTun?.let { tun ->
             runCatching { tun.stop() }
@@ -258,7 +303,18 @@ class DesktopPrivilegedTun(
                     runCatching { proc.destroyForcibly() }
                 }
             }
+        } else if (os == "darwin" && prevMacPid > 0L) {
+            val waitDeadline = System.currentTimeMillis() + 5_000L
+            while (System.currentTimeMillis() < waitDeadline) {
+                val alive = runCatching {
+                    ProcessHandle.of(prevMacPid).map { it.isAlive }.orElse(false)
+                }.getOrDefault(false)
+                if (!alive || prevStatusFile?.isFile != true) break
+                Thread.sleep(50L)
+            }
         }
+        prevBypassFile?.let { f -> runCatching { f.delete() } }
+        prevStatusFile?.let { f -> runCatching { f.delete() } }
     }
 
     // ------------------------------------------------------------------- Linux
@@ -529,8 +585,17 @@ class DesktopPrivilegedTun(
             IPV6_ROUTES_ADDED="0"
             NET_SVC=""
             ORIG_DNS_RESTORE=""
+            CLEANED_UP="0"
+
+            write_status() {
+              printf '%s\n' "${'$'}1" >"${'$'}{STATUS}.tmp"
+              chmod 644 "${'$'}{STATUS}.tmp" >/dev/null 2>&1 || true
+              mv -f "${'$'}{STATUS}.tmp" "${'$'}STATUS"
+            }
 
             cleanup() {
+              [ "${'$'}CLEANED_UP" = "1" ] && return
+              CLEANED_UP="1"
               if [ -n "${'$'}NET_SVC" ] && [ -n "${'$'}ORIG_DNS_RESTORE" ]; then
                 if [ "${'$'}ORIG_DNS_RESTORE" = "__EMPTY__" ]; then
                   networksetup -setdnsservers "${'$'}NET_SVC" "Empty" >/dev/null 2>&1 || true
@@ -538,13 +603,15 @@ class DesktopPrivilegedTun(
                   # shellcheck disable=SC2086
                   networksetup -setdnsservers "${'$'}NET_SVC" ${'$'}ORIG_DNS_RESTORE >/dev/null 2>&1 || true
                 fi
+                dscacheutil -flushcache >/dev/null 2>&1 || true
+                killall -HUP mDNSResponder >/dev/null 2>&1 || true
               fi
               if [ "${'$'}IPV6_ROUTES_ADDED" = "1" ] && [ -n "${'$'}UTUN" ]; then
                 route -n delete -inet6 -net ::/1 -interface "${'$'}UTUN" >/dev/null 2>&1 || true
                 route -n delete -inet6 -net 8000::/1 -interface "${'$'}UTUN" >/dev/null 2>&1 || true
               fi
               for r in 1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/5 16.0.0.0/4 32.0.0.0/3 64.0.0.0/2 128.0.0.0/1 198.18.0.0/15; do
-                [ -n "${'$'}UTUN" ] && route -n delete -net "${'$'}r" -interface "${'$'}UTUN" >/dev/null 2>&1 || true
+                route -n delete -net "${'$'}r" 198.18.0.1 >/dev/null 2>&1 || route -n delete -net "${'$'}r" >/dev/null 2>&1 || true
               done
               if [ "${'$'}LAN_ROUTES_ADDED" = "1" ] && [ -n "${'$'}PHYS_GW" ]; then
                 for lr in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
@@ -557,10 +624,14 @@ class DesktopPrivilegedTun(
               for ip6 in ${'$'}ADDED_BYPASS_V6; do
                 [ -n "${'$'}PHYS_GW6" ] && route -n delete -inet6 -host "${'$'}ip6" "${'$'}PHYS_GW6" >/dev/null 2>&1 || true
               done
-              [ -n "${'$'}T2S_PID" ] && kill "${'$'}T2S_PID" >/dev/null 2>&1 || true
-              rm -f "${'$'}KEEPALIVE" "${'$'}STATUS" "${'$'}BYPASS_FILE" >/dev/null 2>&1 || true
+              if [ -n "${'$'}T2S_PID" ]; then
+                kill "${'$'}T2S_PID" >/dev/null 2>&1 || true
+                wait "${'$'}T2S_PID" >/dev/null 2>&1 || true
+              fi
+              rm -f "${'$'}KEEPALIVE" "${'$'}BYPASS_FILE" "${'$'}{STATUS}.tmp" "${'$'}STATUS" >/dev/null 2>&1 || true
             }
-            trap cleanup EXIT INT TERM HUP
+            trap '' HUP
+            trap cleanup EXIT INT TERM
 
             sync_bypass_ips() {
               [ -f "${'$'}BYPASS_FILE" ] || return 0
@@ -572,7 +643,7 @@ class DesktopPrivilegedTun(
                       *" ${'$'}ip "*) ;;
                       *)
                         if [ -n "${'$'}PHYS_GW6" ]; then
-                          route -n add -inet6 -host "${'$'}ip" "${'$'}PHYS_GW6" >/dev/null 2>&1 || true
+                          route -n add -inet6 -host "${'$'}ip" "${'$'}PHYS_GW6" >/dev/null 2>&1 || route -n change -inet6 -host "${'$'}ip" "${'$'}PHYS_GW6" >/dev/null 2>&1 || true
                           ADDED_BYPASS_V6="${'$'}ADDED_BYPASS_V6 ${'$'}ip"
                         fi
                         ;;
@@ -583,7 +654,7 @@ class DesktopPrivilegedTun(
                       *" ${'$'}ip "*) ;;
                       *)
                         if [ -n "${'$'}PHYS_GW" ]; then
-                          route -n add -host "${'$'}ip" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
+                          route -n add -host "${'$'}ip" "${'$'}PHYS_GW" >/dev/null 2>&1 || route -n change -host "${'$'}ip" "${'$'}PHYS_GW" >/dev/null 2>&1 || true
                           ADDED_BYPASS_V4="${'$'}ADDED_BYPASS_V4 ${'$'}ip"
                         fi
                         ;;
@@ -599,7 +670,7 @@ class DesktopPrivilegedTun(
             DEF6_OUT="${'$'}(route -n get -inet6 default 2>/dev/null || true)"
             PHYS_GW6="${'$'}(printf '%s\n' "${'$'}DEF6_OUT" | awk '/gateway:/{print ${'$'}2; exit}')"
             if [ -z "${'$'}PHYS_IF" ]; then
-              printf 'ERROR:cannot detect default network interface\n' >"${'$'}STATUS"
+              write_status "ERROR:cannot detect default network interface"
               exit 1
             fi
 
@@ -632,13 +703,14 @@ class DesktopPrivilegedTun(
               j=${'$'}((j + 1))
             done
             if ! ifconfig "${'$'}UTUN" >/dev/null 2>&1; then
-              printf 'ERROR:utun interface %s did not appear\n' "${'$'}UTUN" >"${'$'}STATUS"
+              write_status "ERROR:utun interface ${'$'}UTUN did not appear"
               exit 1
             fi
 
-            ifconfig "${'$'}UTUN" 198.18.0.1 198.18.0.1 mtu "${'$'}MTU" up
+            ifconfig "${'$'}UTUN" 198.18.0.1 198.18.0.1 up
+            ifconfig "${'$'}UTUN" mtu "${'$'}MTU" >/dev/null 2>&1 || true
             for r in 1.0.0.0/8 2.0.0.0/7 4.0.0.0/6 8.0.0.0/5 16.0.0.0/4 32.0.0.0/3 64.0.0.0/2 128.0.0.0/1 198.18.0.0/15; do
-              route -n add -net "${'$'}r" -interface "${'$'}UTUN" >/dev/null
+              route -n add -net "${'$'}r" 198.18.0.1 >/dev/null || route -n change -net "${'$'}r" 198.18.0.1 >/dev/null
             done
 
             if [ "${'$'}ENABLE_IPV6" = "1" ]; then
@@ -664,17 +736,21 @@ class DesktopPrivilegedTun(
                 if printf '%s\n' "${'$'}CUR_DNS" | grep -qi "There aren't any"; then
                   ORIG_DNS_RESTORE="__EMPTY__"
                   networksetup -setdnsservers "${'$'}NET_SVC" 1.1.1.1 8.8.8.8 >/dev/null 2>&1 || true
-                elif printf '%s\n' "${'$'}CUR_DNS" | grep -Eq '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|fe80:)'; then
+                  dscacheutil -flushcache >/dev/null 2>&1 || true
+                  killall -HUP mDNSResponder >/dev/null 2>&1 || true
+                elif printf '%s\n' "${'$'}CUR_DNS" | grep -Eq '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|9\.9\.9\.9|fe80:)'; then
                   ORIG_DNS_RESTORE="${'$'}(printf '%s\n' "${'$'}CUR_DNS" | tr '\n' ' ')"
                   networksetup -setdnsservers "${'$'}NET_SVC" 1.1.1.1 8.8.8.8 >/dev/null 2>&1 || true
+                  dscacheutil -flushcache >/dev/null 2>&1 || true
+                  killall -HUP mDNSResponder >/dev/null 2>&1 || true
                 fi
               fi
             fi
 
-            printf 'OWENCLAVE_TUN_READY tun=%s iface=%s\n' "${'$'}UTUN" "${'$'}PHYS_IF" >"${'$'}STATUS"
+            write_status "OWENCLAVE_TUN_READY tun=${'$'}UTUN iface=${'$'}PHYS_IF pid=${'$'}${'$'}"
             while [ -f "${'$'}KEEPALIVE" ] && kill -0 "${'$'}OWNER_PID" 2>/dev/null && kill -0 "${'$'}T2S_PID" 2>/dev/null; do
               sync_bypass_ips
-              sleep 0.3
+              sleep 0.2
             done
         """.trimIndent() + "\n"
     }
@@ -704,7 +780,7 @@ class DesktopPrivilegedTun(
             listOf(
                 "/usr/bin/osascript",
                 "-e",
-                "do shell script \"\\\"$escaped\\\" >/dev/null 2>&1 &\" with administrator privileges",
+                "do shell script \"/usr/bin/nohup \\\"$escaped\\\" >/dev/null 2>&1 </dev/null &\" with administrator privileges",
             )
         }
 
@@ -725,7 +801,9 @@ class DesktopPrivilegedTun(
                 val status = runCatching { statusFile.readText().trim() }.getOrDefault("")
                 if (status.startsWith("OWENCLAVE_TUN_READY")) {
                     keepaliveFile = keepalive
+                    statusMonitorFile = statusFile
                     bypassListFile = bypassFile
+                    macHelperPid = Regex("pid=(\\d+)").find(status)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
                     if (launcher.currentUid() == 0) supervisorProcess = proc
                     Log.i(TAG, "macOS VPN tunnel active ($status)")
                     return
@@ -733,12 +811,14 @@ class DesktopPrivilegedTun(
                 if (status.startsWith("ERROR:")) {
                     keepalive.delete()
                     bypassFile.delete()
+                    statusFile.delete()
                     throw TunException(status.removePrefix("ERROR:"))
                 }
             }
             if (!proc.isAlive && proc.exitValue() != 0) {
                 keepalive.delete()
                 bypassFile.delete()
+                statusFile.delete()
                 runCatching { errThread.join(1_500L) }
                 val err = errHolder.get()
                 if (err.contains("User canceled", ignoreCase = true) || err.contains("-128")) {
@@ -750,6 +830,7 @@ class DesktopPrivilegedTun(
         }
         keepalive.delete()
         bypassFile.delete()
+        statusFile.delete()
         throw TunAuthorizationException("VPN authorization timed out")
     }
 
@@ -899,7 +980,7 @@ class DesktopPrivilegedTun(
                 val host = rawHost.removeSurrounding("[", "]").trim()
                 if (host.isEmpty() || host.equals("localhost", ignoreCase = true)) continue
                 runCatching {
-                    for (addr in InetAddress.getAllByName(host)) {
+                    for (addr in android.net.DnsResolver.resolveDirect(host, timeoutMs = 1_200)) {
                         if (addr.isLoopbackAddress || addr.isAnyLocalAddress || addr.isLinkLocalAddress) continue
                         val ip = addr.hostAddress?.substringBefore('%')?.trim().orEmpty()
                         if (ip.isNotEmpty() && !ip.startsWith("198.18.") && !ip.startsWith("198.19.")) {

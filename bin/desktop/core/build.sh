@@ -236,6 +236,88 @@ EOF
 
     perl -pi -e 's|"golang.org/x/sys/unix"|"syscall"|g; s|unix\.IPPROTO_TCP|syscall.IPPROTO_TCP|g; s|unix\.IPPROTO_UDP|syscall.IPPROTO_UDP|g' "$raw_work_dir/libexclavecore/tun.go"
 
+    perl -0777 -pi -e 's/if systemDialer == nil \{\s*(systemDialer = &protectedDialer\{\s*protector: &noopProtector\{\},\s*resolver:\s*instance\.resolver,\s*\})\s*\}/$1/s' "$raw_work_dir/libexclavecore/v2ray.go"
+
+    cat << 'EOF' > "$raw_work_dir/libexclavecore/bind_darwin.go"
+//go:build darwin
+
+package libexclavecore
+
+import (
+	"net"
+	"os"
+	"sync"
+	"syscall"
+	"time"
+
+	v2rayNet "github.com/exclavenetwork/exclave-core/v5/common/net"
+)
+
+const darwinIPv6BoundIf = 125 // IPV6_BOUND_IF in <netinet6/in6.h>
+
+var (
+	physIfMu        sync.Mutex
+	cachedIfName    string
+	cachedIfIndex   int
+	cachedIfExpires time.Time
+)
+
+func resolvePhysicalIfIndex(name string) (int, error) {
+	now := time.Now()
+	physIfMu.Lock()
+	if name == cachedIfName && cachedIfIndex > 0 && now.Before(cachedIfExpires) {
+		idx := cachedIfIndex
+		physIfMu.Unlock()
+		return idx, nil
+	}
+	physIfMu.Unlock()
+
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return 0, err
+	}
+
+	physIfMu.Lock()
+	cachedIfName = name
+	cachedIfIndex = iface.Index
+	cachedIfExpires = now.Add(2 * time.Second)
+	physIfMu.Unlock()
+	return iface.Index, nil
+}
+
+func bindPhysicalInterface(fd uintptr, addr v2rayNet.Address) error {
+	if addr != nil && addr.Family().IsIP() {
+		if addr.IP().IsLoopback() {
+			return nil
+		}
+	}
+	ifName := os.Getenv("OWENCLAVE_PHYSICAL_IF")
+	if ifName == "" {
+		return nil
+	}
+	idx, err := resolvePhysicalIfIndex(ifName)
+	if err != nil || idx <= 0 {
+		return err
+	}
+	if addr != nil && addr.Family().IsIPv6() {
+		return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, darwinIPv6BoundIf, idx)
+	}
+	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_BOUND_IF, idx)
+}
+EOF
+
+    cat << 'EOF' > "$raw_work_dir/libexclavecore/bind_other.go"
+//go:build !linux && !darwin
+
+package libexclavecore
+
+import v2rayNet "github.com/exclavenetwork/exclave-core/v5/common/net"
+
+func bindPhysicalInterface(fd uintptr, addr v2rayNet.Address) error {
+	return nil
+}
+EOF
+
     prepend_line "//go:build linux" "$raw_work_dir/libexclavecore/dialer.go"
     cat << 'EOF' > "$raw_work_dir/libexclavecore/dialer_nonlinux.go"
 //go:build !linux
@@ -284,11 +366,16 @@ func (dialer protectedDialer) Dial(ctx context.Context, src v2rayNet.Address, de
 		}
 		dest.Address = v2rayNet.IPAddress(ips[0])
 	}
+	isIPv6 := dest.Address.Family().IsIPv6()
 	control := func(network, address string, c syscall.RawConn) error {
 		var ctrlErr error
 		err := c.Control(func(fd uintptr) {
 			if !dialer.protector.Protect(int32(fd)) {
 				ctrlErr = errors.New("protect failed")
+				return
+			}
+			if bindErr := bindPhysicalInterface(fd, dest.Address); bindErr != nil {
+				ctrlErr = bindErr
 				return
 			}
 			if sockopt != nil {
@@ -303,15 +390,20 @@ func (dialer protectedDialer) Dial(ctx context.Context, src v2rayNet.Address, de
 	switch dest.Network {
 	case v2rayNet.Network_UDP:
 		lc := net.ListenConfig{Control: control}
-		bindAddr := ":0"
-		if src != nil && src != v2rayNet.AnyIP && src != v2rayNet.AnyIPv6 {
+		udpNet := "udp4"
+		bindAddr := "0.0.0.0:0"
+		if isIPv6 {
+			udpNet = "udp6"
+			bindAddr = "[::]:0"
+		}
+		if src != nil && src != v2rayNet.AnyIP && src != v2rayNet.AnyIPv6 && src.Family() == dest.Address.Family() {
 			bindAddr = net.JoinHostPort(src.IP().String(), "0")
 		}
-		packetConn, err := lc.ListenPacket(ctx, "udp", bindAddr)
+		packetConn, err := lc.ListenPacket(ctx, udpNet, bindAddr)
 		if err != nil {
 			return nil, err
 		}
-		destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
+		destAddr, err := net.ResolveUDPAddr(udpNet, dest.NetAddr())
 		if err != nil {
 			packetConn.Close()
 			return nil, err
@@ -322,10 +414,14 @@ func (dialer protectedDialer) Dial(ctx context.Context, src v2rayNet.Address, de
 		}, nil
 	default:
 		d := net.Dialer{Control: control}
-		if src != nil && src != v2rayNet.AnyIP && src != v2rayNet.AnyIPv6 {
+		tcpNet := "tcp4"
+		if isIPv6 {
+			tcpNet = "tcp6"
+		}
+		if src != nil && src != v2rayNet.AnyIP && src != v2rayNet.AnyIPv6 && src.Family() == dest.Address.Family() {
 			d.LocalAddr = &net.TCPAddr{IP: src.IP()}
 		}
-		return d.DialContext(ctx, "tcp", dest.NetAddr())
+		return d.DialContext(ctx, tcpNet, dest.NetAddr())
 	}
 }
 EOF

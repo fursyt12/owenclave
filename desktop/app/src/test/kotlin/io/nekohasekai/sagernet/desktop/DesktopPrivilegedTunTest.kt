@@ -372,12 +372,22 @@ class DesktopPrivilegedTunTest {
             assertTrue(tun.isRunning())
             assertEquals(1, osascriptCalls.size)
             assertEquals("/usr/bin/osascript", osascriptCalls[0][0])
+            assertTrue(
+                osascriptCalls[0][2].contains("/usr/bin/nohup") && osascriptCalls[0][2].contains("</dev/null &"),
+                "osascript must detach via nohup and redirect stdin from /dev/null: ${osascriptCalls[0]}",
+            )
 
             val scriptFile = tempDir.resolve("runtime/owenclave-tun-macos.sh")
             assertTrue(scriptFile.isFile)
             val scriptText = scriptFile.readText()
             assertTrue(scriptText.contains("export PATH=\"/usr/sbin:/sbin:/usr/bin:/bin:/usr/local/bin\""))
             assertTrue(scriptText.contains("networksetup -setdnsservers"))
+            assertTrue(scriptText.contains("trap '' HUP"), "macOS helper must ignore SIGHUP when osascript exits")
+            assertTrue(scriptText.contains("trap cleanup EXIT INT TERM"))
+            assertTrue(
+                scriptText.contains("route -n add -net \"\$r\" 198.18.0.1"),
+                "macOS utun IFF_POINTOPOINT routes must target peer gateway 198.18.0.1",
+            )
 
             val shCheck = ProcessBuilder("sh", "-n", scriptFile.absolutePath)
                 .redirectErrorStream(true)
@@ -475,6 +485,92 @@ class DesktopPrivilegedTunTest {
             assertEquals("'none'", host.gnome["org.gnome.system.proxy/mode"])
         } finally {
             tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `DnsResolver resolveDirect resolves RFC1035 records with bounded timeout and passive proc net tcp detects listener`() {
+        // 1. Literal IPv4/IPv6 fast-path requires zero DNS servers.
+        val lit4 = android.net.DnsResolver.resolveDirect("150.241.92.78", customServers = emptyList())
+        assertEquals(listOf("150.241.92.78"), lit4.map { it.hostAddress })
+        val lit6 = android.net.DnsResolver.resolveDirect("[2001:db8::42]", customServers = emptyList())
+        assertEquals(1, lit6.size)
+
+        // 2. Local RFC1035 mock UDP DNS server returning CNAME + A record (compressed pointer 0xC00C).
+        java.net.DatagramSocket(0, java.net.InetAddress.getByName("127.0.0.1")).use { mockDns ->
+            val serverAddr = java.net.InetSocketAddress("127.0.0.1", mockDns.localPort)
+            val responder = Thread({
+                val buf = ByteArray(512)
+                while (!mockDns.isClosed) {
+                    val pkt = java.net.DatagramPacket(buf, buf.size)
+                    try {
+                        mockDns.receive(pkt)
+                    } catch (_: Exception) {
+                        break
+                    }
+                    val req = buf.copyOf(pkt.length)
+                    val out = java.io.ByteArrayOutputStream()
+                    // Header: copy txId, QR=1 + RD=1 + RA=1 (0x8180), QD=1, AN=1
+                    out.write(req[0].toInt()); out.write(req[1].toInt())
+                    out.write(0x81); out.write(0x80)
+                    out.write(0x00); out.write(0x01)
+                    out.write(0x00); out.write(0x01)
+                    out.write(0x00); out.write(0x00)
+                    out.write(0x00); out.write(0x00)
+                    // Copy question section verbatim
+                    out.write(req, 12, req.size - 12)
+                    val qtype = ((req[req.size - 4].toInt() and 0xFF) shl 8) or (req[req.size - 3].toInt() and 0xFF)
+                    if (qtype == android.net.DnsResolver.TYPE_A) {
+                        // Compressed name pointer 0xC00C, TYPE=A(1), CLASS=IN(1), TTL=60, RDLEN=4, IP=203.0.113.77
+                        out.write(byteArrayOf(0xC0.toByte(), 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x04))
+                        out.write(byteArrayOf(203.toByte(), 0, 113, 77))
+                    } else {
+                        // NODATA for AAAA: ANCOUNT=0
+                        val bytes = out.toByteArray()
+                        bytes[7] = 0
+                        val resp = java.net.DatagramPacket(bytes, bytes.size, pkt.socketAddress)
+                        mockDns.send(resp)
+                        continue
+                    }
+                    val bytes = out.toByteArray()
+                    mockDns.send(java.net.DatagramPacket(bytes, bytes.size, pkt.socketAddress))
+                }
+            }, "mock-rfc1035-dns").apply {
+                isDaemon = true
+                start()
+            }
+
+            val resolved = android.net.DnsResolver.resolveDirect(
+                rawDomain = "reload-test.owenclave.example",
+                nsType = android.net.DnsResolver.TYPE_A,
+                timeoutMs = 500,
+                customServers = listOf(serverAddr),
+            )
+            assertEquals(listOf("203.0.113.77"), resolved.map { it.hostAddress })
+        }
+
+        // 3. Blackhole UDP server returns within bounded timeout instead of hanging 30s.
+        java.net.DatagramSocket(0, java.net.InetAddress.getByName("127.0.0.1")).use { blackhole ->
+            val blackholeAddr = java.net.InetSocketAddress("127.0.0.1", blackhole.localPort)
+            val t0 = System.currentTimeMillis()
+            val empty = android.net.DnsResolver.resolveDirect(
+                rawDomain = "unreachable-node.owenclave.example",
+                nsType = android.net.DnsResolver.TYPE_A,
+                timeoutMs = 250,
+                customServers = listOf(blackholeAddr),
+            )
+            val elapsed = System.currentTimeMillis() - t0
+            assertTrue(empty.isEmpty())
+            assertTrue(elapsed < 2_500L, "Expected bounded timeout < 2.5s, took ${elapsed}ms")
+        }
+
+        // 4. Passive /proc/net/tcp(6) detection never opens a client socket on the listener.
+        if (java.io.File("/proc/net/tcp").canRead() || java.io.File("/proc/net/tcp6").canRead()) {
+            java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use { srv ->
+                assertTrue(
+                    io.nekohasekai.sagernet.bg.ProxyService.isLoopbackTcpListeningLinux(srv.localPort),
+                )
+            }
         }
     }
 }

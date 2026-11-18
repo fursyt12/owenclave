@@ -187,7 +187,11 @@ internal class FakeHost : CommandRunner {
             "-setsecurewebproxystate" -> setState("secureweb", command)
             "-setsocksfirewallproxystate" -> setState("socks", command)
             "-setproxybypassdomains" -> {
-                mac["bypass"] = command.drop(3).joinToString(" ")
+                if (command.size < 4) {
+                    return CommandResult(4, "", "** Error: The amount of parameters was not correct.")
+                }
+                val args = command.drop(3)
+                mac["bypass"] = if (args.size == 1 && args[0].equals("Empty", ignoreCase = true)) "" else args.joinToString(" ")
                 ok()
             }
             else -> CommandResult(1, "", "unsupported: ${command[1]}")

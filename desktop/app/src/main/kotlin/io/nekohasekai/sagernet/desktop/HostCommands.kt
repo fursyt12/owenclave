@@ -36,10 +36,17 @@ object ProcessCommandRunner : CommandRunner {
     private const val TIMEOUT_SECONDS = 20L
 
     override fun run(command: List<String>): CommandResult = try {
-        val process = ProcessBuilder(command)
+        val pb = ProcessBuilder(command)
             // stderr is merged into stdout so reading one stream cannot deadlock.
             .redirectErrorStream(true)
-            .start()
+        if (!DesktopRuntime.isWindows) {
+            val currentPath = pb.environment()["PATH"].orEmpty()
+            val extra = listOf("/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin")
+            pb.environment()["PATH"] = (currentPath.split(':').filter { it.isNotBlank() } + extra)
+                .distinct()
+                .joinToString(":")
+        }
+        val process = pb.start()
         val output = process.inputStream.bufferedReader().use { it.readText() }
         if (!process.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
             process.destroyForcibly()
