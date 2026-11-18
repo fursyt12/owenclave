@@ -198,13 +198,13 @@ class TunSession(private val log: (String) -> Unit) {
 
         val setupPs = buildString {
             append("\$ErrorActionPreference = 'Stop'; ")
-            append("\$idx = [int](Get-NetAdapter -Name '$name').ifIndex; ")
-            append("Remove-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv4 -Confirm:\$false -ErrorAction SilentlyContinue; ")
+            append("\$idx = [int](Get-NetAdapter -Name '$name' -IncludeHidden).ifIndex; ")
+            append("Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv4 -Dhcp Disabled -DadTransmits 0 -InterfaceMetric 1 -NlMtuBytes $mtu -ErrorAction SilentlyContinue | Out-Null; ")
+            append("Get-NetIPAddress -InterfaceIndex \$idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:\$false -ErrorAction SilentlyContinue; ")
             append("New-NetIPAddress -InterfaceIndex \$idx -IPAddress '198.18.0.1' -PrefixLength 15 -PolicyStore ActiveStore | Out-Null; ")
-            append("Set-NetIPInterface -InterfaceIndex \$idx -AddressFamily IPv4 -InterfaceMetric 1 -NlMtuBytes $mtu -ErrorAction SilentlyContinue | Out-Null; ")
             append("Set-DnsClientServerAddress -InterfaceIndex \$idx -ServerAddresses @('1.1.1.1','8.8.8.8') -ErrorAction SilentlyContinue | Out-Null; ")
             append("foreach (\$p in @('0.0.0.0/1','128.0.0.0/1')) { ")
-            append("Remove-NetRoute -InterfaceIndex \$idx -DestinationPrefix \$p -Confirm:\$false -ErrorAction SilentlyContinue; ")
+            append("Get-NetRoute -InterfaceIndex \$idx -DestinationPrefix \$p -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue; ")
             append("New-NetRoute -InterfaceIndex \$idx -DestinationPrefix \$p -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null ")
             append("}; ")
             append("Clear-DnsClientCache -ErrorAction SilentlyContinue")
@@ -250,13 +250,19 @@ class TunSession(private val log: (String) -> Unit) {
 
     private fun startPump(binary: File, dev: String, primaryInterface: String, socksPort: Int) {
         val deviceArg = if (DesktopRuntime.isWindows) WINDOWS_DEVICE else dev
-        val command = listOf(
-            binary.absolutePath,
-            "--device", deviceArg,
-            "--proxy", "socks5://127.0.0.1:$socksPort",
-            "--interface", primaryInterface,
-            "--loglevel", "info",
-        )
+        val command = buildList {
+            add(binary.absolutePath)
+            add("--device")
+            add(deviceArg)
+            add("--proxy")
+            add("socks5://127.0.0.1:$socksPort")
+            if (!DesktopRuntime.isWindows) {
+                add("--interface")
+                add(primaryInterface)
+            }
+            add("--loglevel")
+            add("info")
+        }
         log("starting ${binary.name}: ${command.joinToString(" ")}")
         val process = ProcessBuilder(command)
             .directory(binary.parentFile)
@@ -282,7 +288,7 @@ class TunSession(private val log: (String) -> Unit) {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "(Get-NetAdapter -Name '$name' -ErrorAction SilentlyContinue).Name",
+                    "(Get-NetAdapter -Name '$name' -IncludeHidden -ErrorAction SilentlyContinue).Name",
                 ).isNotEmpty()
                 else -> runQuiet("ifconfig", name).isNotEmpty()
             }

@@ -941,8 +941,8 @@ class DesktopPrivilegedTun(
               }
 
               ${'$'}workDir = [System.IO.Path]::GetDirectoryName(${'$'}tun2socks)
-              ${'$'}t2sArgs = @('--device', ${'$'}tunName, '--proxy', ${'$'}proxyUrl, '--interface', ${'$'}physIf, '--mtu', "${'$'}mtu", '--loglevel', 'warn')
-              ${'$'}t2s = Start-Process -FilePath ${'$'}tun2socks -ArgumentList ${'$'}t2sArgs -WorkingDirectory ${'$'}workDir -RedirectStandardError ${'$'}t2sLog -WindowStyle Hidden -PassThru
+              ${'$'}t2sArgLine = "--device `"${'$'}tunName`" --proxy `"${'$'}proxyUrl`" --mtu ${'$'}mtu --loglevel warn"
+              ${'$'}t2s = Start-Process -FilePath ${'$'}tun2socks -ArgumentList ${'$'}t2sArgLine -WorkingDirectory ${'$'}workDir -RedirectStandardError ${'$'}t2sLog -WindowStyle Hidden -PassThru
 
               ${'$'}tunAdapter = ${'$'}null
               for (${'$'}i = 0; ${'$'}i -lt 75; ${'$'}i++) {
@@ -950,7 +950,7 @@ class DesktopPrivilegedTun(
                   ${'$'}detail = if (Test-Path -LiteralPath ${'$'}t2sLog) { (Get-Content -LiteralPath ${'$'}t2sLog -ErrorAction SilentlyContinue) -join '; ' } else { '' }
                   throw "tun2socks.exe exited prematurely (code ${'$'}(${'$'}t2s.ExitCode)): ${'$'}detail"
                 }
-                ${'$'}cand = Get-NetAdapter -Name ${'$'}tunName -ErrorAction SilentlyContinue
+                ${'$'}cand = Get-NetAdapter -Name ${'$'}tunName -IncludeHidden -ErrorAction SilentlyContinue
                 if (${'$'}cand -and ${'$'}cand.ifIndex -gt 0 -and (Get-NetIPInterface -InterfaceIndex ${'$'}cand.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
                   ${'$'}tunAdapter = ${'$'}cand
                   break
@@ -962,21 +962,27 @@ class DesktopPrivilegedTun(
               }
               ${'$'}tunIdx = [int]${'$'}tunAdapter.ifIndex
 
-              Remove-NetIPAddress -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -Confirm:${'$'}false -ErrorAction SilentlyContinue
+              Set-NetIPInterface -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -Dhcp Disabled -DadTransmits 0 -InterfaceMetric 1 -NlMtuBytes ${'$'}mtu -ErrorAction SilentlyContinue | Out-Null
+              Get-NetIPAddress -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:${'$'}false -ErrorAction SilentlyContinue
               New-NetIPAddress -InterfaceIndex ${'$'}tunIdx -IPAddress '172.19.0.1' -PrefixLength 30 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-              Set-NetIPInterface -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -InterfaceMetric 1 -NlMtuBytes ${'$'}mtu -ErrorAction SilentlyContinue | Out-Null
+              for (${'$'}d = 0; ${'$'}d -lt 30; ${'$'}d++) {
+                ${'$'}ipObj = Get-NetIPAddress -InterfaceIndex ${'$'}tunIdx -IPAddress '172.19.0.1' -ErrorAction SilentlyContinue
+                if (${'$'}ipObj -and ${'$'}ipObj.DadState -eq 'Preferred') { break }
+                Start-Sleep -Milliseconds 100
+              }
               Set-DnsClientServerAddress -InterfaceIndex ${'$'}tunIdx -ServerAddresses @('1.1.1.1', '8.8.8.8') -ErrorAction SilentlyContinue | Out-Null
 
               foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1', '198.18.0.0/15')) {
-                Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                Get-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:${'$'}false -ErrorAction SilentlyContinue
                 New-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
               }
 
               if (${'$'}enableIpv6 -eq 1) {
                 try {
+                  Set-NetIPInterface -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DadTransmits 0 -ErrorAction SilentlyContinue | Out-Null
                   New-NetIPAddress -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -IPAddress 'fdfe:dcba:9876::1' -PrefixLength 126 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
                   foreach (${'$'}p6 in @('::/1', '8000::/1')) {
-                    Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                    Get-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:${'$'}false -ErrorAction SilentlyContinue
                     New-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -NextHop '::' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
                   }
                   ${'$'}ipv6Added = ${'$'}true
@@ -997,19 +1003,19 @@ class DesktopPrivilegedTun(
               ${'$'}ErrorActionPreference = 'Continue'
               if (${'$'}tunIdx -gt 0) {
                 foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1', '198.18.0.0/15')) {
-                  Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                  Get-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:${'$'}false -ErrorAction SilentlyContinue
                 }
                 if (${'$'}ipv6Added) {
                   foreach (${'$'}p6 in @('::/1', '8000::/1')) {
-                    Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                    Get-NetRoute -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv6 -DestinationPrefix ${'$'}p6 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:${'$'}false -ErrorAction SilentlyContinue
                   }
                 }
               }
               foreach (${'$'}lp in ${'$'}addedLan) {
-                Remove-NetRoute -DestinationPrefix ${'$'}lp -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                Get-NetRoute -DestinationPrefix ${'$'}lp -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:${'$'}false -ErrorAction SilentlyContinue
               }
               foreach (${'$'}cidr in ${'$'}addedBypass) {
-                Remove-NetRoute -DestinationPrefix ${'$'}cidr -Confirm:${'$'}false -ErrorAction SilentlyContinue
+                Get-NetRoute -DestinationPrefix ${'$'}cidr -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:${'$'}false -ErrorAction SilentlyContinue
               }
               if (${'$'}t2s -and -not ${'$'}t2s.HasExited) {
                 Stop-Process -Id ${'$'}t2s.Id -Force -ErrorAction SilentlyContinue
@@ -1066,9 +1072,10 @@ class DesktopPrivilegedTun(
                 start()
             }
         } else {
-            val elevateCmd = "try { Start-Process -FilePath 'powershell.exe' " +
-                "-ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','${psScript.absolutePath.replace("'", "''")}') " +
-                "-Verb RunAs -WindowStyle Hidden; exit 0 } catch { Write-Error ${'$'}_.Exception.Message; exit 126 }"
+            val qPsPath = psScript.absolutePath.replace("'", "''")
+            val elevateCmd = "try { ${'$'}q = [char]34; ${'$'}al = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + ${'$'}q + '$qPsPath' + ${'$'}q; " +
+                "Start-Process -FilePath 'powershell.exe' -ArgumentList ${'$'}al -Verb RunAs -WindowStyle Hidden; exit 0 } " +
+                "catch { Write-Error ${'$'}_.Exception.Message; exit 126 }"
 
             val uacProc = launcher.start(
                 listOf("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", elevateCmd),

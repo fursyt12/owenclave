@@ -636,6 +636,8 @@ class DesktopPrivilegedTunTest {
             assertFalse(psText.contains("netsh "), "Windows helper must not rely on localized netsh commands")
             assertFalse(psText.contains("route.exe"), "Windows helper must not redirect native route.exe stderr under Stop preference")
             assertFalse(psText.contains("wintun://"), "tun2socks device driver must not use unsupported wintun:// scheme")
+            assertFalse(psText.contains("--interface"), "Windows loopback tun2socks must not pass --interface (avoids Start-Process space splitting and loopback IP_UNICAST_IF)")
+            assertTrue(psText.contains("DadTransmits 0"))
             assertTrue(psText.contains("New-NetIPAddress"))
             assertTrue(psText.contains("Set-DnsClientServerAddress"))
             assertTrue(psText.contains("New-NetRoute"))
