@@ -871,12 +871,13 @@ class DesktopPrivilegedTun(
             ${'$'}enableIpv6 = $ipv6Val
             ${'$'}ownerPid = ${params.owenclavePid}
             ${'$'}t2s = ${'$'}null
+            ${'$'}t2sLog = "${'$'}statusFile.t2s.log"
             ${'$'}tunIdx = 0
             ${'$'}physIdx = 0
             ${'$'}gw = ''
             ${'$'}gw6 = ''
-            ${'$'}lanAdded = ${'$'}false
             ${'$'}ipv6Added = ${'$'}false
+            ${'$'}addedLan = New-Object 'System.Collections.Generic.List[string]'
             ${'$'}addedBypass = New-Object 'System.Collections.Generic.HashSet[string]'
             ${'$'}utf8NoBom = New-Object System.Text.UTF8Encoding(${'$'}false)
 
@@ -893,15 +894,19 @@ class DesktopPrivilegedTun(
                 if (-not ${'$'}ip -or ${'$'}addedBypass.Contains(${'$'}ip)) { continue }
                 if (${'$'}ip.Contains(':')) {
                   if (${'$'}gw6 -and ${'$'}physIdx -gt 0) {
-                    Remove-NetRoute -DestinationPrefix "${'$'}ip/128" -Confirm:${'$'}false -ErrorAction SilentlyContinue
-                    New-NetRoute -DestinationPrefix "${'$'}ip/128" -InterfaceIndex ${'$'}physIdx -NextHop ${'$'}gw6 -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
-                    [void]${'$'}addedBypass.Add(${'$'}ip)
+                    ${'$'}cidr6 = "${'$'}ip/128"
+                    if (-not (Get-NetRoute -DestinationPrefix ${'$'}cidr6 -ErrorAction SilentlyContinue)) {
+                      New-NetRoute -DestinationPrefix ${'$'}cidr6 -InterfaceIndex ${'$'}physIdx -NextHop ${'$'}gw6 -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+                      [void]${'$'}addedBypass.Add(${'$'}cidr6)
+                    }
                   }
                 } elseif (${'$'}ip.Contains('.')) {
                   if (${'$'}gw -and ${'$'}gw -ne '0.0.0.0' -and ${'$'}physIdx -gt 0) {
-                    & route.exe delete ${'$'}ip 2>${'$'}null | Out-Null
-                    & route.exe add ${'$'}ip mask 255.255.255.255 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
-                    [void]${'$'}addedBypass.Add(${'$'}ip)
+                    ${'$'}cidr4 = "${'$'}ip/32"
+                    if (-not (Get-NetRoute -DestinationPrefix ${'$'}cidr4 -ErrorAction SilentlyContinue)) {
+                      New-NetRoute -DestinationPrefix ${'$'}cidr4 -InterfaceIndex ${'$'}physIdx -NextHop ${'$'}gw -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+                      [void]${'$'}addedBypass.Add(${'$'}cidr4)
+                    }
                   }
                 }
               }
@@ -927,23 +932,29 @@ class DesktopPrivilegedTun(
 
               Sync-BypassIps
               if (${'$'}bypassLan -eq 1 -and ${'$'}gw -and ${'$'}gw -ne '0.0.0.0' -and ${'$'}physIdx -gt 0) {
-                & route.exe add 10.0.0.0 mask 255.0.0.0 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
-                & route.exe add 172.16.0.0 mask 255.240.0.0 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
-                & route.exe add 192.168.0.0 mask 255.255.0.0 ${'$'}gw if ${'$'}physIdx metric 1 2>${'$'}null | Out-Null
-                ${'$'}lanAdded = ${'$'}true
+                foreach (${'$'}lp in @('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')) {
+                  if (-not (Get-NetRoute -DestinationPrefix ${'$'}lp -ErrorAction SilentlyContinue)) {
+                    New-NetRoute -DestinationPrefix ${'$'}lp -InterfaceIndex ${'$'}physIdx -NextHop ${'$'}gw -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null
+                    [void]${'$'}addedLan.Add(${'$'}lp)
+                  }
+                }
               }
 
               ${'$'}workDir = [System.IO.Path]::GetDirectoryName(${'$'}tun2socks)
               ${'$'}t2sArgs = @('--device', ${'$'}tunName, '--proxy', ${'$'}proxyUrl, '--interface', ${'$'}physIf, '--mtu', "${'$'}mtu", '--loglevel', 'warn')
-              ${'$'}t2s = Start-Process -FilePath ${'$'}tun2socks -ArgumentList ${'$'}t2sArgs -WorkingDirectory ${'$'}workDir -WindowStyle Hidden -PassThru
+              ${'$'}t2s = Start-Process -FilePath ${'$'}tun2socks -ArgumentList ${'$'}t2sArgs -WorkingDirectory ${'$'}workDir -RedirectStandardError ${'$'}t2sLog -WindowStyle Hidden -PassThru
 
               ${'$'}tunAdapter = ${'$'}null
               for (${'$'}i = 0; ${'$'}i -lt 75; ${'$'}i++) {
                 if (${'$'}t2s.HasExited) {
-                  throw "tun2socks.exe exited prematurely (code ${'$'}(${'$'}t2s.ExitCode))"
+                  ${'$'}detail = if (Test-Path -LiteralPath ${'$'}t2sLog) { (Get-Content -LiteralPath ${'$'}t2sLog -ErrorAction SilentlyContinue) -join '; ' } else { '' }
+                  throw "tun2socks.exe exited prematurely (code ${'$'}(${'$'}t2s.ExitCode)): ${'$'}detail"
                 }
-                ${'$'}tunAdapter = Get-NetAdapter -Name ${'$'}tunName -ErrorAction SilentlyContinue
-                if (${'$'}tunAdapter -and ${'$'}tunAdapter.ifIndex -gt 0) { break }
+                ${'$'}cand = Get-NetAdapter -Name ${'$'}tunName -ErrorAction SilentlyContinue
+                if (${'$'}cand -and ${'$'}cand.ifIndex -gt 0 -and (Get-NetIPInterface -InterfaceIndex ${'$'}cand.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+                  ${'$'}tunAdapter = ${'$'}cand
+                  break
+                }
                 Start-Sleep -Milliseconds 200
               }
               if (-not ${'$'}tunAdapter) {
@@ -952,11 +963,11 @@ class DesktopPrivilegedTun(
               ${'$'}tunIdx = [int]${'$'}tunAdapter.ifIndex
 
               Remove-NetIPAddress -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -Confirm:${'$'}false -ErrorAction SilentlyContinue
-              New-NetIPAddress -InterfaceIndex ${'$'}tunIdx -IPAddress '198.18.0.1' -PrefixLength 15 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+              New-NetIPAddress -InterfaceIndex ${'$'}tunIdx -IPAddress '172.19.0.1' -PrefixLength 30 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
               Set-NetIPInterface -InterfaceIndex ${'$'}tunIdx -AddressFamily IPv4 -InterfaceMetric 1 -NlMtuBytes ${'$'}mtu -ErrorAction SilentlyContinue | Out-Null
               Set-DnsClientServerAddress -InterfaceIndex ${'$'}tunIdx -ServerAddresses @('1.1.1.1', '8.8.8.8') -ErrorAction SilentlyContinue | Out-Null
 
-              foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1')) {
+              foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1', '198.18.0.0/15')) {
                 Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -Confirm:${'$'}false -ErrorAction SilentlyContinue
                 New-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
               }
@@ -983,8 +994,9 @@ class DesktopPrivilegedTun(
               Write-Status ("ERROR:" + ${'$'}_.Exception.Message)
               exit 1
             } finally {
+              ${'$'}ErrorActionPreference = 'Continue'
               if (${'$'}tunIdx -gt 0) {
-                foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1')) {
+                foreach (${'$'}p in @('0.0.0.0/1', '128.0.0.0/1', '198.18.0.0/15')) {
                   Remove-NetRoute -InterfaceIndex ${'$'}tunIdx -DestinationPrefix ${'$'}p -Confirm:${'$'}false -ErrorAction SilentlyContinue
                 }
                 if (${'$'}ipv6Added) {
@@ -993,24 +1005,18 @@ class DesktopPrivilegedTun(
                   }
                 }
               }
-              if (${'$'}lanAdded) {
-                & route.exe delete 10.0.0.0 mask 255.0.0.0 2>${'$'}null | Out-Null
-                & route.exe delete 172.16.0.0 mask 255.240.0.0 2>${'$'}null | Out-Null
-                & route.exe delete 192.168.0.0 mask 255.255.0.0 2>${'$'}null | Out-Null
+              foreach (${'$'}lp in ${'$'}addedLan) {
+                Remove-NetRoute -DestinationPrefix ${'$'}lp -Confirm:${'$'}false -ErrorAction SilentlyContinue
               }
-              foreach (${'$'}ip in ${'$'}addedBypass) {
-                if (${'$'}ip.Contains(':')) {
-                  Remove-NetRoute -DestinationPrefix "${'$'}ip/128" -Confirm:${'$'}false -ErrorAction SilentlyContinue
-                } else {
-                  & route.exe delete ${'$'}ip 2>${'$'}null | Out-Null
-                }
+              foreach (${'$'}cidr in ${'$'}addedBypass) {
+                Remove-NetRoute -DestinationPrefix ${'$'}cidr -Confirm:${'$'}false -ErrorAction SilentlyContinue
               }
               if (${'$'}t2s -and -not ${'$'}t2s.HasExited) {
                 Stop-Process -Id ${'$'}t2s.Id -Force -ErrorAction SilentlyContinue
                 try { ${'$'}t2s.WaitForExit(3000) | Out-Null } catch {}
               }
               Clear-DnsClientCache -ErrorAction SilentlyContinue
-              Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath ${'$'}keepalive, ${'$'}bypassFile, "${'$'}statusFile.tmp", ${'$'}statusFile
+              Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath ${'$'}keepalive, ${'$'}bypassFile, ${'$'}t2sLog, "${'$'}statusFile.tmp", ${'$'}statusFile
             }
         """.trimIndent() + "\r\n"
     }

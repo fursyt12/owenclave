@@ -634,6 +634,7 @@ class DesktopPrivilegedTunTest {
             assertTrue(psFile.isFile)
             val psText = psFile.readText()
             assertFalse(psText.contains("netsh "), "Windows helper must not rely on localized netsh commands")
+            assertFalse(psText.contains("route.exe"), "Windows helper must not redirect native route.exe stderr under Stop preference")
             assertFalse(psText.contains("wintun://"), "tun2socks device driver must not use unsupported wintun:// scheme")
             assertTrue(psText.contains("New-NetIPAddress"))
             assertTrue(psText.contains("Set-DnsClientServerAddress"))
