@@ -72,6 +72,11 @@ fun parseSOCKS(link: String): SOCKSBean {
         if (url.scheme.equals("socks+tls", ignoreCase = true)) {
             security = "tls"
             url.queryParameter("sni")?.let { sni = it }
+            url.queryParameter("allowInsecure")?.let {
+                if (it == "1" || it.equals("true", ignoreCase = true)) {
+                    allowInsecure = true
+                }
+            }
         }
     }
 }
@@ -107,8 +112,13 @@ fun SOCKSBean.toUri(): String? {
     if (password.isNotEmpty()) {
         builder.password = password
     }
-    if (security == "tls" && sni.isNotEmpty()) {
-        builder.addQueryParameter("sni", sni)
+    if (security == "tls") {
+        if (sni.isNotEmpty()) {
+            builder.addQueryParameter("sni", sni)
+        }
+        if (allowInsecure == true) {
+            builder.addQueryParameter("allowInsecure", "1")
+        }
     }
     return builder.string
 }

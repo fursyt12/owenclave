@@ -118,6 +118,7 @@ jobs:
           PRIMARY_SUCCEEDED: ${{ needs.build-macos-arm64.outputs.succeeded }}
           FALLBACK_STARTED: ${{ needs.build-macos-arm64-fallback.outputs.started }}
           FALLBACK_SUCCEEDED: ${{ needs.build-macos-arm64-fallback.outputs.succeeded }}
+          IS_RELEASE_RUN: ${{ (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/desktop-v') || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/0.'))) || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'y') }}
         run: |
           set -euo pipefail
           if [ "$PRIMARY_STARTED" = "true" ] && [ "$PRIMARY_SUCCEEDED" != "true" ]; then
@@ -130,6 +131,9 @@ jobs:
           fi
           if [ "$PRIMARY_SUCCEEDED" = "true" ] || [ "$FALLBACK_SUCCEEDED" = "true" ]; then
             echo "::notice::macOS arm64 verified and packaged cleanly"
+          elif [ "$IS_RELEASE_RUN" = "true" ]; then
+            echo "::error::Refusing to publish an incomplete release without macOS arm64 artifacts (both Apple Silicon pools timed out)"
+            exit 1
           else
             echo "::warning::Both GitHub-hosted Apple Silicon pools timed out waiting for VM capacity"
           fi

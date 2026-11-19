@@ -6,6 +6,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import io.nekohasekai.sagernet.BuildConfig
 import io.nekohasekai.sagernet.Key
+import io.nekohasekai.sagernet.LogLevel
 import io.nekohasekai.sagernet.desktop.BalancerSpec
 import io.nekohasekai.sagernet.desktop.CoreRunner
 import io.nekohasekai.sagernet.desktop.DesktopConfigBuilder
@@ -38,15 +39,26 @@ import io.nekohasekai.sagernet.fmt.v2ray.StandardV2RayBean
 import io.nekohasekai.sagernet.fmt.v2ray.toUri
 import io.nekohasekai.sagernet.fmt.wireguard.WireGuardBean
 import io.nekohasekai.sagernet.fmt.wireguard.toConf
+import java.io.BufferedInputStream
 import java.io.File
-import java.net.HttpURLConnection
+import java.io.IOException
+import java.io.InputStream
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Proxy
+import java.net.Socket
 import java.net.URI
+import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLParameters
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
 /**
  * Runtime engine for the Dockerized / headless Mihomo-compatible Owenclave server.
@@ -83,6 +95,7 @@ class DaemonEngine(val config: DaemonConfig) {
     private val logBuffer = ArrayDeque<LogRecord>(MAX_LOGS)
     private val delayHistory = LinkedHashMap<String, MutableList<DelayRecord>>()
     private val nodeHealth = LinkedHashMap<String, Boolean>()
+    private val lastNodeProbeAtMillis = LinkedHashMap<String, Long>()
 
     private val configProfiles = ArrayList<Profile>()
     private val manualProfiles = ArrayList<Profile>()
@@ -97,6 +110,8 @@ class DaemonEngine(val config: DaemonConfig) {
 
     private var selectedProfileId: String? = null
     private var internalSocksPort: Int = 0
+    private var probeSocksPort: Int = 0
+    private val probeSecret: String = UUID.randomUUID().toString().replace("-", "")
     private var tproxyDisabledFallback: Boolean = false
     private var lastAppliedCoreSignature: String? = null
 
@@ -109,6 +124,7 @@ class DaemonEngine(val config: DaemonConfig) {
         recordLog(classifyLogLevel(line), line)
     }
     private var scheduler: ScheduledExecutorService? = null
+    private var healthSupervisor: ScheduledExecutorService? = null
 
     fun start() {
         synchronized(lock) {
@@ -163,9 +179,26 @@ class DaemonEngine(val config: DaemonConfig) {
             )
             scheduler = exec
         }
+
+        val healthExec = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "owenclave-health-supervisor").apply { isDaemon = true }
+        }
+        val tickSeconds = synchronized(lock) {
+            val cap = config.healthCheckInterval
+            if (cap in 1..4) cap.toLong() else 5L
+        }
+        healthExec.scheduleWithFixedDelay(
+            { runCatching { runHealthSupervisorTick() } },
+            tickSeconds,
+            tickSeconds,
+            TimeUnit.SECONDS,
+        )
+        healthSupervisor = healthExec
     }
 
     fun stop() {
+        healthSupervisor?.shutdownNow()
+        healthSupervisor = null
         scheduler?.shutdownNow()
         scheduler = null
         synchronized(lock) {
@@ -258,6 +291,20 @@ class DaemonEngine(val config: DaemonConfig) {
     /** `true` if observatory probed the node alive, `false` if dead, `null` if not yet probed. */
     fun nodeHealthOf(profileId: String): Boolean? = synchronized(lock) {
         nodeHealth[profileId]
+    }
+
+    /** `true` when `fallback-to-direct` is currently carrying traffic over direct bypass because all candidate nodes are dead. */
+    fun isInDirectFallback(): Boolean = synchronized(lock) {
+        if (config.mode == "direct") return@synchronized false
+        val active = activeProfileLocked() ?: return@synchronized false
+        val primaryBalancer = resolvePrimaryBalancerLocked(active)
+        if (primaryBalancer != null) {
+            primaryBalancer.fallbackToDirect &&
+                primaryBalancer.profileIds.isNotEmpty() &&
+                primaryBalancer.profileIds.all { nodeHealth[it] == false }
+        } else {
+            config.fallbackToDirect && nodeHealth[active.id] == false
+        }
     }
 
     // --------------------------------------------------------------- mutations
@@ -694,43 +741,438 @@ class DaemonEngine(val config: DaemonConfig) {
     }
 
     /**
-     * Measures HTTP latency (ms) through the running core's local SOCKS inbound.
+     * Measures HTTP/HTTPS latency (ms) through the exact outbound or balancer named by [targetName]
+     * via the dedicated authenticated `probe-socks-in` listener, using 2-step UnifiedDelay when
+     * keep-alive is available so multi-RTT handshake overhead does not inflate steady-state ping.
      */
     fun measureDelay(
         targetName: String,
         url: String = DEFAULT_DELAY_URL,
         timeoutMs: Int = 5_000,
     ): Int {
-        val socks = synchronized(lock) { internalSocksPort }
-        if (!runner.running || socks <= 0) {
+        val (probePort, secret, probeTarget) = synchronized(lock) {
+            Triple(probeSocksPort, probeSecret, resolveProbeTargetLocked(targetName))
+        }
+        if (!runner.running || probePort <= 0) {
             throw IllegalStateException("core is not running")
         }
+        val uri = try {
+            URI.create(url.trim())
+        } catch (e: Exception) {
+            throw IllegalArgumentException("invalid delay URL: $url", e)
+        }
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") {
+            throw IllegalArgumentException("delay URL must use http or https")
+        }
+        val host = uri.host?.trim()?.removeSurrounding("[", "]")?.takeIf { it.isNotEmpty() }
+            ?: throw IllegalArgumentException("delay URL is missing host")
+        val port = if (uri.port > 0) uri.port else if (scheme == "https") 443 else 80
+        val pathAndQuery = buildString {
+            append(uri.rawPath?.takeIf { it.isNotEmpty() } ?: "/")
+            if (!uri.rawQuery.isNullOrEmpty()) append('?').append(uri.rawQuery)
+        }
+        val hostHeader = if ((scheme == "http" && port == 80) || (scheme == "https" && port == 443)) {
+            if (':' in host) "[$host]" else host
+        } else {
+            if (':' in host) "[$host]:$port" else "$host:$port"
+        }
+
         val boundTimeout = timeoutMs.coerceIn(500, 30_000)
-        val startNs = System.nanoTime()
-        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socks))
-        val conn = (URI.create(url).toURL().openConnection(proxy) as HttpURLConnection).apply {
-            connectTimeout = boundTimeout
-            readTimeout = boundTimeout
-            instanceFollowRedirects = false
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", "Owenclave/${BuildConfig.VERSION_NAME}")
+        val matchedProfile = probeTarget.second
+        val socksUser = probeTarget.first
+
+        val elapsedMs = try {
+            probeViaSocks5(
+                socksPort = probePort,
+                socksUser = socksUser,
+                socksPass = secret,
+                tls = scheme == "https",
+                host = host,
+                port = port,
+                hostHeader = hostHeader,
+                pathAndQuery = pathAndQuery,
+                timeoutMs = boundTimeout,
+            )
+        } catch (err: Exception) {
+            if (matchedProfile != null && runner.running) {
+                synchronized(lock) {
+                    nodeHealth[matchedProfile.id] = false
+                    lastNodeProbeAtMillis[matchedProfile.id] = System.currentTimeMillis()
+                }
+            }
+            throw err
         }
-        val code = try {
-            conn.responseCode
-        } finally {
-            conn.disconnect()
-        }
-        if (code !in 200..399) {
-            throw IllegalStateException("HTTP $code from $url")
-        }
-        val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+
         val stamp = Instant.now().toString()
+        val nowMs = System.currentTimeMillis()
         synchronized(lock) {
-            val list = delayHistory.getOrPut(targetName) { ArrayList() }
-            list += DelayRecord(time = stamp, delay = elapsedMs)
-            while (list.size > 20) list.removeAt(0)
+            recordDelayLocked(targetName, stamp, elapsedMs)
+            if (matchedProfile != null) {
+                nodeHealth[matchedProfile.id] = true
+                lastNodeProbeAtMillis[matchedProfile.id] = nowMs
+                if (matchedProfile.displayName != targetName) {
+                    recordDelayLocked(matchedProfile.displayName, stamp, elapsedMs)
+                }
+            }
         }
         return elapsedMs
+    }
+
+    private fun recordDelayLocked(key: String, stamp: String, delayMs: Int) {
+        val list = delayHistory.getOrPut(key) { ArrayList() }
+        list += DelayRecord(time = stamp, delay = delayMs)
+        while (list.size > 20) list.removeAt(0)
+    }
+
+    private fun resolveProbeTargetLocked(rawTarget: String): Pair<String, Profile?> {
+        val trimmed = rawTarget.trim()
+        require(trimmed.isNotEmpty()) { "proxy name is required" }
+
+        val merged = mergedMihomoContextLocked()
+        if (trimmed.equals("REJECT", ignoreCase = true) ||
+            trimmed.equals("REJECT-DROP", ignoreCase = true) ||
+            trimmed in merged.virtualReject
+        ) {
+            throw IllegalArgumentException("proxy '$trimmed' rejects traffic")
+        }
+        if (trimmed.equals("DIRECT", ignoreCase = true) || trimmed in merged.virtualDirect || config.mode == "direct") {
+            return "direct" to null
+        }
+
+        val allProfiles = allProfilesLocked()
+        allProfiles.firstOrNull { it.displayName == trimmed || it.id == trimmed }?.let { p ->
+            return "p:${p.id}" to p
+        }
+
+        val profilesByName = allProfiles.associateBy { it.displayName }
+        if (trimmed.equals("GLOBAL", ignoreCase = true) || trimmed.equals("PROXY", ignoreCase = true)) {
+            val active = activeProfileLocked()
+            if (active != null) {
+                val primaryBal = resolvePrimaryBalancerLocked(active)
+                if (primaryBal != null) return "b:${primaryBal.id}" to null
+            }
+            val groupView = buildGroupViewsLocked().firstOrNull { it.name.equals(trimmed, ignoreCase = true) }
+            val chosen = groupView?.now.orEmpty()
+            if (chosen.equals("DIRECT", ignoreCase = true)) return "direct" to null
+            profilesByName[chosen]?.let { return "p:${it.id}" to it }
+            active?.let { return "p:${it.id}" to it }
+            return "direct" to null
+        }
+
+        if (trimmed in merged.groupsByName) {
+            val balSpec = MihomoYamlSupport.resolveBalancerSpec(
+                targetName = trimmed,
+                profilesByName = profilesByName,
+                groupsByName = merged.groupsByName,
+                groupSelections = groupSelections,
+                virtualDirect = merged.virtualDirect,
+                virtualReject = merged.virtualReject,
+                defaultFallbackToDirect = config.fallbackToDirect,
+                healthCheckIntervalCap = config.healthCheckInterval,
+            )
+            if (balSpec != null) {
+                return "b:${balSpec.id}" to null
+            }
+            val selected = MihomoYamlSupport.resolveSelectedProfile(
+                targetName = trimmed,
+                profilesByName = profilesByName,
+                groupsByName = merged.groupsByName,
+                groupSelections = groupSelections,
+            )
+            if (selected != null) return "p:${selected.id}" to selected
+            val groupView = buildGroupViewsLocked().firstOrNull { it.name == trimmed }
+            if (groupView?.now.equals("DIRECT", ignoreCase = true)) return "direct" to null
+        }
+
+        throw IllegalArgumentException("proxy '$trimmed' not found")
+    }
+
+    private fun probeViaSocks5(
+        socksPort: Int,
+        socksUser: String,
+        socksPass: String,
+        tls: Boolean,
+        host: String,
+        port: Int,
+        hostHeader: String,
+        pathAndQuery: String,
+        timeoutMs: Int,
+    ): Int {
+        val rawSocket = Socket()
+        try {
+            rawSocket.tcpNoDelay = true
+            rawSocket.soTimeout = timeoutMs
+            val overallStartNs = System.nanoTime()
+            rawSocket.connect(InetSocketAddress("127.0.0.1", socksPort), timeoutMs)
+
+            val rawIn = rawSocket.getInputStream()
+            val rawOut = rawSocket.getOutputStream()
+
+            // 1. SOCKS5 greeting requesting RFC1929 username/password auth (0x02)
+            rawOut.write(byteArrayOf(0x05, 0x01, 0x02))
+            rawOut.flush()
+            val greetReply = readExact(rawIn, 2)
+            if (greetReply[0] != 0x05.toByte() || greetReply[1] != 0x02.toByte()) {
+                throw IOException("probe SOCKS5 listener rejected auth method (${greetReply[1].toInt() and 0xFF})")
+            }
+
+            // 2. RFC1929 username/password subnegotiation
+            val userBytes = socksUser.toByteArray(StandardCharsets.UTF_8)
+            val passBytes = socksPass.toByteArray(StandardCharsets.UTF_8)
+            require(userBytes.size in 1..255 && passBytes.size in 1..255) { "invalid SOCKS5 credentials length" }
+            val authPacket = ByteArray(3 + userBytes.size + passBytes.size)
+            authPacket[0] = 0x01
+            authPacket[1] = userBytes.size.toByte()
+            System.arraycopy(userBytes, 0, authPacket, 2, userBytes.size)
+            authPacket[2 + userBytes.size] = passBytes.size.toByte()
+            System.arraycopy(passBytes, 0, authPacket, 3 + userBytes.size, passBytes.size)
+            rawOut.write(authPacket)
+            rawOut.flush()
+            val authReply = readExact(rawIn, 2)
+            if (authReply[1] != 0x00.toByte()) {
+                throw IOException("probe SOCKS5 authentication failed for '$socksUser'")
+            }
+
+            // 3. SOCKS5 CONNECT target host:port
+            val ipLiteral = parseNumericIpOrNull(host)
+            val addrBytes: ByteArray
+            val atyp: Byte
+            when (ipLiteral) {
+                is Inet4Address -> {
+                    atyp = 0x01
+                    addrBytes = ipLiteral.address
+                }
+                is Inet6Address -> {
+                    atyp = 0x04
+                    addrBytes = ipLiteral.address
+                }
+                else -> {
+                    atyp = 0x03
+                    val domainBytes = host.toByteArray(StandardCharsets.UTF_8)
+                    require(domainBytes.size in 1..255) { "domain too long: $host" }
+                    addrBytes = ByteArray(1 + domainBytes.size).also {
+                        it[0] = domainBytes.size.toByte()
+                        System.arraycopy(domainBytes, 0, it, 1, domainBytes.size)
+                    }
+                }
+            }
+            val connectReq = ByteArray(4 + addrBytes.size + 2)
+            connectReq[0] = 0x05
+            connectReq[1] = 0x01 // CONNECT
+            connectReq[2] = 0x00
+            connectReq[3] = atyp
+            System.arraycopy(addrBytes, 0, connectReq, 4, addrBytes.size)
+            connectReq[4 + addrBytes.size] = ((port ushr 8) and 0xFF).toByte()
+            connectReq[5 + addrBytes.size] = (port and 0xFF).toByte()
+            rawOut.write(connectReq)
+            rawOut.flush()
+
+            val connHead = readExact(rawIn, 4)
+            if (connHead[0] != 0x05.toByte() || connHead[1] != 0x00.toByte()) {
+                throw IOException("SOCKS5 CONNECT failed (reply=${connHead[1].toInt() and 0xFF})")
+            }
+            when (connHead[3].toInt() and 0xFF) {
+                0x01 -> readExact(rawIn, 4 + 2)
+                0x04 -> readExact(rawIn, 16 + 2)
+                0x03 -> {
+                    val dLen = readExact(rawIn, 1)[0].toInt() and 0xFF
+                    readExact(rawIn, dLen + 2)
+                }
+                else -> throw IOException("unsupported SOCKS5 ATYP ${connHead[3].toInt() and 0xFF}")
+            }
+
+            val activeSocket: Socket = if (tls) {
+                val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+                (sslFactory.createSocket(rawSocket, host, port, true) as SSLSocket).apply {
+                    soTimeout = timeoutMs
+                    if (ipLiteral == null) {
+                        sslParameters = sslParameters.apply {
+                            serverNames = listOf(SNIHostName(host))
+                        }
+                    }
+                    startHandshake()
+                }
+            } else {
+                rawSocket
+            }
+
+            val streamIn = BufferedInputStream(activeSocket.getInputStream(), 4096)
+            val streamOut = activeSocket.getOutputStream()
+            val ua = "Owenclave/${BuildConfig.VERSION_NAME}"
+
+            val req1 = (
+                "GET $pathAndQuery HTTP/1.1\r\n" +
+                    "Host: $hostHeader\r\n" +
+                    "User-Agent: $ua\r\n" +
+                    "Accept: */*\r\n" +
+                    "Connection: keep-alive\r\n\r\n"
+                ).toByteArray(StandardCharsets.US_ASCII)
+            streamOut.write(req1)
+            streamOut.flush()
+
+            val resp1 = readHttpResponseHeadAndDrainBody(streamIn)
+            val rtt1Ns = System.nanoTime() - overallStartNs
+            if (resp1.statusCode !in 200..399) {
+                throw IllegalStateException("HTTP ${resp1.statusCode}")
+            }
+
+            val rtt1Ms = (rtt1Ns / 1_000_000L).toInt().coerceAtLeast(1)
+            if (resp1.canReuseKeepAlive && rtt1Ms < timeoutMs / 2) {
+                val req2 = (
+                    "GET $pathAndQuery HTTP/1.1\r\n" +
+                        "Host: $hostHeader\r\n" +
+                        "User-Agent: $ua\r\n" +
+                        "Accept: */*\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(StandardCharsets.US_ASCII)
+                val secondResult = runCatching {
+                    val start2Ns = System.nanoTime()
+                    streamOut.write(req2)
+                    streamOut.flush()
+                    val statusLine = readHttpLine(streamIn)
+                        ?: throw IOException("EOF on warm probe")
+                    val rtt2Ns = System.nanoTime() - start2Ns
+                    val code2 = parseHttpStatusCode(statusLine)
+                    if (code2 !in 200..399) throw IllegalStateException("HTTP $code2")
+                    ((rtt2Ns) / 1_000_000L).toInt().coerceAtLeast(1)
+                }.getOrNull()
+                if (secondResult != null) {
+                    return secondResult
+                }
+            }
+            return rtt1Ms
+        } finally {
+            runCatching { rawSocket.close() }
+        }
+    }
+
+    private data class ParsedProbeHttpResponse(
+        val statusCode: Int,
+        val canReuseKeepAlive: Boolean,
+    )
+
+    private fun readHttpResponseHeadAndDrainBody(input: BufferedInputStream): ParsedProbeHttpResponse {
+        val statusLine = readHttpLine(input) ?: throw IOException("empty HTTP response")
+        val code = parseHttpStatusCode(statusLine)
+        var contentLength: Long? = null
+        var chunked = false
+        var connectionClose = statusLine.startsWith("HTTP/1.0", ignoreCase = true)
+
+        while (true) {
+            val line = readHttpLine(input) ?: throw IOException("truncated HTTP headers")
+            if (line.isEmpty()) break
+            val colon = line.indexOf(':')
+            if (colon <= 0) continue
+            val name = line.substring(0, colon).trim().lowercase()
+            val value = line.substring(colon + 1).trim()
+            when (name) {
+                "content-length" -> contentLength = value.toLongOrNull()
+                "transfer-encoding" -> if (value.contains("chunked", ignoreCase = true)) chunked = true
+                "connection" -> {
+                    if (value.contains("close", ignoreCase = true)) connectionClose = true
+                    if (value.contains("keep-alive", ignoreCase = true)) connectionClose = false
+                }
+            }
+        }
+
+        if (code in 100..199 || code == 204 || code == 304) {
+            return ParsedProbeHttpResponse(code, !connectionClose)
+        }
+        if (chunked) {
+            return ParsedProbeHttpResponse(code, false)
+        }
+        val len = contentLength ?: return ParsedProbeHttpResponse(code, false)
+        if (len < 0L || len > 65_536L) {
+            return ParsedProbeHttpResponse(code, false)
+        }
+        if (len > 0L) {
+            readExact(input, len.toInt())
+        }
+        return ParsedProbeHttpResponse(code, !connectionClose)
+    }
+
+    private fun parseHttpStatusCode(statusLine: String): Int {
+        val parts = statusLine.split(' ', limit = 3)
+        if (parts.size < 2 || !parts[0].startsWith("HTTP/")) {
+            throw IOException("malformed HTTP status line: $statusLine")
+        }
+        return parts[1].toIntOrNull() ?: throw IOException("invalid HTTP status code: $statusLine")
+    }
+
+    private fun readHttpLine(input: InputStream): String? {
+        val sb = StringBuilder(128)
+        var sawAny = false
+        while (true) {
+            val b = input.read()
+            if (b < 0) return if (sawAny) sb.toString() else null
+            sawAny = true
+            if (b == '\n'.code) {
+                if (sb.isNotEmpty() && sb[sb.length - 1] == '\r') {
+                    sb.setLength(sb.length - 1)
+                }
+                return sb.toString()
+            }
+            if (sb.length < 4096) sb.append(b.toChar())
+        }
+    }
+
+    private fun readExact(input: InputStream, count: Int): ByteArray {
+        val out = ByteArray(count)
+        var off = 0
+        while (off < count) {
+            val n = input.read(out, off, count - off)
+            if (n < 0) throw IOException("unexpected EOF")
+            off += n
+        }
+        return out
+    }
+
+    private fun parseNumericIpOrNull(host: String): InetAddress? {
+        val isIpv4 = host.all { it.isDigit() || it == '.' } && host.count { it == '.' } == 3
+        val isIpv6 = ':' in host
+        if (!isIpv4 && !isIpv6) return null
+        return runCatching { InetAddress.getByName(host) }.getOrNull()
+    }
+
+    private fun runHealthSupervisorTick() {
+        val candidatesToProbe = ArrayList<Pair<Profile, String>>()
+        val now = System.currentTimeMillis()
+
+        synchronized(lock) {
+            val allProfiles = allProfilesLocked()
+            if (allProfiles.isEmpty() || config.mode == "direct") return
+            if (!runner.healthy) {
+                recordLog("warning", "core or external plugin process exited unexpectedly; restarting")
+                runCatching { reloadCoreLocked(forceRestart = true) }
+                    .onFailure { recordLog("error", "supervisor restart failed: ${it.message}") }
+                return
+            }
+
+            val active = activeProfileLocked() ?: return
+            val primaryBal = resolvePrimaryBalancerLocked(active)
+            // When core log-level < INFO, observatory logs are suppressed; actively probe
+            // active/balancer candidates on interval so `nodeHealth` and `delayHistory` stay live.
+            val observatoryLogsSuppressed = config.toCoreLogLevel() < LogLevel.INFO
+            if (observatoryLogsSuppressed || primaryBal == null) {
+                val intervalMs = ((primaryBal?.probeIntervalSec ?: config.healthCheckInterval.takeIf { it > 0 } ?: 15)
+                    .coerceIn(3, 3600)) * 1000L
+                val probeUrl = primaryBal?.probeUrl?.takeIf { it.isNotBlank() } ?: DEFAULT_DELAY_URL
+                val byId = allProfiles.associateBy { it.id }
+                val ids = primaryBal?.profileIds ?: listOf(active.id)
+                for (pid in ids) {
+                    val p = byId[pid] ?: continue
+                    val lastAt = lastNodeProbeAtMillis[pid] ?: 0L
+                    if (now - lastAt >= intervalMs) {
+                        candidatesToProbe += p to probeUrl
+                    }
+                }
+            }
+        }
+
+        for ((profile, probeUrl) in candidatesToProbe) {
+            runCatching { measureDelay(profile.displayName, probeUrl, 5_000) }
+        }
     }
 
     // --------------------------------------------------------- core supervision
@@ -772,10 +1214,15 @@ class DaemonEngine(val config: DaemonConfig) {
 
         val exposeSocksOnLan = config.allowLan && config.effectiveListenAddress() == "0.0.0.0" && config.socksPort > 0
         val requestedTproxy = config.tproxyPort.takeIf { it > 0 && !tproxyDisabledFallback }
+        if (probeSocksPort <= 0) {
+            probeSocksPort = CoreRunner.freePort()
+        }
         val inbounds = ServerInboundOptions(
             mixedPort = config.mixedPort.takeIf { it > 0 },
             bindAddress = config.effectiveListenAddress(),
             tproxyPort = requestedTproxy,
+            probePort = probeSocksPort,
+            probeSecret = probeSecret,
         )
         val allProfiles = allProfilesLocked()
         val outIface = config.interfaceName.takeIf { it.isNotBlank() }
@@ -812,6 +1259,7 @@ class DaemonEngine(val config: DaemonConfig) {
         ).withValue(Key.REQUIRE_SOCKS, "true")
             .withValue(Key.REQUIRE_HTTP, if (config.httpPort > 0) "true" else "false")
             .withValue(Key.ALLOW_ACCESS, if (exposeSocksOnLan) "true" else "false")
+            .withValue(Key.INTERRUPT_REUSED_CONNECTIONS, "true")
 
         if (!config.ipv6) {
             desktopSettings = desktopSettings
@@ -1002,8 +1450,9 @@ class DaemonEngine(val config: DaemonConfig) {
             return BalancerSpec(
                 id = "primary-fb:${effectiveProfile.id}",
                 profileIds = listOf(effectiveProfile.id),
-                strategy = "leastPing",
+                strategy = "fallback",
                 stickyChoice = false,
+                probeUrl = MihomoYamlSupport.DEFAULT_PROBE_URL,
                 probeIntervalSec = interval,
                 fallbackToDirect = true,
             )
@@ -1053,12 +1502,17 @@ class DaemonEngine(val config: DaemonConfig) {
                 val aliveMembers = memberProfiles.filter { nodeHealth[it.id] == true }
                 when {
                     aliveMembers.isNotEmpty() -> {
-                        aliveMembers.minByOrNull { p ->
-                            delayHistory[p.displayName]?.lastOrNull()?.delay ?: Int.MAX_VALUE
-                        }?.displayName ?: aliveMembers.first().displayName
+                        if (spec.type == "fallback") {
+                            // `fallback` uses strict list priority: always return to the first healthy server.
+                            aliveMembers.first().displayName
+                        } else {
+                            aliveMembers.minByOrNull { p ->
+                                delayHistory[p.displayName]?.lastOrNull()?.delay ?: Int.MAX_VALUE
+                            }?.displayName ?: aliveMembers.first().displayName
+                        }
                     }
                     memberProfiles.isNotEmpty() && memberProfiles.all { nodeHealth[it.id] == false } &&
-                        (spec.fallbackToDirect || config.fallbackToDirect) && "DIRECT" in choices -> "DIRECT"
+                        (spec.fallbackToDirect || config.fallbackToDirect) -> "DIRECT"
                     else -> groupSelections[spec.name]?.takeIf { it in choices } ?: choices.firstOrNull().orEmpty()
                 }
             } else {
@@ -1146,6 +1600,8 @@ class DaemonEngine(val config: DaemonConfig) {
                 addProperty("tproxyPort", config.tproxyPort)
                 addProperty("interfaceName", config.interfaceName)
                 addProperty("ipv6", config.ipv6)
+                addProperty("fallbackToDirect", config.fallbackToDirect)
+                addProperty("healthCheckInterval", config.healthCheckInterval)
 
                 add("manualProfiles", JsonArray().apply {
                     manualProfiles.forEach { add(it.toJson()) }
@@ -1184,6 +1640,16 @@ class DaemonEngine(val config: DaemonConfig) {
         runCatching {
             val root = JsonParser.parseString(stateFile.readText()).asJsonObject
             selectedProfileId = root.get("selectedProfileId")?.takeIf { !it.isJsonNull }?.asString
+            if (!config.hasExplicitFallbackToDirect) {
+                root.get("fallbackToDirect")?.takeIf { !it.isJsonNull }?.asBoolean?.let {
+                    config.fallbackToDirect = it
+                }
+            }
+            if (!config.hasExplicitHealthCheckInterval) {
+                root.get("healthCheckInterval")?.takeIf { !it.isJsonNull }?.asInt?.let {
+                    if (it in 0..3600) config.healthCheckInterval = it
+                }
+            }
 
             manualProfiles.clear()
             root.getAsJsonArray("manualProfiles")?.forEach { el ->
@@ -1239,9 +1705,8 @@ class DaemonEngine(val config: DaemonConfig) {
                 val target = allProfilesLocked().firstOrNull { DesktopConfigBuilder.entityIdOf(it.id) == entityId }
                 if (target != null) {
                     nodeHealth[target.id] = true
-                    val list = delayHistory.getOrPut(target.displayName) { ArrayList() }
-                    list += DelayRecord(time = stamp, delay = delayMs)
-                    while (list.size > 20) list.removeAt(0)
+                    lastNodeProbeAtMillis[target.id] = System.currentTimeMillis()
+                    recordDelayLocked(target.displayName, stamp, delayMs)
                 }
             }
             return
@@ -1252,6 +1717,7 @@ class DaemonEngine(val config: DaemonConfig) {
                 val target = allProfilesLocked().firstOrNull { DesktopConfigBuilder.entityIdOf(it.id) == entityId }
                 if (target != null) {
                     nodeHealth[target.id] = false
+                    lastNodeProbeAtMillis[target.id] = System.currentTimeMillis()
                 }
             }
         }
@@ -1279,7 +1745,7 @@ class DaemonEngine(val config: DaemonConfig) {
 
     companion object {
         private const val MAX_LOGS = 500
-        const val DEFAULT_DELAY_URL = "https://www.gstatic.com/generate_204"
+        const val DEFAULT_DELAY_URL = "http://cp.cloudflare.com/generate_204"
         private val OBSERVATORY_ALIVE_REGEX = Regex("""app/observatory: the outbound proxy-global-(\d+) is alive:([0-9.]+)""")
         private val OBSERVATORY_DEAD_REGEX = Regex("""app/observatory: the outbound proxy-global-(\d+) is dead""")
 

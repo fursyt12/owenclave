@@ -19,6 +19,7 @@ import java.net.URL
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 import kotlin.test.BeforeTest
@@ -577,7 +578,10 @@ class WebControllerServerTest {
             // and 1 single-node fallback balancer for `YouTube` -> `NL-Hy2`
             assertEquals(2, balancersJson.size())
             balancersJson.forEach { b ->
-                assertEquals("bypass", b.asJsonObject.get("fallbackTag").asString)
+                assertEquals(
+                    DesktopConfigBuilder.TAG_BYPASS_FALLBACK,
+                    b.asJsonObject.get("fallbackTag").asString,
+                )
             }
 
             val outboundsByTag = rootJson.getAsJsonArray("outbounds")
@@ -586,6 +590,13 @@ class WebControllerServerTest {
             assertEquals(
                 "enp7s0",
                 outboundsByTag.getValue("bypass")
+                    .getAsJsonObject("streamSettings")
+                    .getAsJsonObject("sockopt")
+                    .get("bindToDevice").asString,
+            )
+            assertEquals(
+                "enp7s0",
+                outboundsByTag.getValue(DesktopConfigBuilder.TAG_BYPASS_FALLBACK)
                     .getAsJsonObject("streamSettings")
                     .getAsJsonObject("sockopt")
                     .get("bindToDevice").asString,
@@ -1041,6 +1052,470 @@ class WebControllerServerTest {
             runCatching { echoServer.close() }
             runCatching { echoThread.join(1000) }
             tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `measureDelay probes each server independently and rejects dead servers during direct fallback`() {
+        val coreBin = DesktopRuntime.coreBinary() ?: return
+        val tmpDir = Files.createTempDirectory("owenclave-per-node-delay").toFile()
+
+        // Single-shot HTTP 204 target (`Connection: close` so each delay probe reflects true upstream latency)
+        val probeTarget = com.sun.net.httpserver.HttpServer.create(InetSocketAddress("127.0.0.1", 0), 32).apply {
+            createContext("/generate_204") { ex ->
+                ex.responseHeaders.set("Connection", "close")
+                ex.sendResponseHeaders(204, -1)
+                ex.close()
+            }
+            start()
+        }
+
+        // Slow HTTP CONNECT proxy server that adds a 160ms artificial delay before tunneling to probeTarget
+        val slowProxy = MockHttpConnectProxy(delayMs = 160L)
+
+        var fastUpstreamProc: Process? = null
+        var engine: DaemonEngine? = null
+        var controller: WebControllerServer? = null
+
+        try {
+            val fastPort = CoreRunner.freePort()
+            val deadPort = CoreRunner.freePort()
+            val fastCfg = File(tmpDir, "fast-upstream.json").apply {
+                writeText(
+                    """
+                    {
+                      "log": { "loglevel": "warning" },
+                      "inbounds": [
+                        { "tag": "in", "listen": "127.0.0.1", "port": $fastPort, "protocol": "http" }
+                      ],
+                      "outbounds": [ { "tag": "direct", "protocol": "freedom" } ]
+                    }
+                    """.trimIndent(),
+                )
+            }
+            fastUpstreamProc = ProcessBuilder(coreBin.absolutePath, "run", "-c", fastCfg.absolutePath)
+                .directory(tmpDir)
+                .redirectErrorStream(true)
+                .start()
+            SelfTest.awaitPort(fastPort)
+
+            val targetUrl = "http://127.0.0.1:${probeTarget.address.port}/generate_204"
+            val configYaml = File(tmpDir, "config.yaml").apply {
+                writeText(
+                    """
+                    mode: rule
+                    log-level: warning
+                    fallback-to-direct: true
+                    proxies:
+                      - name: Dead-Node
+                        type: http
+                        server: 127.0.0.1
+                        port: $deadPort
+                      - name: Fast-Node
+                        type: http
+                        server: 127.0.0.1
+                        port: $fastPort
+                      - name: Slow-Node
+                        type: http
+                        server: 127.0.0.1
+                        port: ${slowProxy.port}
+                    proxy-groups:
+                      - name: PROXY
+                        type: fallback
+                        proxies:
+                          - Dead-Node
+                          - Fast-Node
+                          - Slow-Node
+                        url: "$targetUrl"
+                        interval: 60
+                    rules:
+                      - MATCH,PROXY
+                    """.trimIndent(),
+                )
+            }
+
+            val cfg = DaemonConfig.load(
+                args = arrayOf(
+                    "--config", configYaml.absolutePath,
+                    "--data-dir", File(tmpDir, "data").absolutePath,
+                    "--mixed-port", CoreRunner.freePort().toString(),
+                    "--bind-address", "127.0.0.1",
+                    "--controller", "127.0.0.1:0",
+                ),
+                env = emptyMap(),
+            )
+            engine = DaemonEngine(cfg).also { it.start() }
+            controller = WebControllerServer(engine).also { it.start() }
+            val base = "http://127.0.0.1:${controller.boundPort}"
+            val encodedUrl = java.net.URLEncoder.encode(targetUrl, StandardCharsets.UTF_8)
+
+            val (fastCode, fastBody) = httpRequest("GET", "$base/proxies/Fast-Node/delay?timeout=3000&url=$encodedUrl")
+            assertEquals(200, fastCode, "Fast-Node delay failed: $fastBody")
+            val fastDelay = JsonParser.parseString(fastBody).asJsonObject.get("delay").asInt
+            assertTrue(fastDelay in 1..110, "Expected Fast-Node delay < 110ms, got ${fastDelay}ms")
+
+            val (slowCode, slowBody) = httpRequest("GET", "$base/proxies/Slow-Node/delay?timeout=3000&url=$encodedUrl")
+            assertEquals(200, slowCode, "Slow-Node delay failed: $slowBody")
+            val slowDelay = JsonParser.parseString(slowBody).asJsonObject.get("delay").asInt
+            assertTrue(slowDelay >= 140, "Expected Slow-Node delay >= 140ms (not routed via Fast-Node), got ${slowDelay}ms")
+
+            val (deadCode, _) = httpRequest("GET", "$base/proxies/Dead-Node/delay?timeout=2000&url=$encodedUrl")
+            assertEquals(504, deadCode, "Dead-Node must fail with 504 instead of leaking through DIRECT bypass")
+
+            val deadProfile = engine.allProfiles().first { it.displayName == "Dead-Node" }
+            assertEquals(false, engine.nodeHealthOf(deadProfile.id), "Dead-Node health must be marked false")
+
+            val (fileSchemeCode, _) = httpRequest("GET", "$base/proxies/Fast-Node/delay?url=file:///etc/hosts")
+            assertEquals(504, fileSchemeCode, "Non-HTTP delay URLs must be rejected")
+        } finally {
+            runCatching { controller?.stop() }
+            runCatching { engine?.stop() }
+            runCatching {
+                fastUpstreamProc?.let { p ->
+                    p.destroyForcibly()
+                    p.waitFor(2, TimeUnit.SECONDS)
+                }
+            }
+            runCatching { slowProxy.close() }
+            runCatching { probeTarget.stop(0) }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `fallback group preserves priority order and recovers automatically from backup and DIRECT bypass`() {
+        val coreBin = DesktopRuntime.coreBinary() ?: return
+        val tmpDir = Files.createTempDirectory("owenclave-fallback-recovery-e2e").toFile()
+
+        val targetHttp = com.sun.net.httpserver.HttpServer.create(InetSocketAddress("127.0.0.1", 0), 32).apply {
+            createContext("/whoami") { ex ->
+                val via = ex.requestHeaders.getFirst("X-Upstream-Node") ?: "DIRECT"
+                val bytes = via.toByteArray(StandardCharsets.UTF_8)
+                ex.responseHeaders.set("Connection", "close")
+                ex.sendResponseHeaders(200, bytes.size.toLong())
+                ex.responseBody.use { it.write(bytes) }
+            }
+            start()
+        }
+        val targetPort = targetHttp.address.port
+
+        // Controllable HTTP CONNECT proxy upstreams (`Primary-Node` adds 35ms latency so `Backup-Node` has lower ping!)
+        val primaryAlive = java.util.concurrent.atomic.AtomicBoolean(true)
+        val backupAlive = java.util.concurrent.atomic.AtomicBoolean(true)
+        val primaryProxy = MockHttpConnectProxy(delayMs = 35L, enabled = primaryAlive, injectNodeHeader = "Primary-Node")
+        val backupProxy = MockHttpConnectProxy(delayMs = 0L, enabled = backupAlive, injectNodeHeader = "Backup-Node")
+        var engine: DaemonEngine? = null
+
+        try {
+            val probeUrl = "http://127.0.0.1:$targetPort/whoami"
+            val configYaml = File(tmpDir, "config.yaml").apply {
+                writeText(
+                    """
+                    mode: rule
+                    log-level: info
+                    fallback-to-direct: true
+                    proxies:
+                      - name: Primary-Node
+                        type: http
+                        server: 127.0.0.1
+                        port: ${primaryProxy.port}
+                      - name: Backup-Node
+                        type: http
+                        server: 127.0.0.1
+                        port: ${backupProxy.port}
+                    proxy-groups:
+                      - name: Auto-Fallback
+                        type: fallback
+                        proxies:
+                          - Primary-Node
+                          - Backup-Node
+                        url: "$probeUrl"
+                        interval: 1
+                    rules:
+                      - IP-CIDR,127.0.0.1/32,Auto-Fallback
+                      - MATCH,Auto-Fallback
+                    """.trimIndent(),
+                )
+            }
+
+            val mixedPort = CoreRunner.freePort()
+            val cfg = DaemonConfig.load(
+                args = arrayOf(
+                    "--config", configYaml.absolutePath,
+                    "--data-dir", File(tmpDir, "data").absolutePath,
+                    "--mixed-port", mixedPort.toString(),
+                    "--bind-address", "127.0.0.1",
+                    "--controller", "127.0.0.1:0",
+                ),
+                env = emptyMap(),
+            )
+            engine = DaemonEngine(cfg).also { it.start() }
+
+            fun fetchCarrierViaMixedPort(): String? = runCatching {
+                val conn = URI.create(probeUrl).toURL().openConnection(
+                    Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", mixedPort)),
+                ) as HttpURLConnection
+                conn.connectTimeout = 2500
+                conn.readTimeout = 2500
+                val code = conn.responseCode
+                val text = if (code == 200) conn.inputStream.bufferedReader().use { it.readText().trim() } else null
+                conn.disconnect()
+                text
+            }.getOrNull()
+
+            fun awaitCarrier(expected: String, timeoutMs: Long = 7_000): String? {
+                val deadline = System.currentTimeMillis() + timeoutMs
+                var last: String? = null
+                while (System.currentTimeMillis() < deadline) {
+                    last = fetchCarrierViaMixedPort()
+                    val groupNow = engine.groupViews().firstOrNull { it.name == "Auto-Fallback" }?.now
+                    if (last == expected && groupNow == expected) return last
+                    Thread.sleep(200)
+                }
+                return last
+            }
+
+            // 1. Both healthy -> MUST pick `Primary-Node` (priority #1), even though `Backup-Node` has lower ping!
+            assertEquals("Primary-Node", awaitCarrier("Primary-Node"), "Expected priority #1 Primary-Node when both are healthy")
+            assertEquals(false, engine.isInDirectFallback())
+
+            // 2. Primary-Node fails (502) -> MUST fail over to `Backup-Node`
+            primaryAlive.set(false)
+            assertEquals("Backup-Node", awaitCarrier("Backup-Node"), "Expected failover to Backup-Node when Primary-Node returns 502")
+            assertEquals(false, engine.isInDirectFallback())
+
+            // 3. Backup-Node ALSO fails (502) -> MUST fall back to `DIRECT` (`bypass-fallback`)
+            backupAlive.set(false)
+            assertEquals("DIRECT", awaitCarrier("DIRECT"), "Expected failover to DIRECT bypass when all proxies fail")
+            assertTrue(engine.isInDirectFallback(), "Expected isInDirectFallback() == true during total proxy outage")
+
+            // 4. Primary-Node and Backup-Node come back online -> MUST recover all the way back to `Primary-Node`!
+            backupAlive.set(true)
+            primaryAlive.set(true)
+            assertEquals(
+                "Primary-Node",
+                awaitCarrier("Primary-Node", timeoutMs = 8_000),
+                "Expected automatic recovery out of DIRECT/Backup back to Primary-Node when Primary-Node returns",
+            )
+            assertEquals(false, engine.isInDirectFallback(), "Expected isInDirectFallback() == false after recovery")
+        } finally {
+            runCatching { engine?.stop() }
+            runCatching { primaryProxy.close() }
+            runCatching { backupProxy.close() }
+            runCatching { targetHttp.stop(0) }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `persists fallback settings across restarts and blocks cross-origin CSRF when secret is empty`() {
+        val coreBin = DesktopRuntime.coreBinary()
+        if (coreBin == null) return
+        val tmpDir = Files.createTempDirectory("owenclave-persist-csrf").toFile()
+        var engine1: DaemonEngine? = null
+        var server1: WebControllerServer? = null
+        var engine2: DaemonEngine? = null
+
+        try {
+            val dataDir = File(tmpDir, "data")
+            val cfg1 = DaemonConfig.load(
+                args = arrayOf(
+                    "--data-dir", dataDir.absolutePath,
+                    "--mixed-port", CoreRunner.freePort().toString(),
+                    "--bind-address", "127.0.0.1",
+                    "--controller", "127.0.0.1:0",
+                ),
+                env = emptyMap(),
+            )
+            engine1 = DaemonEngine(cfg1).also { it.start() }
+            server1 = WebControllerServer(engine1).also { it.start() }
+            val port = server1.boundPort
+            val base = "http://127.0.0.1:$port"
+
+            // Cross-origin POST from untrusted website must be rejected when controller has no secret
+            val csrfStatusLine = java.net.Socket("127.0.0.1", port).use { sock ->
+                sock.soTimeout = 3000
+                sock.getOutputStream().write(
+                    (
+                        "POST /api/reload HTTP/1.1\r\n" +
+                            "Host: 127.0.0.1:$port\r\n" +
+                            "Origin: https://evil.example\r\n" +
+                            "Content-Type: application/json\r\n" +
+                            "Content-Length: 2\r\n" +
+                            "Connection: close\r\n\r\n{}"
+                        ).toByteArray(StandardCharsets.UTF_8),
+                )
+                sock.getOutputStream().flush()
+                sock.getInputStream().bufferedReader().readLine().orEmpty()
+            }
+            assertTrue(csrfStatusLine.contains(" 401 "), "Cross-origin browser POST must be blocked (got: $csrfStatusLine)")
+
+            // Same-origin PATCH from Web UI must succeed and persist fallback-to-direct & health-check-interval
+            val sameOriginPatchLine = java.net.Socket("127.0.0.1", port).use { sock ->
+                sock.soTimeout = 3000
+                val payload = """{"fallback-to-direct":true,"health-check-interval":22}"""
+                sock.getOutputStream().write(
+                    (
+                        "PATCH /configs HTTP/1.1\r\n" +
+                            "Host: 127.0.0.1:$port\r\n" +
+                            "Origin: $base\r\n" +
+                            "Content-Type: application/json\r\n" +
+                            "Content-Length: ${payload.length}\r\n" +
+                            "Connection: close\r\n\r\n$payload"
+                        ).toByteArray(StandardCharsets.UTF_8),
+                )
+                sock.getOutputStream().flush()
+                sock.getInputStream().bufferedReader().readLine().orEmpty()
+            }
+            assertTrue(sameOriginPatchLine.contains(" 204 "), "Same-origin PATCH must succeed (got: $sameOriginPatchLine)")
+            assertTrue(engine1.config.fallbackToDirect)
+            assertEquals(22, engine1.config.healthCheckInterval)
+
+            server1.stop()
+            server1 = null
+            engine1.stop()
+            engine1 = null
+
+            val cfg2 = DaemonConfig.load(
+                args = arrayOf(
+                    "--data-dir", dataDir.absolutePath,
+                    "--mixed-port", CoreRunner.freePort().toString(),
+                    "--bind-address", "127.0.0.1",
+                    "--controller", "127.0.0.1:0",
+                ),
+                env = emptyMap(),
+            )
+            engine2 = DaemonEngine(cfg2).also { it.start() }
+            assertTrue(engine2.config.fallbackToDirect, "fallbackToDirect must survive daemon restart")
+            assertEquals(22, engine2.config.healthCheckInterval, "healthCheckInterval must survive daemon restart")
+        } finally {
+            runCatching { server1?.stop() }
+            runCatching { engine1?.stop() }
+            runCatching { engine2?.stop() }
+            tmpDir.deleteRecursively()
+        }
+    }
+
+    private fun httpRequest(method: String, url: String, body: String? = null): Pair<Int, String> {
+        val client = HttpClient.newHttpClient()
+        val reqBuilder = HttpRequest.newBuilder(URI.create(url))
+        if (body != null) {
+            reqBuilder.header("Content-Type", "application/json")
+            reqBuilder.method(method, HttpRequest.BodyPublishers.ofString(body))
+        } else {
+            reqBuilder.method(method, HttpRequest.BodyPublishers.noBody())
+        }
+        val resp = client.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString())
+        return resp.statusCode() to resp.body()
+    }
+
+    /**
+     * Lightweight HTTP `CONNECT` + forward proxy for deterministic local e2e testing of `owenclave-core`'s
+     * `http` outbound (`CONNECT host:port HTTP/1.1`), including controllable HTTP 502 outages, latency
+     * injection, and optional `X-Upstream-Node` header tagging on tunneled HTTP/1.1 requests.
+     */
+    private class MockHttpConnectProxy(
+        private val delayMs: Long = 0L,
+        private val enabled: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(true),
+        private val injectNodeHeader: String? = null,
+    ) : AutoCloseable {
+        private val server = java.net.ServerSocket(0, 32, java.net.InetAddress.getByName("127.0.0.1"))
+        val port: Int = server.localPort
+
+        init {
+            Thread {
+                while (!server.isClosed) {
+                    val client = runCatching { server.accept() }.getOrNull() ?: break
+                    Thread {
+                        runCatching { handleClient(client) }
+                        runCatching { client.close() }
+                    }.apply { isDaemon = true }.start()
+                }
+            }.apply { isDaemon = true }.start()
+        }
+
+        private fun handleClient(client: java.net.Socket) {
+            client.soTimeout = 4_000
+            val inp = java.io.BufferedInputStream(client.getInputStream())
+            val out = client.getOutputStream()
+
+            val reqLine = readAsciiLine(inp) ?: return
+            while (true) {
+                val hdr = readAsciiLine(inp) ?: return
+                if (hdr.isEmpty()) break
+            }
+            if (!enabled.get()) {
+                out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                out.flush()
+                return
+            }
+            if (delayMs > 0) Thread.sleep(delayMs)
+
+            val parts = reqLine.split(' ')
+            if (parts.size < 2) return
+            val method = parts[0].uppercase()
+            val target = parts[1]
+
+            if (method == "CONNECT") {
+                val host = target.substringBeforeLast(':')
+                val dstPort = target.substringAfterLast(':').toIntOrNull() ?: 80
+                java.net.Socket().use { upstream ->
+                    upstream.soTimeout = 4_000
+                    upstream.connect(InetSocketAddress(host, dstPort), 3_000)
+                    out.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                    out.flush()
+                    val upOut = upstream.getOutputStream()
+                    val upIn = upstream.getInputStream()
+                    val c2u = Thread {
+                        runCatching {
+                            if (injectNodeHeader != null) {
+                                val firstLine = readAsciiLine(inp) ?: return@runCatching
+                                upOut.write("$firstLine\r\nX-Upstream-Node: $injectNodeHeader\r\n".toByteArray())
+                                while (true) {
+                                    val h = readAsciiLine(inp) ?: break
+                                    upOut.write("$h\r\n".toByteArray())
+                                    if (h.isEmpty()) break
+                                }
+                                upOut.flush()
+                            }
+                            inp.copyTo(upOut)
+                        }
+                        runCatching { upstream.shutdownOutput() }
+                    }.apply { isDaemon = true }.also { it.start() }
+                    runCatching { upIn.copyTo(out); out.flush() }
+                    c2u.join(1_000)
+                }
+            } else {
+                val conn = URI.create(target).toURL().openConnection(Proxy.NO_PROXY) as HttpURLConnection
+                if (injectNodeHeader != null) conn.setRequestProperty("X-Upstream-Node", injectNodeHeader)
+                conn.connectTimeout = 3_000
+                conn.readTimeout = 3_000
+                val code = conn.responseCode
+                val body = (if (code in 200..399) conn.inputStream else conn.errorStream)?.use { it.readBytes() } ?: ByteArray(0)
+                conn.disconnect()
+                out.write("HTTP/1.1 $code OK\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                if (body.isNotEmpty()) out.write(body)
+                out.flush()
+            }
+        }
+
+        private fun readAsciiLine(inp: java.io.InputStream): String? {
+            val sb = StringBuilder()
+            var any = false
+            while (true) {
+                val b = inp.read()
+                if (b < 0) return if (any) sb.toString() else null
+                any = true
+                if (b == '\n'.code) {
+                    if (sb.isNotEmpty() && sb[sb.length - 1] == '\r') sb.setLength(sb.length - 1)
+                    return sb.toString()
+                }
+                sb.append(b.toChar())
+            }
+        }
+
+        override fun close() {
+            runCatching { server.close() }
         }
     }
 

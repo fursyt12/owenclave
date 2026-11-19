@@ -2159,6 +2159,9 @@ object WebDashboardHtml {
     if (cfg.mode === 'direct') {
       return { name: 'DIRECT', mode: 'direct', profile: null, bypassFailover: false };
     }
+    if (state.inFallback) {
+      return { name: 'DIRECT (Bypass)', mode: 'bypass', profile: null, bypassFailover: true };
+    }
     const profiles = state.profiles || [];
     const byName = new Map(profiles.map(p => [p.name, p]));
     const groups = state.groups || [];
@@ -2180,13 +2183,11 @@ object WebDashboardHtml {
       cur = byGroup.get(cur).now;
     }
     if (cur === 'DIRECT') {
-      const allDead = profiles.length > 0 && profiles.every(p => p.health === 'dead');
-      return { name: 'DIRECT', mode: allDead ? 'bypass' : 'direct', profile: null, bypassFailover: allDead };
+      return { name: 'DIRECT', mode: 'direct', profile: null, bypassFailover: false };
     }
     const found = (cur && byName.get(cur)) || profiles.find(p => p.selected) || profiles[0] || null;
     if (found) {
-      const allDead = profiles.length > 0 && profiles.every(p => p.health === 'dead');
-      if (allDead && cfg['fallback-to-direct']) {
+      if (found.health === 'dead' && cfg['fallback-to-direct']) {
         return { name: 'DIRECT (Bypass)', mode: 'bypass', profile: null, bypassFailover: true };
       }
       return { name: found.name, mode: 'proxy', profile: found, bypassFailover: false };

@@ -104,9 +104,9 @@ self contained and can live on a USB stick. Remove `data/` to fall back to the
 per user location.
 
 `jpackage` can only build for the host OS, which is why
-`.github/workflows/desktop.yml` runs the build on `ubuntu-latest`, `macos-13`
-(x64), `macos-14` (arm64) and `windows-latest`, and publishes both the portable
-archives and the installers.
+`.github/workflows/desktop.yml` runs the build on `ubuntu-latest`, `macos-26-intel`
+(x64), `xcode-27` / `macos-26` (arm64) and `windows-latest`, and publishes both the
+portable archives and the installers.
 
 ## Run from the sources
 
@@ -261,32 +261,27 @@ with the cgroup match, or a failing command each raise a message naming the caus
 
 ### Privileges
 
-TUN mode needs administrator rights:
+TUN / VPN mode elevates privileges on demand when connecting:
 
 | OS | How |
 | --- | --- |
-| Linux | run the client as root, or grant `CAP_NET_ADMIN` |
-| macOS | start it with `sudo` |
-| Windows | start it as Administrator (plus `wintun.dll`, see below) |
+| Linux | Polkit (`pkexec`) / graphical askpass via `owenclave-tun-helper` (or run as root / `CAP_NET_ADMIN`) |
+| macOS | macOS administrator prompt via `osascript` (or run with `sudo`) |
+| Windows | Windows UAC prompt (`RunAs` Administrator) with bundled `tun2socks.exe` + `wintun.dll` |
 
-Windows additionally needs `wintun.dll` next to `tun2socks.exe`; the download script
-fetches it from wintun.net when that host is reachable, otherwise put the DLL into
-the runtime directory by hand (the app says so explicitly).
+Windows additionally bundles `wintun.dll` next to `tun2socks.exe` (downloaded and verified from `wintun.net` by `./run desktop tun2socks download`).
 
 ### Verification
 
 ```sh
-# no privileges needed if user namespaces are available: a namespace gives the TUN
-# device without touching the host routes, and a stub SOCKS server answers
-sudo unshare -rn bash -c "ip link set lo up; ip route add default dev lo || true; \
-  ./desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest-tun-stub"
+# authoritative end-to-end VPN / TUN self-test (routes traffic through local proxy via real TUN/Wintun)
+sudo ./desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest-vpn-e2e
 
-# the real thing: takes over the default route and fetches a public URL through it
+# public-network TUN self-test
 sudo ./desktop/app/build/compose/binaries/main/app/Owenclave/bin/Owenclave --selftest-tun
 ```
 
-CI runs both: the namespace variant on Linux, the real one (last step, non blocking)
-on Linux, macOS and Windows.
+CI runs `--selftest-vpn-e2e` as a blocking verification gate on Linux, macOS and Windows before any desktop artifact is uploaded.
 
 ## System proxy mode
 

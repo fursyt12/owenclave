@@ -286,6 +286,7 @@ class CoreRunner(
         what: String,
         startupLines: List<String> = emptyList(),
     ) {
+        val useProcFs = File("/proc/net/tcp").canRead()
         val deadline = System.currentTimeMillis() + timeoutMillis
         while (System.currentTimeMillis() < deadline) {
             if (!process.isAlive) {
@@ -296,13 +297,19 @@ class CoreRunner(
                 val suffix = if (detail.isNotBlank()) ": $detail" else ""
                 throw UnsupportedProfileException("$what terminated during startup (exit code ${process.exitValue()})$suffix")
             }
-            runCatching {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress("127.0.0.1", port), 250)
-                }
+            if (useProcFs && io.nekohasekai.sagernet.bg.ProxyService.isLoopbackTcpListeningLinux(port)) {
                 return
             }
-            Thread.sleep(150)
+            if (!useProcFs) {
+                val connected = runCatching {
+                    Socket().use { socket ->
+                        socket.connect(InetSocketAddress("127.0.0.1", port), 250)
+                    }
+                    true
+                }.getOrDefault(false)
+                if (connected) return
+            }
+            Thread.sleep(100)
         }
         throw UnsupportedProfileException("$what did not start listening on 127.0.0.1:$port in time")
     }

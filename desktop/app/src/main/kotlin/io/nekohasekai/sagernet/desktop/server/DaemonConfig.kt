@@ -32,6 +32,8 @@ data class DaemonConfig(
     var ipv6: Boolean = true,
     var fallbackToDirect: Boolean = false,
     var healthCheckInterval: Int = 0,
+    val hasExplicitFallbackToDirect: Boolean = false,
+    val hasExplicitHealthCheckInterval: Boolean = false,
     val externalController: String = "0.0.0.0:9090",
     val secret: String = "",
     val subscriptionUserAgent: String = "Owenclave/${BuildConfig.VERSION_NAME}",
@@ -148,15 +150,15 @@ data class DaemonConfig(
                 ?: yamlBool("ipv6")
                 ?: true
 
-            val fallbackToDirect = argValue(args, "--fallback-to-direct")?.lowercase()?.let { it == "true" || it == "1" }
+            val explicitFallbackToDirect = argValue(args, "--fallback-to-direct")?.lowercase()?.let { it == "true" || it == "1" }
                 ?: env["FALLBACK_TO_DIRECT"]?.lowercase()?.let { it == "true" || it == "1" || it == "yes" }
                 ?: yamlBool("fallback-to-direct", "bypass-on-unavailable")
-                ?: false
+            val fallbackToDirect = explicitFallbackToDirect ?: false
 
-            val healthCheckInterval = argValue(args, "--health-check-interval")?.toIntOrNull()
+            val explicitHealthCheckInterval = argValue(args, "--health-check-interval")?.toIntOrNull()
                 ?: env["HEALTH_CHECK_INTERVAL"]?.toIntOrNull()
                 ?: yamlInt("health-check-interval")
-                ?: 0
+            val healthCheckInterval = explicitHealthCheckInterval ?: 0
 
             val controller = argValue(args, "--controller")
                 ?: env["EXTERNAL_CONTROLLER"]?.takeIf { it.isNotBlank() }
@@ -231,6 +233,8 @@ data class DaemonConfig(
                 ipv6 = ipv6,
                 fallbackToDirect = fallbackToDirect,
                 healthCheckInterval = healthCheckInterval,
+                hasExplicitFallbackToDirect = explicitFallbackToDirect != null,
+                hasExplicitHealthCheckInterval = explicitHealthCheckInterval != null,
                 externalController = controller,
                 secret = secret,
                 subscriptionUserAgent = defaultUa,

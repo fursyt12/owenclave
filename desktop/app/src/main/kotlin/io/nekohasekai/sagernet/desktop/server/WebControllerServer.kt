@@ -554,6 +554,7 @@ class WebControllerServer(
         return JsonObject().apply {
             addProperty("version", BuildConfig.VERSION_NAME)
             addProperty("running", engine.isCoreRunning())
+            addProperty("inFallback", engine.isInDirectFallback())
             addProperty("startedAt", engine.startedAtMillis)
             engine.lastCoreError()?.let { addProperty("lastError", it) }
             add("configs", buildConfigsJson())
@@ -662,7 +663,20 @@ class WebControllerServer(
 
     private fun isAuthorized(exchange: HttpExchange, query: Map<String, String>): Boolean {
         val expected = engine.config.secret
-        if (expected.isEmpty()) return true
+        if (expected.isEmpty()) {
+            val method = exchange.requestMethod.uppercase()
+            if (method !in setOf("GET", "HEAD", "OPTIONS")) {
+                val origin = exchange.requestHeaders.getFirst("Origin")?.trim().orEmpty()
+                if (origin.isNotEmpty()) {
+                    val host = exchange.requestHeaders.getFirst("Host")?.trim().orEmpty()
+                    val originHost = runCatching { java.net.URI(origin).authority.orEmpty() }.getOrDefault("")
+                    if (originHost.isEmpty() || !originHost.equals(host, ignoreCase = true)) {
+                        return false
+                    }
+                }
+            }
+            return true
+        }
 
         val authHeader = exchange.requestHeaders.getFirst("Authorization").orEmpty()
         val provided = when {

@@ -33,18 +33,34 @@ CMD ["--daemon"]
 FROM eclipse-temurin:21-jdk-noble AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git python3 xz-utils \
+    build-essential ca-certificates curl git perl python3 xz-utils \
+  && ARCH="$(dpkg --print-architecture)" \
+  && curl -fsSL "https://go.dev/dl/go1.27.3.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz \
   && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/usr/local/go/bin:${PATH}"
 
 WORKDIR /src
 COPY . .
 
-# Ensure NaiveProxy, tun2socks, and core binaries exist (reuses prebuilt dist/ if present)
+# Build patched core + JNI and ensure NaiveProxy, tun2socks, and verified geo assets exist
 RUN set -eux; \
     ARCH="$(dpkg --print-architecture)"; \
     case "$ARCH" in amd64) TAG="linux-amd64"; TARGET="linux/amd64" ;; arm64) TAG="linux-arm64"; TARGET="linux/arm64" ;; *) TAG="linux-amd64"; TARGET="linux/amd64" ;; esac; \
+    TARGETS="$TARGET" ./bin/desktop/core/build.sh; \
     if [ ! -f "desktop/naive/dist/$TAG/naive" ]; then TARGETS="$TARGET" ./bin/desktop/naive/download.sh; fi; \
     if [ ! -f "desktop/tun2socks/dist/$TAG/tun2socks" ]; then TARGETS="$TARGET" ./bin/desktop/tun2socks/download.sh; fi; \
+    mkdir -p app/src/main/assets/owenclave-core; \
+    if [ ! -f "app/src/main/assets/owenclave-core/geoip.dat" ]; then \
+      GEOIP_VER="$(tr -d '[:space:]' < app/src/main/assets/owenclave-core/geoip.version.txt)"; \
+      curl -fsSL -o app/src/main/assets/owenclave-core/geoip.dat "https://github.com/v2fly/geoip/releases/download/${GEOIP_VER}/geoip.dat"; \
+      curl -fsSL "https://github.com/v2fly/geoip/releases/download/${GEOIP_VER}/geoip.dat.sha256sum" | awk '{print $1 "  app/src/main/assets/owenclave-core/geoip.dat"}' | sha256sum -c -; \
+    fi; \
+    if [ ! -f "app/src/main/assets/owenclave-core/geosite.dat" ]; then \
+      GEOSITE_VER="$(tr -d '[:space:]' < app/src/main/assets/owenclave-core/geosite.version.txt)"; \
+      curl -fsSL -o app/src/main/assets/owenclave-core/geosite.dat "https://github.com/v2fly/domain-list-community/releases/download/${GEOSITE_VER}/dlc.dat"; \
+      curl -fsSL "https://github.com/v2fly/domain-list-community/releases/download/${GEOSITE_VER}/dlc.dat.sha256sum" | awk '{print $1 "  app/src/main/assets/owenclave-core/geosite.dat"}' | sha256sum -c -; \
+    fi; \
     ./gradlew :desktop:app:prepareServerDist --no-daemon --console=plain
 
 # ---------------------------------------------------------------------------

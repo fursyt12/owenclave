@@ -28,6 +28,7 @@ import java.util.regex.Pattern
  */
 object MihomoYamlSupport {
 
+    const val DEFAULT_PROBE_URL = "http://cp.cloudflare.com/generate_204"
     val AUTO_BALANCER_TYPES = setOf("fallback", "url-test", "load-balance")
 
     data class ProxyGroupSpec(
@@ -394,8 +395,9 @@ object MihomoYamlSupport {
             return BalancerSpec(
                 id = "profile-fb:${single.id}",
                 profileIds = listOf(single.id),
-                strategy = "leastPing",
+                strategy = "fallback",
                 stickyChoice = false,
+                probeUrl = DEFAULT_PROBE_URL,
                 probeIntervalSec = computeInterval(null),
                 fallbackToDirect = true,
             )
@@ -456,14 +458,18 @@ object MihomoYamlSupport {
         collectFromGroup(group, HashSet())
         if (members.isEmpty()) return null
 
-        val strategy = if (group.type == "load-balance") "random" else "leastPing"
-        val sticky = !hasDirectFallback && (group.type == "fallback" || (group.type == "url-test" && (group.tolerance ?: 0) > 0))
+        val strategy = when (group.type) {
+            "fallback" -> "fallback"
+            "load-balance" -> "random"
+            else -> "leastPing"
+        }
+        val sticky = !hasDirectFallback && group.type == "url-test" && (group.tolerance ?: 0) > 0
         return BalancerSpec(
             id = group.name,
             profileIds = members.keys.toList(),
             strategy = strategy,
             stickyChoice = sticky,
-            probeUrl = group.url.orEmpty(),
+            probeUrl = group.url?.takeIf { it.isNotBlank() } ?: DEFAULT_PROBE_URL,
             probeIntervalSec = computeInterval(group.interval),
             fallbackToDirect = hasDirectFallback,
         )

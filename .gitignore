@@ -33,3 +33,4 @@ release.keystore
 /desktop/*/bin/
 /library/*/bin/
 /library/core/.gobind-work-*
+/library/core/.core-patch-work-*

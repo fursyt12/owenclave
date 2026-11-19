@@ -16,6 +16,7 @@ import io.nekohasekai.sagernet.database.SagerDatabase
 import io.nekohasekai.sagernet.fmt.AbstractBean
 import io.nekohasekai.sagernet.fmt.buildV2RayConfig
 import io.nekohasekai.sagernet.fmt.internal.BalancerBean
+import io.nekohasekai.sagernet.fmt.naive.NaiveBean
 
 /** Raised when a profile cannot be expressed as a V2Ray config for the core. */
 class UnsupportedProfileException(message: String) : Exception(message)
@@ -46,6 +47,8 @@ data class ServerInboundOptions(
     val username: String = "",
     val password: String = "",
     val tproxyPort: Int? = null,
+    val probePort: Int? = null,
+    val probeSecret: String = "",
 )
 
 /**
@@ -197,7 +200,7 @@ object DesktopConfigBuilder {
                 type = BalancerBean.TYPE_LIST
                 strategy = spec.strategy.ifBlank { "leastPing" }
                 proxies = ArrayList(memberIds.mapNotNull { profileEntityIds[it] })
-                probeUrl = spec.probeUrl
+                probeUrl = spec.probeUrl.ifBlank { DEFAULT_PROBE_URL }
                 probeInterval = spec.probeIntervalSec.coerceIn(1, 3600)
             }
 
@@ -242,8 +245,55 @@ object DesktopConfigBuilder {
             SagerDatabase.proxyDao.updateProxy(dbEntities)
         }
 
+        val probeMarkerToUser = LinkedHashMap<String, String>()
+        val probeMarkerRules = ArrayList<RoutingRule>()
+        val probeEnabled = serverInbounds?.probePort != null &&
+            serverInbounds.probePort > 0 &&
+            serverInbounds.probeSecret.isNotEmpty()
+        if (probeEnabled && !direct) {
+            val activeNaiveIds = HashSet<String>().apply {
+                add(profile.id)
+                addAll(validPrimaryMembers)
+                balancers.forEach { addAll(it.profileIds) }
+                rules.forEach { r ->
+                    if (r.target.startsWith("profile:")) add(r.target.removePrefix("profile:"))
+                }
+            }
+            var extraNaiveBudget = 8
+            var markerIdx = 0
+            for ((pid, p) in allBeanProfiles) {
+                val isNaive = p.bean is NaiveBean
+                if (isNaive && pid !in activeNaiveIds) {
+                    if (extraNaiveBudget <= 0) continue
+                    extraNaiveBudget--
+                }
+                val markerDomain = "full:owc-probe-${markerIdx++}.invalid"
+                probeMarkerToUser[markerDomain] = "p:$pid"
+                probeMarkerRules += RoutingRule(
+                    id = "probe-marker-$markerIdx",
+                    name = "probe-$pid",
+                    domains = markerDomain,
+                    target = "profile:$pid",
+                )
+            }
+            val distinctBalancers = LinkedHashMap<String, BalancerSpec>()
+            primaryBalancer?.let { distinctBalancers[it.id] = it }
+            balancers.forEach { if (it.id !in distinctBalancers) distinctBalancers[it.id] = it }
+            for ((bId, _) in distinctBalancers) {
+                if (bId !in balancerEntityIds && bId !in balancerDirectFallbackIds) continue
+                val markerDomain = "full:owc-probe-${markerIdx++}.invalid"
+                probeMarkerToUser[markerDomain] = "b:$bId"
+                probeMarkerRules += RoutingRule(
+                    id = "probe-balancer-$markerIdx",
+                    name = "probe-balancer-$bId",
+                    domains = markerDomain,
+                    target = "balancer:$bId",
+                )
+            }
+        }
+
         installRules(
-            rules = rules,
+            rules = if (probeMarkerRules.isEmpty()) rules else probeMarkerRules + rules,
             bypassPrivateNetworks = settings.bypassPrivateNetworks,
             primaryProfileId = if (usePrimaryBalancer) "" else profile.id,
             extraEntityIds = profileEntityIds,
@@ -274,6 +324,7 @@ object DesktopConfigBuilder {
                 serverInbounds = serverInbounds,
                 balancerOverrides = balancerOverrides,
                 localPluginPorts = plugins.map { it.port }.toSet(),
+                probeMarkerToUser = probeMarkerToUser,
             ),
             plugins,
         )
@@ -511,6 +562,7 @@ object DesktopConfigBuilder {
         serverInbounds: ServerInboundOptions? = null,
         balancerOverrides: Map<String, BalancerSpec> = emptyMap(),
         localPluginPorts: Set<Int> = emptySet(),
+        probeMarkerToUser: Map<String, String> = emptyMap(),
     ): String {
         val root = runCatching { JsonParser.parseString(config).asJsonObject }.getOrElse { return config }
 
@@ -534,6 +586,9 @@ object DesktopConfigBuilder {
             }
             keptInbounds.add(inbound)
         }
+        val hasProbeInbound = serverInbounds?.probePort != null &&
+            serverInbounds.probePort > 0 &&
+            serverInbounds.probeSecret.isNotEmpty()
         serverInbounds?.let { extra ->
             val listen = extra.bindAddress.trim().let { if (it.isEmpty() || it == "*") "0.0.0.0" else it }
             if (extra.mixedPort != null && extra.mixedPort > 0) {
@@ -577,19 +632,58 @@ object DesktopConfigBuilder {
                 }
                 keptInbounds.add(tproxy)
             }
+            if (hasProbeInbound) {
+                val accounts = JsonArray().apply {
+                    add(JsonObject().apply {
+                        addProperty("user", "direct")
+                        addProperty("pass", extra.probeSecret)
+                    })
+                    probeMarkerToUser.values.distinct().forEach { userTag ->
+                        add(JsonObject().apply {
+                            addProperty("user", userTag)
+                            addProperty("pass", extra.probeSecret)
+                        })
+                    }
+                }
+                val probeInbound = JsonObject().apply {
+                    addProperty("tag", TAG_PROBE_IN)
+                    addProperty("listen", "127.0.0.1")
+                    addProperty("port", extra.probePort)
+                    addProperty("protocol", "socks")
+                    add("settings", JsonObject().apply {
+                        addProperty("auth", "password")
+                        addProperty("udp", false)
+                        add("accounts", accounts)
+                    })
+                }
+                keptInbounds.add(probeInbound)
+            }
         }
         root.add("inbounds", keptInbounds)
         val inboundTags = keptInbounds.mapNotNull { it.asJsonObject.get("tag")?.asString }.toSet()
 
+        var needsBypassFallback = false
         // 2. Routing rules that referenced a dropped inbound (`dns-in` fed the
         //    `dns-out` outbound) would make the core reject the config.
-        root.getAsJsonObject("routing")?.let { routing ->
+        val routingObj = root.getAsJsonObject("routing") ?: if (hasProbeInbound) {
+            JsonObject().also { root.add("routing", it) }
+        } else {
+            null
+        }
+        routingObj?.let { routing ->
             routing.getAsJsonArray("balancers")?.forEach { element ->
                 val balancerObj = element.asJsonObject
                 val bTag = balancerObj.get("tag")?.asString ?: return@forEach
                 val spec = balancerOverrides[bTag] ?: return@forEach
+                if (spec.strategy == "fallback") {
+                    balancerObj.getAsJsonObject("strategy")?.let { strat ->
+                        strat.addProperty("type", "fallback")
+                        strat.getAsJsonObject("settings")?.remove("aliveOnly")
+                    }
+                }
                 if (spec.fallbackToDirect) {
-                    balancerObj.addProperty("fallbackTag", "bypass")
+                    balancerObj.addProperty("fallbackTag", TAG_BYPASS_FALLBACK)
+                    needsBypassFallback = true
                 } else if (spec.stickyChoice && spec.strategy == "leastPing") {
                     // Exclave-core's stickyChoice caches the last alive tag even after all nodes die,
                     // which suppresses `fallbackTag`; only enable stickyChoice when fallbackToDirect is off.
@@ -598,23 +692,67 @@ object DesktopConfigBuilder {
                         ?.addProperty("stickyChoice", true)
                 }
             }
-            val rules = routing.getAsJsonArray("rules")
-            if (rules != null) {
-                val keptRules = JsonArray()
-                rules.forEach { element ->
-                    val rule = element.asJsonObject
-                    val inboundTag = rule.getAsJsonArray("inboundTag")
-                    if (inboundTag != null && inboundTag.any { it.asString !in inboundTags }) return@forEach
-                    keptRules.add(rule)
+            val rules = routing.getAsJsonArray("rules") ?: JsonArray()
+            val dnsTopRules = ArrayList<JsonObject>()
+            val probeTopRules = ArrayList<JsonObject>()
+            val regularRules = ArrayList<JsonObject>()
+
+            if (hasProbeInbound) {
+                probeTopRules += JsonObject().apply {
+                    addProperty("type", "field")
+                    add("inboundTag", JsonArray().apply { add(TAG_PROBE_IN) })
+                    add("user", JsonArray().apply { add("direct") })
+                    addProperty("outboundTag", "bypass")
                 }
-                routing.add("rules", keptRules)
-                if (keptRules.size() == 0 && routing.getAsJsonArray("balancers") == null) {
-                    root.remove("routing")
+            }
+
+            rules.forEach { element ->
+                val rule = element.asJsonObject
+                val inboundTag = rule.getAsJsonArray("inboundTag")
+                if (inboundTag != null && inboundTag.any { it.asString !in inboundTags }) return@forEach
+
+                val domainsArr = rule.getAsJsonArray("domains") ?: rule.getAsJsonArray("domain")
+                val singleDomain = if (domainsArr != null && domainsArr.size() == 1) domainsArr[0].asString else null
+                val mappedProbeUser = singleDomain?.let { probeMarkerToUser[it] }
+                if (mappedProbeUser != null) {
+                    if (hasProbeInbound) {
+                        val rewritten = rule.deepCopy().apply {
+                            remove("domains")
+                            remove("domain")
+                            add("inboundTag", JsonArray().apply { add(TAG_PROBE_IN) })
+                            add("user", JsonArray().apply { add(mappedProbeUser) })
+                        }
+                        probeTopRules += rewritten
+                    }
+                    return@forEach
                 }
+
+                if (rule.get("outboundTag")?.asString == "dns-out") {
+                    dnsTopRules += rule
+                } else {
+                    regularRules += rule
+                }
+            }
+
+            val keptRules = JsonArray()
+            dnsTopRules.forEach { keptRules.add(it) }
+            probeTopRules.forEach { keptRules.add(it) }
+            regularRules.forEach { keptRules.add(it) }
+            routing.add("rules", keptRules)
+            if (keptRules.size() == 0 && routing.getAsJsonArray("balancers") == null) {
+                root.remove("routing")
             }
         }
 
         val outbounds = root.getAsJsonArray("outbounds") ?: JsonArray()
+        if (needsBypassFallback && outbounds.none { it.asJsonObject.get("tag")?.asString == TAG_BYPASS_FALLBACK }) {
+            val templateBypass = outbounds.firstOrNull { it.asJsonObject.get("tag")?.asString == "bypass" }
+                ?.asJsonObject
+                ?.deepCopy()
+                ?: JsonObject().apply { addProperty("protocol", "freedom") }
+            templateBypass.addProperty("tag", TAG_BYPASS_FALLBACK)
+            outbounds.add(templateBypass)
+        }
 
         // 3. "Direct only" mode: the selected profile is not dialled, the core
         //    sends everything out directly. The tag is kept so the routing rules
@@ -676,5 +814,8 @@ object DesktopConfigBuilder {
 
     private const val TAG_IPC_IN = "ipc-in"
     private const val TAG_DNS_IN = "dns-in"
+    const val TAG_PROBE_IN = "probe-socks-in"
+    const val TAG_BYPASS_FALLBACK = "bypass-fallback"
+    const val DEFAULT_PROBE_URL = "http://cp.cloudflare.com/generate_204"
 
 }
